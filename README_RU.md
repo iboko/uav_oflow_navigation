@@ -24,8 +24,9 @@
 1. запуск C++ RTOS-ядра внутри PX4 flight stack;
 2. подписка на `sensor_optical_flow`, `distance_sensor`, `vehicle_imu`, `vehicle_attitude`;
 3. публикация диагностики через `debug_vect`;
-4. штатные команды `ofnav start`, `ofnav status`, `ofnav stop` в PX4 shell;
-5. безопасное поведение по умолчанию: модуль не командует моторами и не подменяет EKF2.
+4. опциональный fusion-output path через `vehicle_visual_odometry`;
+5. штатные команды `ofnav start`, `ofnav status`, `ofnav stop` в PX4 shell;
+6. безопасное поведение по умолчанию: модуль не командует моторами и не подменяет EKF2, пока fusion-output явно не включен флагом `-e`.
 
 ## Быстрый запуск Python-уровня
 
@@ -84,7 +85,7 @@ cd ../PX4-Autopilot
 make px4_sitl gz_x500
 ```
 
-В PX4 shell:
+В PX4 shell, только диагностика:
 
 ```sh
 ofnav start -r 100 -q 120
@@ -95,6 +96,23 @@ listener vehicle_imu 5
 listener vehicle_attitude 5
 listener debug_vect 20
 uorb top
+```
+
+В PX4 shell, fusion-output path после проверки диагностики:
+
+```sh
+ofnav stop
+ofnav start -r 100 -q 120 -e
+listener vehicle_visual_odometry 10
+```
+
+Для EKF2 velocity-only fusion:
+
+```sh
+param show EKF2_EV_CTRL
+param set EKF2_EV_CTRL 4
+param set EKF2_EV_NOISE_MD 0
+param set EKF2_EVV_NOISE 0.30
 ```
 
 Подробная инструкция находится в `integrations/px4_ofnav_module/README_RU.md`.
@@ -165,18 +183,26 @@ v_nav = R_yaw * v_body_at_cg
 
 `firmware/rtos_core` — переносимое ядро для настоящей бортовой реализации.
 
-`integrations/px4_ofnav_module` — PX4 uORB/NuttX-модуль, который запускает RTOS-ядро внутри настоящего PX4 flight stack.
+`integrations/px4_ofnav_module` — PX4 uORB/NuttX-модуль, который запускает RTOS-ядро внутри настоящего PX4 flight stack и опционально публикует velocity-only fusion-output в `vehicle_visual_odometry`.
 
 ## Рекомендуемые параметры для первого этапа
 
 ### PX4, общий ориентир
 
 ```text
-EKF2_OF_CTRL      = включить использование optical flow
+EKF2_OF_CTRL      = включить штатное использование optical flow, если используется штатный ОП-канал PX4
 EKF2_OF_QMIN      = 100...150 для первого этапа
 SENS_FLOW_MINHGT  = 0.15...0.30 м
 SENS_FLOW_MAXHGT  = 3.0...5.0 м для малых высот
 EKF2_OF_POS_X/Y/Z = фактическое смещение датчика от центра масс
+```
+
+### PX4, fusion-output через `ofnav -e`
+
+```text
+EKF2_EV_CTRL      = 4     # только external vision velocity bit
+EKF2_EV_NOISE_MD  = 0     # использовать параметры шумов EKF2
+EKF2_EVV_NOISE    = 0.30  # начальное консервативное значение, уточняется по логам
 ```
 
 ### ArduPilot, общий ориентир
@@ -203,6 +229,7 @@ LOG_DISARMED      = 1 для стендовой проверки
 3. проверить дальномер на фактической высоте;
 4. ограничить углы крена/тангажа;
 5. ограничить горизонтальную скорость;
-6. выполнять первый полет только с внешним пилотом и возможностью ручного перехвата.
+6. сначала проверить `debug_vect`, затем `vehicle_visual_odometry`, и только потом включать fusion в EKF2;
+7. выполнять первый полет только с внешним пилотом и возможностью ручного перехвата.
 
 К реальному полету допускается не Python-скрипт, а прошитая и проверенная интеграция RTOS-ядра со штатным автопилотом и его failsafe-логикой.
