@@ -1,0 +1,13 @@
+{
+  "rows": 9001,
+  "position_rmse_m": 0.12019034639498737,
+  "position_p95_m": 0.22733689613464944,
+  "velocity_rmse_mps": 0.04639258174808606,
+  "velocity_p95_mps": 0.10404143532651026,
+  "flow_valid_samples": 1906,
+  "status_count": {
+    "OP_VALID": 7989,
+    "OP_DEGRADED_HOLD_OR_BRAKE": 732,
+    "FAILSAFE_LAND_OR_MANUAL": 280
+  }
+}
