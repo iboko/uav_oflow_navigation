@@ -49,27 +49,48 @@ def send_optical_flow_rad(master, r) -> None:
     quality = int(np.clip(float(r["of_quality"]), 0, 255))
     distance_m = float(r["range_m"]) if np.isfinite(r["range_m"]) else 0.0
 
-    master.mav.optical_flow_rad_send(
-        time_usec,
-        sensor_id,
-        integration_time_us,
-        float(r["of_integrated_x_rad"]),
-        float(r["of_integrated_y_rad"]),
-        float(r["of_integrated_xgyro_rad"]),
-        float(r["of_integrated_ygyro_rad"]),
-        float(r["of_integrated_zgyro_rad"]),
-        temperature_cdeg,
-        quality,
-        distance_m,
-    )
+    # pymavlink signatures differ between generated dialect versions.
+    # Current common.xml OPTICAL_FLOW_RAD includes time_delta_distance_us before distance.
+    # Older generated bindings omit that field. Keep both paths explicit.
+    time_delta_distance_us = integration_time_us if distance_m > 0.0 else 0
+    try:
+        master.mav.optical_flow_rad_send(
+            time_usec,
+            sensor_id,
+            integration_time_us,
+            float(r["of_integrated_x_rad"]),
+            float(r["of_integrated_y_rad"]),
+            float(r["of_integrated_xgyro_rad"]),
+            float(r["of_integrated_ygyro_rad"]),
+            float(r["of_integrated_zgyro_rad"]),
+            temperature_cdeg,
+            quality,
+            time_delta_distance_us,
+            distance_m,
+        )
+    except TypeError:
+        master.mav.optical_flow_rad_send(
+            time_usec,
+            sensor_id,
+            integration_time_us,
+            float(r["of_integrated_x_rad"]),
+            float(r["of_integrated_y_rad"]),
+            float(r["of_integrated_xgyro_rad"]),
+            float(r["of_integrated_ygyro_rad"]),
+            float(r["of_integrated_zgyro_rad"]),
+            temperature_cdeg,
+            quality,
+            distance_m,
+        )
 
 
-def replay(csv_path: str | Path, connection: str, baud: int, speed: float) -> None:
+def replay(csv_path: str | Path, connection: str, baud: int, speed: float, wait_heartbeat: bool) -> None:
     df = pd.read_csv(csv_path)
     master = mavutil.mavlink_connection(connection, baud=baud)
-    print("Ожидание heartbeat...")
-    master.wait_heartbeat()
-    print(f"Heartbeat: system={master.target_system}, component={master.target_component}")
+    if wait_heartbeat:
+        print("Ожидание heartbeat...")
+        master.wait_heartbeat()
+        print(f"Heartbeat: system={master.target_system}, component={master.target_component}")
 
     last_t = float(df.iloc[0]["t_s"])
     for _, r in df.iterrows():
@@ -89,8 +110,13 @@ def main() -> None:
     parser.add_argument("--connection", default="udpout:127.0.0.1:14540")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--speed", type=float, default=1.0, help="1.0 = реальное время, 10 = быстрее")
+    parser.add_argument(
+        "--wait-heartbeat",
+        action="store_true",
+        help="Ждать heartbeat перед replay. Для udpout обычно не требуется.",
+    )
     args = parser.parse_args()
-    replay(args.csv, args.connection, args.baud, args.speed)
+    replay(args.csv, args.connection, args.baud, args.speed, args.wait_heartbeat)
 
 
 if __name__ == "__main__":
