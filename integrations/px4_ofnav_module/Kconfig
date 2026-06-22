@@ -1,0 +1,7 @@
+menuconfig MODULES_OFNAV
+	bool "ofnav optical-flow navigation monitor"
+	default n
+	---help---
+		PX4/NuttX module that runs the ofnav RTOS core on uORB optical-flow,
+		rangefinder, IMU and attitude topics. The module publishes diagnostic
+		debug_vect output and is safe-by-default: it does not replace EKF2.
