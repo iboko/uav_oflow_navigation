@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-and-rtos-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Run Python tests
+        run: pytest -q
+
+      - name: Configure C++ RTOS core
+        run: cmake -S firmware/rtos_core -B build/rtos_core -DOFNAV_BUILD_TESTS=ON
+
+      - name: Build C++ RTOS core
+        run: cmake --build build/rtos_core --parallel
+
+      - name: Run C++ tests
+        run: ctest --test-dir build/rtos_core --output-on-failure
