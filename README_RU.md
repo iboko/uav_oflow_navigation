@@ -1,6 +1,6 @@
 # Реализация режима полета БВС по данным оптического потока
 
-Проект содержит два уровня реализации.
+Проект содержит три уровня реализации.
 
 Первый уровень — исследовательский Python-контур:
 
@@ -18,6 +18,14 @@
 4. safety state machine для `FLOW_NAV`, `DEGRADED_HOLD`, `FAILSAFE_LAND`;
 5. innovation gate для EKF;
 6. CMake-сборка и автономные C++-тесты.
+
+Третий уровень — PX4 uORB/NuttX-модуль:
+
+1. запуск C++ RTOS-ядра внутри PX4 flight stack;
+2. подписка на `sensor_optical_flow`, `distance_sensor`, `vehicle_imu`, `vehicle_attitude`;
+3. публикация диагностики через `debug_vect`;
+4. штатные команды `ofnav start`, `ofnav status`, `ofnav stop` в PX4 shell;
+5. безопасное поведение по умолчанию: модуль не командует моторами и не подменяет EKF2.
 
 ## Быстрый запуск Python-уровня
 
@@ -59,6 +67,37 @@ firmware/rtos_core/
 ├── tests/test_ofnav.cpp
 └── CMakeLists.txt
 ```
+
+## Быстрый запуск PX4 uORB/NuttX-модуля
+
+Сначала иметь рядом репозиторий PX4-Autopilot. Затем из корня этого проекта:
+
+```bash
+chmod +x tools/install_px4_ofnav_module.sh
+./tools/install_px4_ofnav_module.sh ../PX4-Autopilot boards/px4/sitl/default.px4board
+```
+
+Сборка SITL:
+
+```bash
+cd ../PX4-Autopilot
+make px4_sitl gz_x500
+```
+
+В PX4 shell:
+
+```sh
+ofnav start -r 100 -q 120
+ofnav status
+listener sensor_optical_flow 5
+listener distance_sensor 5
+listener vehicle_imu 5
+listener vehicle_attitude 5
+listener debug_vect 20
+uorb top
+```
+
+Подробная инструкция находится в `integrations/px4_ofnav_module/README_RU.md`.
 
 ## Принятая система координат
 
@@ -124,7 +163,9 @@ v_nav = R_yaw * v_body_at_cg
 
 `src/mavlink_bridge.py` — диагностический модуль. Он читает поток MAVLink, вычисляет скорость по ОП и может логировать результат. Передача оценок внешней скорости в автопилот через companion computer должна включаться только после проверки параметров EKF/External Vision на конкретной прошивке.
 
-`firmware/rtos_core` — переносимое ядро для настоящей бортовой реализации. Его следует оборачивать в PX4/NuttX-модуль, ArduPilot backend или RTOS-задачу конкретного полетного контроллера.
+`firmware/rtos_core` — переносимое ядро для настоящей бортовой реализации.
+
+`integrations/px4_ofnav_module` — PX4 uORB/NuttX-модуль, который запускает RTOS-ядро внутри настоящего PX4 flight stack.
 
 ## Рекомендуемые параметры для первого этапа
 
