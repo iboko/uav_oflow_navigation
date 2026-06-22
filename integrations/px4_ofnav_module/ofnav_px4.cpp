@@ -3,6 +3,7 @@
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform_common/posix.h>
 #include <px4_platform_common/tasks.h>
+#include <px4_platform_common/getopt.h>
 #include <drivers/drv_hrt.h>
 
 #include <uORB/uORB.h>
@@ -15,12 +16,11 @@
 #include <poll.h>
 #include <unistd.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 
 #include "ofnav/ofnav.hpp"
-
-using namespace time_literals;
 
 namespace {
 
@@ -101,7 +101,7 @@ public:
                                       SCHED_DEFAULT,
                                       SCHED_PRIORITY_DEFAULT + 20,
                                       4096,
-                                      reinterpret_cast<px4_main_t>(run_trampoline),
+                                      reinterpret_cast<px4_main_t>(&run_trampoline),
                                       argv);
 
         if (_task_id < 0) {
@@ -176,7 +176,7 @@ The module subscribes to uORB topics:
 
 It publishes debug_vect diagnostics:
 - OFNAV_V: estimated VN, VE and mode
-- OFNAV_H: height, quality and innovation value
+- OFNAV_H: height, quality and reject/accept reason code
 
 Safe-by-default behavior: this module does not replace EKF2 and does not command actuators.
 Use it first as a flight-stack-native monitor before enabling any fusion/control path.
@@ -234,7 +234,7 @@ Use it first as a flight-stack-native monitor before enabling any fusion/control
 
             if (pret < 0) {
                 PX4_ERR("poll error");
-                px4_usleep(100_ms);
+                px4_usleep(100000);
                 continue;
             }
 
@@ -381,7 +381,7 @@ private:
         set_debug_name(health, "OFNAV_H");
         health.x = out.flow.height_m;
         health.y = static_cast<float>(quality);
-        health.z = _runtime_diag_innovation;
+        health.z = static_cast<float>(out.flow.reason);
 
         if (_debug_health_pub == nullptr) {
             _debug_health_pub = orb_advertise(ORB_ID(debug_vect), &health);
@@ -404,7 +404,6 @@ private:
     orb_advert_t _debug_health_pub{nullptr};
 
     ofnav::OfNavRuntime _runtime;
-    float _runtime_diag_innovation{0.0f};
 
     uint32_t _samples{0U};
     uint32_t _accepted{0U};
