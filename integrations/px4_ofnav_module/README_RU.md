@@ -20,7 +20,7 @@ vehicle_attitude
 Кватернион ориентации БВС.
 ```
 
-Модуль публикует:
+Модуль публикует диагностику:
 
 ```text
 debug_vect OFNAV_V
@@ -34,7 +34,19 @@ y = качество ОП, 0...255
 z = RejectReason
 ```
 
-Безопасное поведение по умолчанию: модуль **не управляет моторами**, **не подменяет EKF2** и **не отправляет команды в САУ**. Сначала он используется как нативный PX4/NuttX-монитор канала ОП. После SITL/HIL можно расширять его до публикации в fusion/control path.
+Опционально модуль публикует fusion-output:
+
+```text
+vehicle_visual_odometry
+velocity[0] = VN, м/с
+velocity[1] = VE, м/с
+velocity[2] = NaN
+velocity_frame = NED
+position = NaN
+q = NaN
+```
+
+Безопасное поведение по умолчанию: модуль **не управляет моторами**, **не подменяет EKF2** и **не отправляет команды в САУ**. Fusion-output выключен, пока модуль не запущен с флагом `-e`.
 
 ## Установка в PX4-Autopilot
 
@@ -62,7 +74,7 @@ cd ../PX4-Autopilot
 make px4_sitl gz_x500
 ```
 
-В PX4 shell:
+В PX4 shell для режима диагностики:
 
 ```sh
 ofnav start -r 100 -q 120
@@ -85,6 +97,34 @@ listener debug_vect 20
 uorb top
 ```
 
+## Запуск fusion-output path
+
+Включать только после проверки диагностики `OFNAV_V/OFNAV_H`.
+
+```sh
+ofnav stop
+ofnav start -r 100 -q 120 -e
+ofnav status
+listener vehicle_visual_odometry 10
+```
+
+Флаг `-e` включает публикацию accepted velocity-only сообщений в `vehicle_visual_odometry`. Публикуются только измерения, которые прошли safety gate и имеют режим `FLOW_NAV`.
+
+## Настройка EKF2 для fusion внешней скорости
+
+Для использования именно скорости внешнего источника нужно включить бит velocity в `EKF2_EV_CTRL`.
+
+```sh
+param show EKF2_EV_CTRL
+param set EKF2_EV_CTRL 4
+param set EKF2_EV_NOISE_MD 0
+param set EKF2_EVV_NOISE 0.30
+```
+
+Значение `4` соответствует включению только velocity-bit. Не включайте horizontal position/yaw bits, пока `ofnav` публикует только скорость и оставляет position/q как `NaN`.
+
+После изменения параметров перезапустите EKF/автопилот согласно обычной процедуре PX4 для вашей версии прошивки.
+
 ## Запуск с менее строгой проверкой дальномера
 
 По умолчанию модуль требует, чтобы `distance_sensor.orientation == ROTATION_DOWNWARD_FACING`. Если в SITL или драйвере ориентация не заполнена, можно временно запустить так:
@@ -94,6 +134,12 @@ ofnav start -r 100 -q 120 -n
 ```
 
 `-n` нельзя считать нормой для реального полета. Это только для SITL/стендовой диагностики.
+
+С fusion-output и временным отключением проверки ориентации:
+
+```sh
+ofnav start -r 100 -q 120 -n -e
+```
 
 ## Сборка под плату
 
@@ -122,7 +168,7 @@ make px4_fmu-v5_default upload
 2. Снять винты.
 3. Подключить QGroundControl.
 4. Открыть MAVLink Console.
-5. Выполнить:
+5. Выполнить диагностику без fusion-output:
 
 ```sh
 ofnav start -r 100 -q 120
@@ -135,6 +181,7 @@ ofnav status
 6. Поднять БВС над текстурированной поверхностью на 0.5...1.5 м.
 7. Медленно переместить вперед/вправо.
 8. Проверить, что `OFNAV_V.x/y` меняются без скачков, а `OFNAV_H.y` держится выше порога качества.
+9. Только после этого включать `-e` и проверять `vehicle_visual_odometry`.
 
 ## Коды `NavMode`
 
@@ -171,5 +218,6 @@ ofnav status
 2. Проверить качество ОП над разными поверхностями.
 3. Проверить реакцию на закрытие датчика ОП.
 4. Проверить реакцию на потерю дальномера.
-5. Проверить ULog и `debug_vect`.
-6. Только после этого обсуждать публикацию velocity в EKF2/vehicle_visual_odometry или отдельный control path.
+5. Проверить ULog, `debug_vect` и `vehicle_visual_odometry`.
+6. Проверить EKF2 innovations внешней скорости.
+7. Только после этого переходить к маловысотным полетным испытаниям с ручным перехватом.
