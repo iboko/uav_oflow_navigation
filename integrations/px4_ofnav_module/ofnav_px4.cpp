@@ -11,6 +11,7 @@
 #include <uORB/topics/distance_sensor.h>
 #include <uORB/topics/vehicle_imu.h>
 #include <uORB/topics/vehicle_attitude.h>
+#include <uORB/topics/vehicle_odometry.h>
 #include <uORB/topics/debug_vect.h>
 
 #include <poll.h>
@@ -28,6 +29,7 @@ constexpr uint64_t kMainLoopTimeoutMs = 100;
 constexpr unsigned kDefaultRateHz = 100U;
 constexpr unsigned kMinRateHz = 20U;
 constexpr unsigned kMaxRateHz = 250U;
+constexpr float kDefaultVelocityVariance = 0.09f; // (m/s)^2, conservative initial value
 
 static float safe_div(float n, uint32_t dt_us) noexcept
 {
@@ -74,15 +76,22 @@ static void set_debug_name(debug_vect_s &dbg, const char *name) noexcept
     std::strncpy(dbg.name, name, sizeof(dbg.name) - 1U);
 }
 
+static int8_t flow_quality_to_odometry_quality(uint8_t quality) noexcept
+{
+    const unsigned scaled = (static_cast<unsigned>(quality) * 100U) / 255U;
+    return static_cast<int8_t>(scaled > 100U ? 100U : scaled);
+}
+
 } // namespace
 
 class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
-    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range) :
+    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range, bool publish_ev_velocity) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
+        _publish_ev_velocity(publish_ev_velocity),
         _runtime(make_config(min_quality))
     {
     }
@@ -117,12 +126,13 @@ public:
         unsigned rate_hz = kDefaultRateHz;
         unsigned min_quality = 120U;
         bool strict_downward_range = true;
+        bool publish_ev_velocity = false;
 
         int ch = 0;
         int myoptind = 1;
         const char *myoptarg = nullptr;
 
-        while ((ch = px4_getopt(argc, argv, "r:q:n", &myoptind, &myoptarg)) != EOF) {
+        while ((ch = px4_getopt(argc, argv, "r:q:ne", &myoptind, &myoptarg)) != EOF) {
             switch (ch) {
             case 'r': {
                     const int value = std::atoi(myoptarg);
@@ -140,6 +150,10 @@ public:
                 strict_downward_range = false;
                 break;
 
+            case 'e':
+                publish_ev_velocity = true;
+                break;
+
             default:
                 PX4_ERR("unknown option");
                 return nullptr;
@@ -149,7 +163,7 @@ public:
         if (rate_hz < kMinRateHz) { rate_hz = kMinRateHz; }
         if (rate_hz > kMaxRateHz) { rate_hz = kMaxRateHz; }
 
-        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range);
+        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, publish_ev_velocity);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -178,8 +192,13 @@ It publishes debug_vect diagnostics:
 - OFNAV_V: estimated VN, VE and mode
 - OFNAV_H: height, quality and reject/accept reason code
 
-Safe-by-default behavior: this module does not replace EKF2 and does not command actuators.
-Use it first as a flight-stack-native monitor before enabling any fusion/control path.
+Optional fusion-output path:
+- with -e, publishes velocity-only vehicle_visual_odometry messages
+- position and orientation fields are intentionally invalid/NaN
+- only accepted FLOW_NAV estimates are published
+
+Safe-by-default behavior: this module does not command actuators.
+Fusion output is disabled unless -e is explicitly passed.
 )DESCR_STR");
 
         PRINT_MODULE_USAGE_NAME("ofnav", "navigation");
@@ -187,6 +206,7 @@ Use it first as a flight-stack-native monitor before enabling any fusion/control
         PRINT_MODULE_USAGE_PARAM_INT('r', static_cast<int>(kDefaultRateHz), static_cast<int>(kMinRateHz), static_cast<int>(kMaxRateHz), "Module loop rate, Hz", true);
         PRINT_MODULE_USAGE_PARAM_INT('q', 120, 0, 255, "Minimum optical-flow quality", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
+        PRINT_MODULE_USAGE_PARAM_FLAG('e', "Publish accepted velocity-only vehicle_visual_odometry for EKF2 external-vision velocity fusion", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
         return 0;
@@ -194,15 +214,17 @@ Use it first as a flight-stack-native monitor before enabling any fusion/control
 
     int print_status() override
     {
-        PX4_INFO("running: rate=%u Hz min_quality=%u strict_downward_range=%s",
+        PX4_INFO("running: rate=%u Hz min_quality=%u strict_downward_range=%s ev_velocity=%s",
                  _rate_hz,
                  static_cast<unsigned>(_min_quality),
-                 _strict_downward_range ? "true" : "false");
-        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu",
+                 _strict_downward_range ? "true" : "false",
+                 _publish_ev_velocity ? "true" : "false");
+        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu ev_pub=%lu",
                  static_cast<unsigned long>(_samples),
                  static_cast<unsigned long>(_accepted),
                  static_cast<unsigned long>(_degraded),
-                 static_cast<unsigned long>(_failsafe));
+                 static_cast<unsigned long>(_failsafe),
+                 static_cast<unsigned long>(_ev_published));
         return 0;
     }
 
@@ -276,6 +298,10 @@ Use it first as a flight-stack-native monitor before enabling any fusion/control
             }
 
             publish_debug(out, flow_msg.quality);
+
+            if (_publish_ev_velocity && out.mode == ofnav::NavMode::FlowNav && out.flow.accepted) {
+                publish_visual_odometry_velocity(out, flow_msg, imu);
+            }
         }
     }
 
@@ -391,9 +417,62 @@ private:
         }
     }
 
+    void publish_visual_odometry_velocity(const ofnav::RuntimeOutput &out,
+                                          const sensor_optical_flow_s &flow_msg,
+                                          const ofnav::ImuSample &imu)
+    {
+        vehicle_odometry_s odom{};
+        odom.timestamp = hrt_absolute_time();
+        odom.timestamp_sample = flow_msg.timestamp;
+        odom.pose_frame = vehicle_odometry_s::POSE_FRAME_UNKNOWN;
+        odom.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_NED;
+
+        odom.position[0] = NAN;
+        odom.position[1] = NAN;
+        odom.position[2] = NAN;
+
+        odom.q[0] = NAN;
+        odom.q[1] = NAN;
+        odom.q[2] = NAN;
+        odom.q[3] = NAN;
+
+        odom.velocity[0] = out.state.vn_m_s;
+        odom.velocity[1] = out.state.ve_m_s;
+        odom.velocity[2] = NAN;
+
+        odom.angular_velocity[0] = imu.gyro_rad_s.x;
+        odom.angular_velocity[1] = imu.gyro_rad_s.y;
+        odom.angular_velocity[2] = imu.gyro_rad_s.z;
+
+        odom.position_variance[0] = NAN;
+        odom.position_variance[1] = NAN;
+        odom.position_variance[2] = NAN;
+
+        odom.orientation_variance[0] = NAN;
+        odom.orientation_variance[1] = NAN;
+        odom.orientation_variance[2] = NAN;
+
+        odom.velocity_variance[0] = kDefaultVelocityVariance;
+        odom.velocity_variance[1] = kDefaultVelocityVariance;
+        odom.velocity_variance[2] = NAN;
+
+        odom.reset_counter = 0U;
+        odom.quality = flow_quality_to_odometry_quality(flow_msg.quality);
+
+        if (_visual_odom_pub == nullptr) {
+            _visual_odom_pub = orb_advertise(ORB_ID(vehicle_visual_odometry), &odom);
+
+        } else {
+            orb_publish(ORB_ID(vehicle_visual_odometry), _visual_odom_pub, &odom);
+        }
+
+        ++_ev_published;
+    }
+
     unsigned _rate_hz{kDefaultRateHz};
     uint8_t _min_quality{120U};
     bool _strict_downward_range{true};
+    bool _publish_ev_velocity{false};
 
     int _flow_sub{-1};
     int _range_sub{-1};
@@ -402,6 +481,7 @@ private:
 
     orb_advert_t _debug_vel_pub{nullptr};
     orb_advert_t _debug_health_pub{nullptr};
+    orb_advert_t _visual_odom_pub{nullptr};
 
     ofnav::OfNavRuntime _runtime;
 
@@ -409,6 +489,7 @@ private:
     uint32_t _accepted{0U};
     uint32_t _degraded{0U};
     uint32_t _failsafe{0U};
+    uint32_t _ev_published{0U};
 };
 
 extern "C" __EXPORT int ofnav_main(int argc, char *argv[])
