@@ -164,8 +164,12 @@ class ImuPreintegrator:
         if not isinstance(reading.timestamp_us, int) or reading.timestamp_us <= 0:
             self.healthy = False
             raise ValueError("Некорректное время ИИМ")
-        _vector(reading.gyro_body_rad_s, 3, "гироскоп")
-        _vector(reading.specific_force_body_m_s2, 3, "акселерометр")
+        try:
+            _vector(reading.gyro_body_rad_s, 3, "гироскоп")
+            _vector(reading.specific_force_body_m_s2, 3, "акселерометр")
+        except ValueError:
+            self.healthy = False
+            raise
         if self._last is None:
             self._last = reading
             return self._output(reading.timestamp_us, 0.0)
