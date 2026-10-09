@@ -23,6 +23,7 @@ from .continuous_visual_odometry import ContinuousPlanarOdometry, VisualFrame
 from .ground_visual_motion import CameraCalibration
 from .camera_rotation_compensation import CameraMountCalibration
 from .attitude_time_alignment import AttitudeTimeline
+from .velocity_uncertainty import VelocityErrorAssumptions
 
 _REQUIRED_BASE = ("timestamp_us", "image_path", "height_agl_m")
 _REQUIRED_ORIENTATION = ("roll_rad", "pitch_rad", "yaw_rad")
@@ -78,8 +79,21 @@ def run_manifest(
         lever = tuple(float(v) for v in lever_raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("Недопустимое плечо установки камеры") from exc
-    odom = ContinuousPlanarOdometry(camera, camera_mount=mount,
-                                    camera_offset_body_m=lever)
+    velocity_errors = None
+    if "velocity_error_assumptions" in calibration_data:
+        raw = calibration_data["velocity_error_assumptions"]
+        if not isinstance(raw, dict):
+            raise ValueError("Ожидается словарь предположений о погрешностях")
+        try:
+            velocity_errors = VelocityErrorAssumptions(**raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Неизвестные или отсутствующие коэффициенты ошибок") from exc
+        if not velocity_errors.valid():
+            raise ValueError("Некорректные параметры модели неопределенности")
+    odom = ContinuousPlanarOdometry(
+        camera, camera_mount=mount, camera_offset_body_m=lever,
+        velocity_error_assumptions=velocity_errors,
+    )
     timeline = (
         AttitudeTimeline.from_csv(
             str(attitude_log),
@@ -148,6 +162,9 @@ def run_manifest(
                 "inlier_count": result.inlier_count,
                 "inlier_ratio": result.inlier_ratio,
                 "resolution_proxy_m": result.resolution_proxy_m,
+                "velocity_cov_nn_m2_s2": result.velocity_cov_nn,
+                "velocity_cov_ne_m2_s2": result.velocity_cov_ne,
+                "velocity_cov_ee_m2_s2": result.velocity_cov_ee,
                 "relative_position_error_m": float("nan"),
             }
 
@@ -188,6 +205,10 @@ def run_manifest(
         "status_counts": dict(sorted(reasons.items())),
         "reference_available": has_truth,
         "attitude_synchronized_from_log": timeline is not None,
+        "velocity_covariance_source": (
+            "ENGINEERING_ASSUMPTIONS_NOT_VALIDATED"
+            if velocity_errors is not None else "NOT_ESTIMATED"
+        ),
         "camera_to_attitude_offset_us": (
             camera_to_attitude_offset_us if timeline is not None else None
         ),
