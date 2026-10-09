@@ -139,3 +139,25 @@ def test_large_yaw_jump_cannot_produce_false_displacement():
     odom.process(_frame(terrain, 1_000_000))
     bad = odom.process(_frame(_translate(terrain, 2), 1_200_000, yaw=0.6))
     assert not bad.accepted and bad.status == "EXCESSIVE_YAW_CHANGE"
+
+
+def test_pitch_change_that_mimics_translation_is_rejected():
+    terrain = _terrain()
+    odom = ContinuousPlanarOdometry(_calibration())
+    odom.process(_frame(terrain, 1_000_000, pitch=0.001))
+    shifted = _translate(terrain, 3.0)
+    out = odom.process(_frame(shifted, 1_200_000, pitch=0.015))
+    assert out.status == "UNCOMPENSATED_TILT_CHANGE"
+    assert not out.accepted
+    assert out.north_m == 0.0
+
+
+def test_static_frames_do_not_generate_false_horizontal_displacement():
+    terrain = _terrain()
+    odom = ContinuousPlanarOdometry(_calibration())
+    odom.process(_frame(terrain, 1_000_000))
+    for k in range(1, 5):
+        out = odom.process(_frame(terrain, 1_000_000 + 100_000 * k))
+        assert out.accepted, out
+        assert abs(out.north_m) < 0.015
+        assert abs(out.east_m) < 0.015
