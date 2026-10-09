@@ -180,3 +180,40 @@ def test_gyro_bias_is_explicit_state_not_claimed_observable_at_hover():
     assert out.quaternion_body_to_ned[0] == pytest.approx(1., abs=1e-10)
     assert out.gyro_bias_rad_s[2] == pytest.approx(0.08)
     assert out.accepted_visual_count == 0
+
+
+def test_horizontal_velocity_cannot_make_all_states_observable_at_hover():
+    # Stationary FRD aligned with NED: a single 2D velocity measurement
+    # has no direct sensitivity to yaw or z gyro bias in this trajectory.
+    a = continuous_error_jacobian(
+        np.eye(3), np.zeros(3), np.array([0., 0., -9.80665])
+    )
+    h = np.zeros((2, 15))
+    h[:, 3:5] = np.eye(2)
+    observability = []
+    power = np.eye(15)
+    for _ in range(15):
+        observability.append(h @ power)
+        power = power @ a
+    o = np.vstack(observability)
+    assert np.linalg.matrix_rank(o) < 15
+    assert np.allclose(o[:, 8], 0.)    # yaw perturbation
+    assert np.allclose(o[:, 11], 0.)   # z gyro-bias perturbation
+
+
+def test_small_visual_velocity_update_can_correct_attitude_coupling():
+    pitch = 0.05
+    # Incorrect nominal pitch for a truly stationary, level platform.
+    ekf = filt(q=(cos(pitch / 2), 0., sin(pitch / 2), 0.))
+    for k in range(21):
+        t = 1_000_000 + k * 10_000
+        before = ekf.predict(sample(t))
+    pre = before.velocity_ned_m_s[0]
+    assert abs(pre) > 0.01
+    updated = ekf.update_visual_velocity(visual(t, var=0.0001))
+    assert updated.status == "VISUAL_CORRECTED"
+    assert abs(updated.velocity_ned_m_s[0]) < abs(pre)
+    assert np.linalg.norm(updated.quaternion_body_to_ned) == pytest.approx(
+        1.0, abs=1e-12
+    )
+    assert np.linalg.eigvalsh(np.asarray(updated.covariance_15x15))[0] > 0.
