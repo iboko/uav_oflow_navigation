@@ -140,7 +140,10 @@ struct Config {
     Matrix3f body_from_sensor{};
 
     uint64_t max_range_age_us{200000U};
-    uint64_t max_flow_age_us{200000U};
+    uint64_t max_flow_age_us{120000U};
+    uint64_t max_imu_age_us{120000U};
+    uint64_t max_attitude_age_us{120000U};
+    uint64_t max_measurement_skew_us{100000U};
 
     float accel_noise_sigma_m_s2{0.08F};
     float flow_vel_sigma_min_m_s{0.035F};
@@ -181,6 +184,9 @@ public:
 
     [[nodiscard]] EkfState state() const noexcept { return x_; }
     [[nodiscard]] float lastInnovationD2() const noexcept { return last_innovation_d2_; }
+    [[nodiscard]] float covariance(uint8_t row, uint8_t col) const noexcept {
+        return (row < 6U && col < 6U) ? p_[row][col] : kNaN;
+    }
 
 private:
     using Matrix6 = std::array<std::array<float, 6>, 6>;
@@ -207,9 +213,20 @@ public:
                                          const OpticalFlowRadSample& flow,
                                          const FlowVelocityEstimate& flow_estimate,
                                          const EkfState& ekf_state,
-                                         bool innovation_ok) noexcept;
+                                         bool innovation_ok,
+                                         const AttitudeSample& attitude,
+                                     uint64_t now_us = 0U) noexcept;
+
+    // Called periodically even when no new optical-flow sample arrives.
+    [[nodiscard]] RuntimeOutput monitor(uint64_t now_us,
+                                        const ImuSample& imu,
+                                        const RangeSample& range,
+                                        const OpticalFlowRadSample& flow,
+                                        const AttitudeSample& attitude) noexcept;
 
 private:
+    FlowVelocityEstimate last_flow_estimate_{};
+    bool last_innovation_ok_{false};
     Config cfg_{};
 };
 
