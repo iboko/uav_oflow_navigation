@@ -13,6 +13,7 @@ from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
 import numpy as np
 
 from .ground_visual_motion import CameraCalibration, GroundMotionEstimate, estimate_ground_motion
+from .camera_rotation_compensation import CameraMountCalibration, align_current_to_previous
 
 
 def _wrap(angle: float) -> float:
@@ -61,6 +62,7 @@ class ContinuousPlanarOdometry:
         self,
         calibration: CameraCalibration,
         *,
+        camera_mount: CameraMountCalibration | None = None,
         max_pair_dt_s: float = 0.35,
         max_yaw_change_rad: float = 0.30,
         max_relative_height_change: float = 0.12,
@@ -82,7 +84,10 @@ class ContinuousPlanarOdometry:
             or not isfinite(pixel_resolution_floor) or pixel_resolution_floor <= 0.0
         ):
             raise ValueError("Неверные параметры контроля визуальной одометрии")
+        if camera_mount is not None and not camera_mount.valid(calibration):
+            raise ValueError("Несогласованная пространственная калибровка камеры")
         self._calib = calibration
+        self._mount = camera_mount
         self._max_pair_dt = max_pair_dt_s
         self._max_yaw = max_yaw_change_rad
         self._max_height_jump = max_relative_height_change
@@ -189,15 +194,34 @@ class ContinuousPlanarOdometry:
         # Without full 3D camera/IMU calibration, a changing roll/pitch angle
         # creates image translation indistinguishable from vehicle motion.
         # Reject it rather than synthesizing false horizontal displacement.
-        if hypot(current.roll_rad - previous.roll_rad,
-                 current.pitch_rad - previous.pitch_rad) > self._max_delta_tilt:
+        if self._mount is None and hypot(
+            current.roll_rad - previous.roll_rad,
+            current.pitch_rad - previous.pitch_rad,
+        ) > self._max_delta_tilt:
             self._restart(current)
             return self._out(current.timestamp_us, "UNCOMPENSATED_TILT_CHANGE")
 
+        # With a calibrated camera/body SO(3) matrix, remove the known
+        # rotational homography before estimating scene translation.
+        # In the absence of that calibration retain conservative gating.
+        corrected_current = current.gray
+        if self._mount is not None:
+            try:
+                corrected_current, _ = align_current_to_previous(
+                    current.gray, self._calib, self._mount,
+                    previous_rpy=(previous.roll_rad, previous.pitch_rad,
+                                  previous.yaw_rad),
+                    current_rpy=(current.roll_rad, current.pitch_rad,
+                                 current.yaw_rad),
+                )
+            except (ValueError, np.linalg.LinAlgError):
+                self._restart(current)
+                return self._out(current.timestamp_us, "ROTATION_COMPENSATION_FAILED")
+
         height = 0.5 * (previous.height_agl_m + current.height_agl_m)
         motion = estimate_ground_motion(
-            previous.gray, current.gray, dt_s, height,
-            self._calib, roll_rad=current.roll_rad, pitch_rad=current.pitch_rad,
+            previous.gray, corrected_current, dt_s, height,
+            self._calib, roll_rad=previous.roll_rad, pitch_rad=previous.pitch_rad,
             max_tilt_rad=self._max_tilt, min_inliers=self._min_inliers,
             min_inlier_ratio=self._min_ratio,
         )
@@ -207,7 +231,11 @@ class ContinuousPlanarOdometry:
             self._restart(current)
             return self._out(current.timestamp_us, f"TRACK_LOST:{motion.reason}", motion=motion)
 
-        mid_yaw = previous.yaw_rad + 0.5 * yaw_delta
+        # A derotated image is expressed in the previous camera frame.
+        # Thus the velocity has the previous-body heading. The legacy
+        # yaw-only approximation retains midpoint heading for compatibility.
+        mid_yaw = (previous.yaw_rad if self._mount is not None
+                   else previous.yaw_rad + 0.5 * yaw_delta)
         c, s = cos(mid_yaw), sin(mid_yaw)
         vn = c * motion.velocity_body_x_m_s - s * motion.velocity_body_y_m_s
         ve = s * motion.velocity_body_x_m_s + c * motion.velocity_body_y_m_s
