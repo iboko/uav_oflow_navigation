@@ -235,7 +235,7 @@ Fusion output is not supported. The -e option is intentionally rejected.
         orb_set_interval(_flow_sub, static_cast<unsigned>(1000U / _rate_hz));
         orb_set_interval(_imu_sub, static_cast<unsigned>(1000U / _rate_hz));
 
-        pollfd fds[2]{};
+        px4_pollfd_struct_t fds[2]{};
         fds[0].fd = _flow_sub;
         fds[0].events = POLLIN;
         fds[1].fd = _imu_sub;
