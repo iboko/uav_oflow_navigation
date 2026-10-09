@@ -269,6 +269,32 @@ void test_nonfinite_imu_does_not_enter_flow_mode() {
     assert(result.mode == ofnav::NavMode::FailsafeLand);
 }
 
+void test_missing_imu_history_requires_explicit_reset() {
+    const auto cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::ImuSample imu_gap{1250000U, {},
+        {0.0F, 0.0F, -9.81F}, true};
+    const ofnav::RangeSample range{1250000U, 1.0F, true};
+    const ofnav::OpticalFlowRadSample flow{1250000U, 0.04F,
+        0.0F, 0.01F, 0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::AttitudeSample att{1250000U, 0.0F, 0.0F, 0.0F};
+    auto out = runtime.step(imu_gap, range, flow, att, 1250000U);
+    assert(out.mode == ofnav::NavMode::FailsafeLand);
+    assert(!out.flow.accepted);
+
+    // New valid samples must not silently re-arm a discontinuous estimator.
+    const ofnav::ImuSample imu_next{1260000U, {},
+        {0.0F, 0.0F, -9.81F}, true};
+    const ofnav::AttitudeSample att_next{1260000U, 0.0F, 0.0F, 0.0F};
+    out = runtime.monitor(1260000U, imu_next, range, flow, att_next);
+    assert(out.mode == ofnav::NavMode::FailsafeLand);
+
+    runtime.reset(1260000U);
+    const auto reset_out = runtime.monitor(1260000U, imu_next, range, flow, att_next);
+    assert(reset_out.mode != ofnav::NavMode::FailsafeLand);
+}
+
 } // namespace
 
 int main() {
@@ -289,6 +315,7 @@ int main() {
     test_range_sample_skew_must_reject_flow_correction();
     test_excessive_tilt_detected_during_flow_dropout();
     test_nonfinite_imu_does_not_enter_flow_mode();
+    test_missing_imu_history_requires_explicit_reset();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }
