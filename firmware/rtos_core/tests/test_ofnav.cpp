@@ -163,6 +163,48 @@ void test_timeout_without_new_flow_samples() {
     assert(out.health.stale_flow);
 }
 
+void test_asynchronous_imu_prediction_between_flow_frames() {
+    ofnav::Config cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::AttitudeSample attitude{1010000U, 0.0F, 0.0F, 0.0F};
+    const ofnav::ImuSample sample1{1010000U, {}, {1.0F, 0.0F, -9.81F}, true};
+    runtime.predictImu(sample1, attitude);
+    const ofnav::AttitudeSample attitude2{1020000U, 0.0F, 0.0F, 0.0F};
+    const ofnav::ImuSample sample2{1020000U, {}, {1.0F, 0.0F, -9.81F}, true};
+    runtime.predictImu(sample2, attitude2);
+    const ofnav::RangeSample range{1020000U, 1.0F, true};
+    const ofnav::OpticalFlowRadSample flow{};  // No optical-flow update at all.
+    const auto result = runtime.monitor(1020000U, sample2, range, flow, attitude2);
+    assert(near(result.state.vn_m_s, 0.02F, 1.0e-5F));
+    assert(result.mode != ofnav::NavMode::FlowNav);
+}
+
+void test_reused_imu_timestamp_not_predicted_twice() {
+    ofnav::Config cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::AttitudeSample att{1010000U, 0.0F, 0.0F, 0.0F};
+    const ofnav::ImuSample imu{1010000U, {}, {1.0F, 0.0F, -9.81F}, true};
+    runtime.predictImu(imu, att);
+    runtime.predictImu(imu, att);
+    const auto result = runtime.monitor(1010000U, imu, {}, {}, att);
+    assert(near(result.state.vn_m_s, 0.01F, 1.0e-5F));
+}
+
+void test_missing_gyro_compensation_is_rejected() {
+    const auto cfg = baseConfig();
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::OpticalFlowRadSample flow{1000000U, 0.04F, 0.01F, 0.01F,
+        ofnav::kNaN, ofnav::kNaN, ofnav::kNaN, 220U, true};
+    const ofnav::RangeSample range{1000000U, 1.0F, true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto out = estimator.update(flow, range, imu, att);
+    assert(!out.accepted);
+    assert(out.reason == ofnav::RejectReason::NonFiniteInput);
+}
+
 } // namespace
 
 int main() {
@@ -176,6 +218,9 @@ int main() {
     test_gravity_projection_does_not_create_horizontal_velocity();
     test_stale_flow_is_never_fused();
     test_timeout_without_new_flow_samples();
+    test_asynchronous_imu_prediction_between_flow_frames();
+    test_reused_imu_timestamp_not_predicted_twice();
+    test_missing_gyro_compensation_is_rejected();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }
