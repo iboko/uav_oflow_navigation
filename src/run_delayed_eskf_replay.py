@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from math import isfinite
 from collections import Counter
 from pathlib import Path
 
@@ -82,6 +83,7 @@ def run_delayed_replay(
 
     stats = Counter()
     samples: list[dict] = []
+    innovation_nis: list[float] = []
     for arrival, kind, _, obj in events:
         if kind == 0:
             engine.push_imu(obj)
@@ -89,7 +91,7 @@ def run_delayed_replay(
         cam_time = int(obj["timestamp_us"])
         stamp = cam_time + offset
         if obj["accepted"] != "1":
-            status, replayed = "CAMERA_MEASUREMENT_REJECTED", 0
+            status, replayed, nis = "CAMERA_MEASUREMENT_REJECTED", 0, float("nan")
         else:
             try:
                 covariance = (
@@ -103,10 +105,16 @@ def run_delayed_replay(
                     covariance
                 )
                 outcome = engine.push_delayed_visual(measurement)
-                status, replayed = outcome.status, outcome.replayed_imu_samples
+                status, replayed, nis = (
+                    outcome.status, outcome.replayed_imu_samples, outcome.nis
+                )
             except (TypeError, ValueError):
-                status, replayed = "INVALID_VISUAL_FIELDS", 0
+                status, replayed, nis = "INVALID_VISUAL_FIELDS", 0, float("nan")
         snap = engine.state
+        if status in ("VISUAL_CORRECTED", "VISUAL_OUTLIER_REJECTED") and (
+            isfinite(nis)
+        ):
+            innovation_nis.append(nis)
         stats[status] += 1
         samples.append({
             "exposure_timestamp_imu_us": stamp,
@@ -114,6 +122,7 @@ def run_delayed_replay(
             "arrival_lag_us": arrival - stamp,
             "status": status,
             "replayed_imu_samples": replayed,
+            "innovation_nis": nis,
             "current_imu_timestamp_us": snap.timestamp_us,
             "relative_n_m": snap.position_ned_m[0],
             "relative_e_m": snap.position_ned_m[1],
@@ -144,6 +153,14 @@ def run_delayed_replay(
         "final_time_us": snap.timestamp_us,
         "history_max_lag_us": max_lag_us,
         "max_imu_storage": max_samples,
+        "innovation_nis_samples": len(innovation_nis),
+        "innovation_nis_mean_before_gating": (
+            sum(innovation_nis) / len(innovation_nis) if innovation_nis else None
+        ),
+        "innovation_nis_fraction_above_99pct_chi2_2": (
+            sum(x > 9.210340371976184 for x in innovation_nis) /
+            len(innovation_nis) if innovation_nis else None
+        ),
         "warnings": [
             "Офлайн-модель: полученные данные ИИМ предполагаются доступными в момент timestamp_us.",
             "Время прихода кадра не является временем визуального измерения.",
