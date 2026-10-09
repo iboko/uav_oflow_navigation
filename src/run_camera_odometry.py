@@ -22,11 +22,10 @@ import yaml
 from .continuous_visual_odometry import ContinuousPlanarOdometry, VisualFrame
 from .ground_visual_motion import CameraCalibration
 from .camera_rotation_compensation import CameraMountCalibration
+from .attitude_time_alignment import AttitudeTimeline
 
-_REQUIRED = (
-    "timestamp_us", "image_path", "height_agl_m",
-    "roll_rad", "pitch_rad", "yaw_rad",
-)
+_REQUIRED_BASE = ("timestamp_us", "image_path", "height_agl_m")
+_REQUIRED_ORIENTATION = ("roll_rad", "pitch_rad", "yaw_rad")
 
 
 def _camera(path: str | Path) -> CameraCalibration:
@@ -53,6 +52,10 @@ def _camera(path: str | Path) -> CameraCalibration:
 
 def run_manifest(
     manifest: str | Path, calibration: str | Path, output_dir: str | Path,
+    *,
+    attitude_log: str | Path | None = None,
+    camera_to_attitude_offset_us: int = 0,
+    max_attitude_gap_us: int = 25000,
 ) -> dict:
     manifest = Path(manifest)
     output_dir = Path(output_dir)
@@ -70,7 +73,20 @@ def run_manifest(
             raise ValueError("Неверная пространственная калибровка камеры") from exc
         if not mount.valid(camera):
             raise ValueError("Пространственная калибровка не согласована с осями изображения")
-    odom = ContinuousPlanarOdometry(camera, camera_mount=mount)
+    lever_raw = calibration_data.get("camera_offset_body_m", (0., 0., 0.))
+    try:
+        lever = tuple(float(v) for v in lever_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Недопустимое плечо установки камеры") from exc
+    odom = ContinuousPlanarOdometry(camera, camera_mount=mount,
+                                    camera_offset_body_m=lever)
+    timeline = (
+        AttitudeTimeline.from_csv(
+            str(attitude_log),
+            max_sample_gap_us=max_attitude_gap_us,
+            camera_to_attitude_offset_us=camera_to_attitude_offset_us,
+        ) if attitude_log is not None else None
+    )
 
     rows: list[dict] = []
     reasons: Counter[str] = Counter()
@@ -81,7 +97,10 @@ def run_manifest(
         reader = csv.DictReader(stream)
         if not reader.fieldnames:
             raise ValueError("Пустой или недопустимый перечень кадров")
-        missing = sorted(set(_REQUIRED) - set(reader.fieldnames))
+        required = set(_REQUIRED_BASE)
+        if timeline is None:
+            required.update(_REQUIRED_ORIENTATION)
+        missing = sorted(required - set(reader.fieldnames))
         if missing:
             raise ValueError(f"Отсутствуют обязательные столбцы: {missing}")
         truth_columns = {"true_n_m", "true_e_m"}
@@ -97,15 +116,24 @@ def run_manifest(
                 raise ValueError(f"Строка {line_no}: не удалось прочитать кадр {file_path}")
 
             try:
-                sample = VisualFrame(
-                    int(record["timestamp_us"]), gray, float(record["height_agl_m"]),
-                    float(record["yaw_rad"]), float(record["roll_rad"]),
-                    float(record["pitch_rad"]),
-                )
+                stamp = int(record["timestamp_us"])
+                height = float(record["height_agl_m"])
+                attitude_unavailable = False
+                if timeline is None:
+                    rpy = (float(record["roll_rad"]), float(record["pitch_rad"]),
+                           float(record["yaw_rad"]))
+                else:
+                    try:
+                        rpy = timeline.at_camera_time(stamp)
+                    except ValueError:
+                        attitude_unavailable = True
+                        rpy = (float("nan"), float("nan"), float("nan"))
+                sample = VisualFrame(stamp, gray, height, rpy[2], rpy[0], rpy[1])
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Строка {line_no}: неверные числовые данные") from exc
 
-            result = odom.process(sample)
+            result = (odom.reject_frame(sample.timestamp_us, "ATTITUDE_SYNC_FAILED")
+                      if attitude_unavailable else odom.process(sample))
             reasons[result.status] += 1
             current = {
                 "timestamp_us": sample.timestamp_us,
@@ -159,6 +187,10 @@ def run_manifest(
         "independent_segments": len(set(row["segment_id"] for row in rows)),
         "status_counts": dict(sorted(reasons.items())),
         "reference_available": has_truth,
+        "attitude_synchronized_from_log": timeline is not None,
+        "camera_to_attitude_offset_us": (
+            camera_to_attitude_offset_us if timeline is not None else None
+        ),
         "reference_evaluated_intervals": len(errors),
         # Error assessed only on observed intervals, relative to segment start.
         "relative_position_rmse_m": (
@@ -183,8 +215,18 @@ def main() -> None:
     parser.add_argument("--manifest", required=True, help="CSV перечень кадров")
     parser.add_argument("--calibration", required=True, help="YAML параметры камеры")
     parser.add_argument("--output-dir", default="outputs/visual_odometry", help="Каталог результатов")
+    parser.add_argument("--attitude-log", help="CSV кватернионов оценки ориентации: timestamp_us,qw,qx,qy,qz")
+    parser.add_argument("--camera-to-attitude-offset-us", type=int, default=0,
+                        help="t_ориентации = t_камеры + offset; оценить при калибровке")
+    parser.add_argument("--max-attitude-gap-us", type=int, default=25000,
+                        help="Максимальный интервал между соседними отсчетами ориентации")
     args = parser.parse_args()
-    result = run_manifest(args.manifest, args.calibration, args.output_dir)
+    result = run_manifest(
+        args.manifest, args.calibration, args.output_dir,
+        attitude_log=args.attitude_log,
+        camera_to_attitude_offset_us=args.camera_to_attitude_offset_us,
+        max_attitude_gap_us=args.max_attitude_gap_us,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
