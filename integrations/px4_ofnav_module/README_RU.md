@@ -34,17 +34,10 @@ y = качество ОП, 0...255
 z = RejectReason
 ```
 
-Ниже приведен предусмотренный формат внешней одометрии. **В текущей ревизии его публикация заблокирована** до подтверждения трехкомпонентной скорости:
-
-```text
-vehicle_visual_odometry
-velocity[0] = VN, м/с
-velocity[1] = VE, м/с
-velocity[2] = NaN
-velocity_frame = NED
-position = NaN
-q = NaN
-```
+Внешняя одометрия `vehicle_visual_odometry` не публикуется:
+двухкомпонентная скорость по ОП не дает права задавать не измеренную
+вертикальную составляющую. До получения трехкомпонентной скорости и
+проверки EKF2 канал намеренно отключен.
 
 Безопасное поведение по умолчанию: модуль **не управляет моторами**, **не подменяет EKF2** и **не отправляет команды в САУ**. Fusion-output выключен. Флаг `-e` возвращает ошибку, чтобы нельзя было случайно включить несогласованную коррекцию EKF2.
 
@@ -88,7 +81,10 @@ listener sensor_optical_flow 5
 listener distance_sensor 5
 listener vehicle_imu 5
 listener vehicle_attitude 5
-listener debug_vect 20
+uorb top
+# Уточнить номера двух экземпляров debug_vect, затем:
+listener debug_vect -i 0 5
+listener debug_vect -i 1 5
 ```
 
 Частота публикации:
@@ -156,7 +152,7 @@ make px4_fmu-v5_default upload
 ofnav start -r 100 -q 120
 listener sensor_optical_flow 10
 listener distance_sensor 10
-listener debug_vect 20
+listener debug_vect -i 0 5\nlistener debug_vect -i 1 5
 ofnav status
 ```
 
