@@ -99,6 +99,10 @@ class HorizontalVisualInertialFilter:
         )
 
     def predict(self, reading: ImuReading) -> FusionOutput:
+        if self._status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE",
+                            "ACCEL_BIAS_OUT_OF_BOUNDS",
+                            "POSTERIOR_COVARIANCE_INVALID"):
+            return self.snapshot()
         # Validates readings and latches lost-history failure in preintegrator.
         q0 = self._imu.q.copy()
         try:
@@ -147,7 +151,8 @@ class HorizontalVisualInertialFilter:
 
     def update_visual(self, measurement: VisualVelocityMeasurement) -> FusionOutput:
         if self._status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE",
-                            "ACCEL_BIAS_OUT_OF_BOUNDS"):
+                            "ACCEL_BIAS_OUT_OF_BOUNDS",
+                            "POSTERIOR_COVARIANCE_INVALID"):
             return self.snapshot()
         if self._last_imu is None:
             self._status = "NO_IMU_REFERENCE"
