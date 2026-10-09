@@ -80,3 +80,39 @@ def test_manifest_runner_rejects_missing_image(tmp_path):
     (tmp_path / "frame1.png").unlink()
     with pytest.raises(ValueError, match="не удалось прочитать кадр"):
         run_manifest(manifest, calibration, tmp_path / "out")
+
+
+def test_reference_error_never_connects_across_unobserved_time_gap(tmp_path):
+    manifest, calibration = _dataset(tmp_path)
+    with manifest.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        fieldnames = reader.fieldnames
+        records = list(reader)
+
+    # A discontinuous reference trajectory across a missing time interval.
+    # The estimator must re-anchor truth independently for the next segment.
+    records[2]["timestamp_us"] = 2_000_000
+    records[2]["true_n_m"] = 1000.0
+    records[2]["true_e_m"] = -500.0
+    records.append({
+        **records[2],
+        "timestamp_us": 2_200_000,
+        "image_path": "frame3.png",
+        "true_n_m": 1000.0 - 2.0 * 100.0 / 1400.0,
+        "true_e_m": -500.0,
+    })
+    # The final image is shifted only two pixels relative to the new anchor.
+    from_frame = cv2.imread(str(tmp_path / "frame2.png"), cv2.IMREAD_GRAYSCALE)
+    img = cv2.warpAffine(from_frame, np.float32([[1, 0, 2], [0, 1, 0]]),
+                         (640, 480))
+    assert cv2.imwrite(str(tmp_path / "frame3.png"), img)
+    with manifest.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+
+    report = run_manifest(manifest, calibration, tmp_path / "out")
+    assert report["independent_segments"] == 2
+    assert report["accepted_intervals"] == 2
+    assert report["reference_evaluated_intervals"] == 2
+    assert report["relative_position_rmse_m"] < 0.10
