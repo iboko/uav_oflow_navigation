@@ -21,6 +21,7 @@ import yaml
 
 from .continuous_visual_odometry import ContinuousPlanarOdometry, VisualFrame
 from .ground_visual_motion import CameraCalibration
+from .camera_rotation_compensation import CameraMountCalibration
 
 _REQUIRED = (
     "timestamp_us", "image_path", "height_agl_m",
@@ -55,7 +56,21 @@ def run_manifest(
 ) -> dict:
     manifest = Path(manifest)
     output_dir = Path(output_dir)
-    odom = ContinuousPlanarOdometry(_camera(calibration))
+    camera = _camera(calibration)
+    with Path(calibration).open(encoding="utf-8") as stream:
+        calibration_data = yaml.safe_load(stream)
+    mount = None
+    if "body_from_camera" in calibration_data:
+        try:
+            mount = CameraMountCalibration(tuple(
+                tuple(float(v) for v in row)
+                for row in calibration_data["body_from_camera"]
+            ))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Неверная пространственная калибровка камеры") from exc
+        if not mount.valid(camera):
+            raise ValueError("Пространственная калибровка не согласована с осями изображения")
+    odom = ContinuousPlanarOdometry(camera, camera_mount=mount)
 
     rows: list[dict] = []
     reasons: Counter[str] = Counter()
