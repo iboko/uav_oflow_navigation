@@ -49,8 +49,8 @@ def _path(base: Path, name: str) -> Path:
     return (base / value).resolve()
 
 
-def _triple(record: dict, prefix: str) -> tuple[float, float, float]:
-    return tuple(float(record[f"{prefix}_{axis}"]) for axis in "xyz")
+def _triple(record: dict, prefix: str, unit: str) -> tuple[float, float, float]:
+    return tuple(float(record[f"{prefix}_{axis}_{unit}"]) for axis in "xyz")
 
 
 def _truth(path: Path) -> tuple[dict[int, TruthSample], dict[int, dict], set[str]]:
@@ -219,8 +219,8 @@ def run_consistency(
                 row = ref_raw[t]
                 full = nees_full_15(
                     states[t], reference[t],
-                    truth_gyro_bias_rad_s=_triple(row, "bg"),
-                    truth_accel_bias_m_s2=_triple(row, "ba"),
+                    truth_gyro_bias_rad_s=_triple(row, "bg", "rad_s"),
+                    truth_accel_bias_m_s2=_triple(row, "ba", "m_s2"),
                     origin_alignment_verified=pos_aligned,
                     heading_alignment_verified=yaw_aligned,
                 )
