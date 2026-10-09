@@ -15,6 +15,7 @@ import numpy as np
 from .ground_visual_motion import CameraCalibration, GroundMotionEstimate, estimate_ground_motion
 from .camera_rotation_compensation import (CameraMountCalibration, align_current_to_previous,
                                            camera_delta_to_center_ned)
+from .velocity_uncertainty import VelocityErrorAssumptions, modeled_velocity_covariance_ned
 
 
 def _wrap(angle: float) -> float:
@@ -48,6 +49,9 @@ class VisualOdomResult:
     # Только ориентировочный накопленный предел разрешения пикселей; не
     # доверительный интервал, не сертифицированная погрешность положения.
     resolution_proxy_m: float = 0.0
+    velocity_cov_nn: float = float("nan")
+    velocity_cov_ne: float = float("nan")
+    velocity_cov_ee: float = float("nan")
 
 
 class ContinuousPlanarOdometry:
@@ -65,6 +69,7 @@ class ContinuousPlanarOdometry:
         *,
         camera_mount: CameraMountCalibration | None = None,
         camera_offset_body_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        velocity_error_assumptions: VelocityErrorAssumptions | None = None,
         max_pair_dt_s: float = 0.35,
         max_yaw_change_rad: float = 0.30,
         max_relative_height_change: float = 0.12,
@@ -95,6 +100,10 @@ class ContinuousPlanarOdometry:
             raise ValueError("Плечо камеры слишком велико")
         if camera_mount is None and np.any(offset != 0.0):
             raise ValueError("Ненулевое плечо требует трехмерной калибровки камеры")
+        if (velocity_error_assumptions is not None and
+                not velocity_error_assumptions.valid()):
+            raise ValueError("Недопустимые предположения о погрешностях")
+        self._velocity_errors = velocity_error_assumptions
         self._offset = tuple(float(v) for v in offset)
         self._calib = calibration
         self._mount = camera_mount
@@ -130,13 +139,17 @@ class ContinuousPlanarOdometry:
 
     def _out(self, timestamp: int, status: str, accepted: bool = False,
              motion: GroundMotionEstimate | None = None,
-             vn: float = float("nan"), ve: float = float("nan")) -> VisualOdomResult:
+             vn: float = float("nan"), ve: float = float("nan"),
+             covariance: np.ndarray | None = None) -> VisualOdomResult:
         return VisualOdomResult(
             timestamp, self._segment_id, status, accepted,
             self._north, self._east, vn, ve,
             motion.inlier_points if motion else 0,
             motion.inlier_ratio if motion else 0.0,
             self._resolution,
+            float(covariance[0, 0]) if covariance is not None else float("nan"),
+            float(covariance[0, 1]) if covariance is not None else float("nan"),
+            float(covariance[1, 1]) if covariance is not None else float("nan"),
         )
 
     @staticmethod
@@ -270,6 +283,21 @@ class ContinuousPlanarOdometry:
         if not isfinite(vn) or not isfinite(ve):
             self._restart(current)
             return self._out(current.timestamp_us, "NONFINITE_VELOCITY")
+        covariance = None
+        if self._velocity_errors is not None:
+            try:
+                covariance = modeled_velocity_covariance_ned(
+                    self._velocity_errors, camera=self._calib, motion=motion,
+                    height_agl_m=height, interval_s=dt_s,
+                    previous_rpy=(previous.roll_rad, previous.pitch_rad,
+                                  previous.yaw_rad),
+                    current_rpy=(current.roll_rad, current.pitch_rad,
+                                 current.yaw_rad),
+                    center_velocity_ned_m_s=(vn, ve),
+                )
+            except ValueError:
+                self._restart(current)
+                return self._out(current.timestamp_us, "UNCERTAINTY_MODEL_FAILED")
         self._north += vn * dt_s
         self._east += ve * dt_s
 
@@ -280,4 +308,4 @@ class ContinuousPlanarOdometry:
         self._resolution += sqrt(du_floor * du_floor + dv_floor * dv_floor)
         self._previous = current
         return self._out(current.timestamp_us, "VALID", accepted=True,
-                         motion=motion, vn=vn, ve=ve)
+                         motion=motion, vn=vn, ve=ve, covariance=covariance)
