@@ -239,6 +239,36 @@ void test_range_sample_skew_must_reject_flow_correction() {
     assert(result.mode != ofnav::NavMode::FlowNav);
 }
 
+void test_excessive_tilt_detected_during_flow_dropout() {
+    const auto cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::ImuSample imu{1010000U, {}, {0.0F, 0.0F, -9.81F}, true};
+    const ofnav::RangeSample range{1010000U, 1.0F, true};
+    const ofnav::AttitudeSample attitude{
+        1010000U, 2.0F * cfg.max_tilt_rad, 0.0F, 0.0F
+    };
+    const auto result = runtime.monitor(1010000U, imu, range, {}, attitude);
+    assert(result.health.excessive_tilt);
+    assert(result.mode == ofnav::NavMode::FailsafeLand);
+}
+
+void test_nonfinite_imu_does_not_enter_flow_mode() {
+    const auto cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::ImuSample imu{1010000U, {},
+        {ofnav::kNaN, 0.0F, -9.81F}, true};
+    const ofnav::RangeSample range{1010000U, 1.0F, true};
+    const ofnav::OpticalFlowRadSample flow{1010000U, 0.04F,
+        0.0F, 0.01F, 0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::AttitudeSample attitude{1010000U, 0.0F, 0.0F, 0.0F};
+    const auto result = runtime.step(imu, range, flow, attitude, 1010000U);
+    assert(!result.health.imu_valid);
+    assert(!result.flow.accepted);
+    assert(result.mode == ofnav::NavMode::FailsafeLand);
+}
+
 } // namespace
 
 int main() {
@@ -257,6 +287,8 @@ int main() {
     test_missing_gyro_compensation_is_rejected();
     test_velocity_rotation_respects_pitch();
     test_range_sample_skew_must_reject_flow_correction();
+    test_excessive_tilt_detected_during_flow_dropout();
+    test_nonfinite_imu_does_not_enter_flow_mode();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }
