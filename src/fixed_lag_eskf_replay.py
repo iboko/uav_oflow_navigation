@@ -88,6 +88,7 @@ class FixedLagEskfReplay:
         self._states: list[InertialErrorStateFilter] = []
         self._visual: dict[int, VisualVelocityMeasurement] = {}
         self._latest_raw_time_us = 0
+        self._failed = False
         self._per_measurement_status: dict[int, str] = {}
 
     @property
@@ -115,6 +116,8 @@ class FixedLagEskfReplay:
             }
 
     def push_imu(self, reading: ImuReading) -> EskfSnapshot:
+        if self._failed:
+            raise ValueError("Инерциальный фильтр заблокирован после отказа")
         if not isinstance(reading.timestamp_us, int) or (
             reading.timestamp_us <= self._latest_raw_time_us
         ):
@@ -125,11 +128,13 @@ class FixedLagEskfReplay:
         ):
             # Preserve failing estimator state, do not synthesize missing samples.
             self._filter.predict(reading)
+            self._failed = True
             raise ValueError("Неисправимый разрыв последовательности ИИМ")
         if self._checkpoint is not None and len(self._raw) >= self._max_samples:
             raise ValueError("Окно истории ИИМ переполнено: выборка не принята")
         result = self._filter.predict(reading)
         if result.status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE"):
+            self._failed = True
             raise ValueError(f"Инерциальный фильтр перешел в отказ: {result.status}")
         self._latest_raw_time_us = reading.timestamp_us
         if self._checkpoint is None:
@@ -151,6 +156,8 @@ class FixedLagEskfReplay:
                                 state.accepted_visual_count,
                                 state.rejected_visual_count, state)
 
+        if self._failed:
+            return rejected("IMU_INVALID_OR_GAP")
         if not _measurement_valid(measurement):
             return rejected("INVALID_VISUAL_MEASUREMENT")
         if self._checkpoint is None or self._checkpoint_imu is None:
@@ -172,6 +179,11 @@ class FixedLagEskfReplay:
             future_filter, future_states, statuses = self._replay(candidate)
         except (ValueError, np.linalg.LinAlgError):
             return rejected("REPLAY_FAILED")
+        # Do not persist a candidate which caused an internal correction
+        # failure. NIS-based outliers are valid rejections and remain in
+        # the chronological event history for reproducible diagnostics.
+        if statuses[t] not in ("VISUAL_CORRECTED", "VISUAL_OUTLIER_REJECTED"):
+            return rejected(statuses[t])
         # Commit atomically only when replay has completed.
         self._visual = candidate
         self._filter = future_filter
