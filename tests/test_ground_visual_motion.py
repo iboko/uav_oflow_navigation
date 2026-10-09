@@ -73,3 +73,21 @@ def test_invalid_axis_calibration_is_rejected():
     out = estimate_ground_motion(image, image, 0.2, 100.0, bad)
     assert not out.valid
     assert out.reason == "INVALID_CALIBRATION"
+
+
+def test_concentrated_features_do_not_pass_geometric_gate():
+    rng = np.random.default_rng(22)
+    image = np.zeros((480, 640), np.uint8)
+    for _ in range(180):
+        x, y = rng.integers([30, 30], [125, 125])
+        cv2.circle(image, (int(x), int(y)), 2, 220, -1)
+    warped = cv2.warpAffine(
+        image, np.float32([[1, 0, 2.0], [0, 1, 1.0]]),
+        (640, 480)
+    )
+    out = estimate_ground_motion(image, warped, 0.2, 100.0, calibration())
+    assert not out.valid
+    assert out.reason in (
+        "INSUFFICIENT_SPATIAL_DISTRIBUTION",
+        "TOO_FEW_RELIABLE_TRACKS",
+    )
