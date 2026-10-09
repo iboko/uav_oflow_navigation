@@ -295,6 +295,19 @@ void test_missing_imu_history_requires_explicit_reset() {
     assert(reset_out.mode != ofnav::NavMode::FailsafeLand);
 }
 
+void test_combined_roll_pitch_exceeds_inclination_limit() {
+    const auto cfg = baseConfig();
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::OpticalFlowRadSample flow{1000000U, 0.04F,
+        0.0F, 0.003F, 0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::RangeSample range{1000000U, 1.2F, true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.35F, 0.35F, 0.0F};
+    const auto result = estimator.update(flow, range, imu, att);
+    assert(!result.accepted);
+    assert(result.reason == ofnav::RejectReason::ExcessiveTilt);
+}
+
 } // namespace
 
 int main() {
@@ -316,6 +329,7 @@ int main() {
     test_excessive_tilt_detected_during_flow_dropout();
     test_nonfinite_imu_does_not_enter_flow_mode();
     test_missing_imu_history_requires_explicit_reset();
+    test_combined_roll_pitch_exceeds_inclination_limit();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }
