@@ -110,3 +110,15 @@ def test_pitched_stationary_imu_cancels_gravity_in_ned():
         imu.step(reading(1_000_000 + i * 10_000,
                          accel=tuple(f_body)))
     assert np.linalg.norm(imu.vel) < 1e-9
+
+
+def test_nonfinite_imu_is_latched_until_explicit_reset():
+    imu = ImuPreintegrator(quaternion_body_to_ned=(1., 0., 0., 0.))
+    imu.step(reading(1_000_000))
+    with pytest.raises(ValueError, match="Неконечный"):
+        imu.step(reading(1_010_000, accel=(float("nan"), 0., -9.80665)))
+    assert not imu.healthy
+    with pytest.raises(ValueError, match="reset"):
+        imu.step(reading(1_020_000))
+    imu.reset(quaternion_body_to_ned=(1., 0., 0., 0.))
+    assert imu.step(reading(1_030_000)).dt_s == 0.0
