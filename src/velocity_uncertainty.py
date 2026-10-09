@@ -57,7 +57,7 @@ def modeled_velocity_covariance_ned(
     Ошибки рельефа, скользящего затвора, временная корреляция и дисторсия
     моделью НЕ учтены. Значения являются расчетными предположениями.
     """
-    if not assumptions.valid() or not camera.valid() or not motion.accepted:
+    if not assumptions.valid() or not camera.valid() or not motion.valid:
         raise ValueError("Нет достоверных предположений для оценки ковариации")
     if not (isfinite(height_agl_m) and 0 < height_agl_m <= 150
             and isfinite(interval_s) and 0 < interval_s <= 0.5):
