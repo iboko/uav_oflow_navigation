@@ -151,3 +151,20 @@ def test_future_measurement_not_applied_prematurely_and_gap_does_not_rearm():
         engine.push_imu(imu(1_100_000, 10))
     with pytest.raises(ValueError, match="Инерциальный фильтр"):
         engine.push_imu(imu(1_110_000, 11))
+
+
+def test_nis_kept_for_each_exposure_even_after_later_replay():
+    engine = FixedLagEskfReplay(factory, max_lag_us=300_000)
+    for i in range(31):
+        engine.push_imu(imu(1_000_000 + i * 10000, i))
+    outlier = engine.push_delayed_visual(camera(1_210_000, 100., variance=0.001))
+    assert outlier.status == "VISUAL_OUTLIER_REJECTED"
+    assert np.isfinite(outlier.nis)
+    assert outlier.nis > 9.210340371976184
+
+    earlier = engine.push_delayed_visual(camera(1_160_000, 0.07))
+    assert earlier.status == "VISUAL_CORRECTED"
+    assert np.isfinite(earlier.nis)
+    assert 0 <= earlier.nis < 9.210340371976184
+    # The outlier remains an excluded measurement after the rewind.
+    assert engine.state.rejected_visual_count == 1
