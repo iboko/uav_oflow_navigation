@@ -21,6 +21,13 @@ constexpr float kEps = 1.0e-6F;
     return v * v;
 }
 
+[[nodiscard]] bool tiltExceeded(float roll, float pitch, float max_tilt) noexcept {
+    // Combined inclination of the down-facing optical axis from vertical.
+    return !std::isfinite(roll) || !std::isfinite(pitch) ||
+        std::fabs(roll) > max_tilt || std::fabs(pitch) > max_tilt ||
+        std::cos(roll) * std::cos(pitch) < std::cos(max_tilt);
+}
+
 [[nodiscard]] bool imuFinite(const ImuSample& imu) noexcept {
     return imu.valid &&
         std::isfinite(imu.gyro_rad_s.x) && std::isfinite(imu.gyro_rad_s.y) &&
@@ -131,7 +138,7 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
         return out;
     }
 
-    if (std::fabs(attitude.roll_rad) > cfg_.max_tilt_rad || std::fabs(attitude.pitch_rad) > cfg_.max_tilt_rad) {
+    if (tiltExceeded(attitude.roll_rad, attitude.pitch_rad, cfg_.max_tilt_rad)) {
         out.reason = RejectReason::ExcessiveTilt;
         return out;
     }
@@ -452,8 +459,7 @@ RuntimeOutput SafetyMonitor::evaluate(uint64_t now_us,
     out.health.stale_range = !out.health.range_valid;
     out.health.stale_flow = !out.health.flow_valid;
     out.health.excessive_tilt = attitude_valid &&
-        (std::fabs(attitude.roll_rad) > cfg_.max_tilt_rad ||
-         std::fabs(attitude.pitch_rad) > cfg_.max_tilt_rad);
+        tiltExceeded(attitude.roll_rad, attitude.pitch_rad, cfg_.max_tilt_rad);
 
     if (!out.health.imu_valid || !attitude_valid || out.health.stale_range || out.health.excessive_tilt) {
         out.mode = NavMode::FailsafeLand;
