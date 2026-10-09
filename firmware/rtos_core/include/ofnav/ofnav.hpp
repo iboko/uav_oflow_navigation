@@ -225,6 +225,9 @@ public:
 
     void reset(uint64_t time_us) noexcept;
 
+    // Feed each IMU sample separately from the slower optical-flow rate.
+    void predictImu(const ImuSample& imu, const AttitudeSample& attitude) noexcept;
+
     [[nodiscard]] RuntimeOutput step(const ImuSample& imu,
                                      const RangeSample& range,
                                      const OpticalFlowRadSample& flow,
