@@ -65,6 +65,7 @@ class ContinuousPlanarOdometry:
         max_yaw_change_rad: float = 0.30,
         max_relative_height_change: float = 0.12,
         max_tilt_rad: float = 0.15,
+        max_delta_tilt_rad: float = 0.003,
         min_inliers: int = 20,
         min_inlier_ratio: float = 0.60,
         pixel_resolution_floor: float = 0.5,
@@ -76,6 +77,7 @@ class ContinuousPlanarOdometry:
             or not 0.0 < max_yaw_change_rad <= pi
             or not 0.0 < max_relative_height_change < 1.0
             or not 0.0 < max_tilt_rad <= 0.4
+            or not 0.0 < max_delta_tilt_rad <= 0.10
             or min_inliers < 5 or not 0.0 < min_inlier_ratio <= 1.0
             or not isfinite(pixel_resolution_floor) or pixel_resolution_floor <= 0.0
         ):
@@ -85,6 +87,7 @@ class ContinuousPlanarOdometry:
         self._max_yaw = max_yaw_change_rad
         self._max_height_jump = max_relative_height_change
         self._max_tilt = max_tilt_rad
+        self._max_delta_tilt = max_delta_tilt_rad
         self._min_inliers = min_inliers
         self._min_ratio = min_inlier_ratio
         self._pixel_resolution = pixel_resolution_floor
@@ -182,6 +185,14 @@ class ContinuousPlanarOdometry:
         ):
             self._restart(current)
             return self._out(current.timestamp_us, "TILT_EXCEEDS_PLANAR_MODEL")
+
+        # Without full 3D camera/IMU calibration, a changing roll/pitch angle
+        # creates image translation indistinguishable from vehicle motion.
+        # Reject it rather than synthesizing false horizontal displacement.
+        if hypot(current.roll_rad - previous.roll_rad,
+                 current.pitch_rad - previous.pitch_rad) > self._max_delta_tilt:
+            self._restart(current)
+            return self._out(current.timestamp_us, "UNCOMPENSATED_TILT_CHANGE")
 
         height = 0.5 * (previous.height_agl_m + current.height_agl_m)
         motion = estimate_ground_motion(
