@@ -24,9 +24,9 @@
 1. запуск C++ RTOS-ядра внутри PX4 flight stack;
 2. подписка на `sensor_optical_flow`, `distance_sensor`, `vehicle_imu`, `vehicle_attitude`;
 3. публикация диагностики через `debug_vect`;
-4. опциональный fusion-output path через `vehicle_visual_odometry`;
+4. интерфейс внешней одометрии подготовлен, но слияние скорости с EKF2 заблокировано до получения достоверной скорости по трем осям;
 5. штатные команды `ofnav start`, `ofnav status`, `ofnav stop` в PX4 shell;
-6. безопасное поведение по умолчанию: модуль не командует моторами и не подменяет EKF2, пока fusion-output явно не включен флагом `-e`.
+6. модуль не командует моторами; флаг `-e` отвергается, пока нет достоверного трехкомпонентного измерения скорости.
 
 ## Быстрый запуск Python-уровня
 
@@ -98,22 +98,10 @@ listener debug_vect 20
 uorb top
 ```
 
-В PX4 shell, fusion-output path после проверки диагностики:
-
-```sh
-ofnav stop
-ofnav start -r 100 -q 120 -e
-listener vehicle_visual_odometry 10
-```
-
-Для EKF2 velocity-only fusion:
-
-```sh
-param show EKF2_EV_CTRL
-param set EKF2_EV_CTRL 4
-param set EKF2_EV_NOISE_MD 0
-param set EKF2_EVV_NOISE 0.30
-```
+Важное ограничение: при отсутствии измерения вертикальной скорости команда
+`ofnav start -e` выдает ошибку и не включает слияние данных с EKF2.
+Перед использованием внешней одометрии требуется отдельный источник достоверной
+вертикальной скорости, оценка ковариаций и приемочные проверки на стенде.
 
 Подробная инструкция находится в `integrations/px4_ofnav_module/README_RU.md`.
 
@@ -183,7 +171,7 @@ v_nav = R_yaw * v_body_at_cg
 
 `firmware/rtos_core` — переносимое ядро для настоящей бортовой реализации.
 
-`integrations/px4_ofnav_module` — PX4 uORB/NuttX-модуль, который запускает RTOS-ядро внутри настоящего PX4 flight stack и опционально публикует velocity-only fusion-output в `vehicle_visual_odometry`.
+`integrations/px4_ofnav_module` — PX4 uORB/NuttX-модуль, который запускает RTOS-ядро внутри настоящего PX4 flight stack и содержит заготовку интерфейса внешней одометрии; слияние заблокировано до проверки трехкомпонентной скорости.
 
 ## Рекомендуемые параметры для первого этапа
 
