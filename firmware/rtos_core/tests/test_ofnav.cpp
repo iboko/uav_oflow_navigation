@@ -205,6 +205,40 @@ void test_missing_gyro_compensation_is_rejected() {
     assert(out.reason == ofnav::RejectReason::NonFiniteInput);
 }
 
+void test_velocity_rotation_respects_pitch() {
+    auto cfg = baseConfig();
+    cfg.sensor_offset_body_m = {0.0F, 0.0F, 0.0F};
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const float pitch = 0.20F;
+    const float height = 1.0F;
+    const float v_sensor_x = 0.25F;
+    const float dt = 0.04F;
+    const ofnav::OpticalFlowRadSample flow{1000000U, dt, 0.0F,
+        v_sensor_x / height * dt, 0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::RangeSample range{1000000U, height / std::cos(pitch), true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample attitude{1000000U, 0.0F, pitch, 0.0F};
+    const auto result = estimator.update(flow, range, imu, attitude);
+    assert(result.accepted);
+    assert(near(result.velocity_body_m_s.x, v_sensor_x));
+    assert(near(result.velocity_nav_m_s.x, v_sensor_x * std::cos(pitch)));
+}
+
+void test_range_sample_skew_must_reject_flow_correction() {
+    auto cfg = baseConfig();
+    cfg.max_measurement_skew_us = 10000U;
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::ImuSample imu{1080000U, {}, {}, true};
+    const ofnav::RangeSample range{1000000U, 1.0F, true};
+    const ofnav::OpticalFlowRadSample flow{1080000U, 0.04F,
+        0.0F, 0.002F, 0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::AttitudeSample attitude{1080000U, 0.0F, 0.0F, 0.0F};
+    const auto result = runtime.step(imu, range, flow, attitude, 1080000U);
+    assert(!result.flow.accepted);
+    assert(result.mode != ofnav::NavMode::FlowNav);
+}
+
 } // namespace
 
 int main() {
@@ -221,6 +255,8 @@ int main() {
     test_asynchronous_imu_prediction_between_flow_frames();
     test_reused_imu_timestamp_not_predicted_twice();
     test_missing_gyro_compensation_is_rejected();
+    test_velocity_rotation_respects_pitch();
+    test_range_sample_skew_must_reject_flow_correction();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }
