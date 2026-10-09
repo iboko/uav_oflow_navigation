@@ -30,6 +30,7 @@ class ReplayResult:
     accepted_visual_count: int
     rejected_visual_count: int
     state: EskfSnapshot
+    nis: float = float("nan")
 
 
 def _interpolate(before: ImuReading, after: ImuReading, t: int) -> ImuReading:
@@ -90,6 +91,7 @@ class FixedLagEskfReplay:
         self._latest_raw_time_us = 0
         self._failed = False
         self._per_measurement_status: dict[int, str] = {}
+        self._per_measurement_nis: dict[int, float] = {}
 
     @property
     def state(self) -> EskfSnapshot:
@@ -112,6 +114,10 @@ class FixedLagEskfReplay:
                             if t > self._checkpoint_imu.timestamp_us}
             self._per_measurement_status = {
                 t: status for t, status in self._per_measurement_status.items()
+                if t > self._checkpoint_imu.timestamp_us
+            }
+            self._per_measurement_nis = {
+                t: value for t, value in self._per_measurement_nis.items()
                 if t > self._checkpoint_imu.timestamp_us
             }
 
@@ -176,7 +182,7 @@ class FixedLagEskfReplay:
         candidate = dict(self._visual)
         candidate[t] = measurement
         try:
-            future_filter, future_states, statuses = self._replay(candidate)
+            future_filter, future_states, statuses, niss = self._replay(candidate)
         except (ValueError, np.linalg.LinAlgError):
             return rejected("REPLAY_FAILED")
         # Do not persist a candidate which caused an internal correction
@@ -189,11 +195,13 @@ class FixedLagEskfReplay:
         self._filter = future_filter
         self._states = future_states
         self._per_measurement_status = statuses
+        self._per_measurement_nis = niss
         self._trim()
         state = self._filter.snapshot()
         return ReplayResult(
             statuses[t], t, self._latest_raw_time_us, len(self._raw),
             state.accepted_visual_count, state.rejected_visual_count, state,
+            niss[t],
         )
 
     def _replay(
@@ -202,6 +210,7 @@ class FixedLagEskfReplay:
         InertialErrorStateFilter,
         list[InertialErrorStateFilter],
         dict[int, str],
+        dict[int, float],
     ]:
         assert self._checkpoint is not None and self._checkpoint_imu is not None
         f = deepcopy(self._checkpoint)
@@ -210,6 +219,7 @@ class FixedLagEskfReplay:
         i = 0
         states: list[InertialErrorStateFilter] = []
         statuses: dict[int, str] = {}
+        niss: dict[int, float] = {}
         for raw in self._raw:
             while i < len(ordered) and ordered[i].timestamp_us < raw.timestamp_us:
                 visual = ordered[i]
@@ -219,17 +229,21 @@ class FixedLagEskfReplay:
                 f.predict(_interpolate(preceding, raw, stamp))
                 if f.snapshot().status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE"):
                     raise ValueError("Прогноз завершился отказом")
-                statuses[stamp] = f.update_visual_velocity(visual).status
+                result = f.update_visual_velocity(visual)
+                statuses[stamp] = result.status
+                niss[stamp] = result.last_nis
                 i += 1
             f.predict(raw)
             if f.snapshot().status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE"):
                 raise ValueError("Повторный прогноз завершился отказом")
             while i < len(ordered) and ordered[i].timestamp_us == raw.timestamp_us:
                 visual = ordered[i]
-                statuses[visual.timestamp_us] = f.update_visual_velocity(visual).status
+                result = f.update_visual_velocity(visual)
+                statuses[visual.timestamp_us] = result.status
+                niss[visual.timestamp_us] = result.last_nis
                 i += 1
             states.append(deepcopy(f))
             preceding = raw
         if i != len(ordered):
             raise ValueError("Визуальное измерение вне истории ИИМ")
-        return f, states, statuses
+        return f, states, statuses, niss
