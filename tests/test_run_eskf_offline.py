@@ -55,6 +55,14 @@ def test_stationary_imu_camera_log_does_not_create_horizontal_motion(tmp_path):
         rows = list(csv.DictReader(f))
     assert len(rows) == 3
     assert all(abs(float(row["vn_m_s"])) < 1e-9 for row in rows)
+    with (tmp_path / "out" / "eskf_states.jsonl").open(encoding="utf-8") as f:
+        snapshots = [json.loads(line) for line in f if line.strip()]
+    assert len(snapshots) == 3
+    assert all(len(row["covariance_15x15"]) == 15 for row in snapshots)
+    assert all(len(row["covariance_15x15"][0]) == 15 for row in snapshots)
+    assert [s["timestamp_us"] for s in snapshots] == [
+        1_005_000, 1_105_000, 1_205_000
+    ]
     assert json.loads((tmp_path / "out" / "eskf_summary.json").read_text())[
         "accepted_visual_updates"
     ] == 3
