@@ -116,3 +116,67 @@ def test_reference_error_never_connects_across_unobserved_time_gap(tmp_path):
     assert report["accepted_intervals"] == 2
     assert report["reference_evaluated_intervals"] == 2
     assert report["relative_position_rmse_m"] < 0.10
+
+
+def test_reference_reanchors_after_uncompensated_tilt(tmp_path):
+    manifest, calibration = _dataset(tmp_path)
+    with manifest.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames
+        records = list(reader)
+    records[1]["pitch_rad"] = 0.02
+    records[2]["pitch_rad"] = 0.02
+    with manifest.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+    report = run_manifest(manifest, calibration, tmp_path / "out")
+    assert report["independent_segments"] == 2
+    assert report["accepted_intervals"] == 1
+    assert report["reference_evaluated_intervals"] == 1
+    assert report["relative_position_rmse_m"] < 0.10
+
+
+def test_log_runner_accepts_calibrated_pitch_compensation(tmp_path):
+    from src.camera_rotation_compensation import (
+        CameraMountCalibration, rotation_homography_previous_to_current,
+    )
+    from src.ground_visual_motion import CameraCalibration
+
+    manifest, calibration_path = _dataset(tmp_path)
+    with manifest.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames
+        records = list(reader)[:2]
+
+    cam = CameraCalibration(900, 900, 320, 240, ((0, -1), (1, 0)))
+    mount = CameraMountCalibration(((0., -1., 0.), (1., 0., 0.), (0., 0., 1.)))
+    h = rotation_homography_previous_to_current(
+        cam, mount, previous_rpy=(0., 0., 0.),
+        current_rpy=(0., 0.014, 0.)
+    )
+    frame1 = cv2.imread(str(tmp_path / "frame1.png"), cv2.IMREAD_GRAYSCALE)
+    assert cv2.imwrite(
+        str(tmp_path / "frame1.png"),
+        cv2.warpPerspective(frame1, h, (640, 480))
+    )
+    records[1]["pitch_rad"] = 0.014
+    records[1]["true_n_m"] = 0.0
+    records[1]["true_e_m"] = -2.0 * 100.0 / 900.0
+
+    with manifest.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+
+    calibration_path.write_text(
+        "focal_x_px: 900\nfocal_y_px: 900\n"
+        "center_x_px: 320\ncenter_y_px: 240\n"
+        "image_to_body_xy: [[0, -1], [1, 0]]\n"
+        "body_from_camera: [[0, -1, 0], [1, 0, 0], [0, 0, 1]]\n",
+        encoding="utf-8"
+    )
+    report = run_manifest(manifest, calibration_path, tmp_path / "out")
+    assert report["accepted_intervals"] == 1
+    assert report["reference_evaluated_intervals"] == 1
+    assert report["relative_position_rmse_m"] < 0.12
