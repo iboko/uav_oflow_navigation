@@ -244,6 +244,7 @@ void HorizontalEkf::reset(uint64_t time_us) noexcept {
     p_[5][5] = sq(0.03F);
     last_predict_us_ = time_us;
     initialized_ = true;
+    prediction_healthy_ = true;
     last_innovation_d2_ = 0.0F;
 }
 
@@ -252,13 +253,20 @@ void HorizontalEkf::predict(const ImuSample& imu, const AttitudeSample& attitude
         reset(imu.time_us);
         return;
     }
-    if (!imu.valid || imu.time_us <= last_predict_us_) {
+    if (!prediction_healthy_ || !imu.valid || imu.time_us <= last_predict_us_) {
         return;
     }
 
-    // Large gaps cannot be silently truncated while retaining a fresh timestamp.
+    if (last_predict_us_ == 0U) {
+        // First sample fixes the time origin without integrating unknown history.
+        last_predict_us_ = imu.time_us;
+        return;
+    }
+
+    // Missing inertial history is not a reason to silently reset covariance
+    // to artificially low confidence; recovery needs an explicit reset.
     if ((imu.time_us - last_predict_us_) > 200000U) {
-        reset(imu.time_us);
+        prediction_healthy_ = false;
         return;
     }
     float dt = static_cast<float>(imu.time_us - last_predict_us_) * 1.0e-6F;
@@ -344,7 +352,7 @@ void HorizontalEkf::predict(const ImuSample& imu, const AttitudeSample& attitude
 }
 
 bool HorizontalEkf::updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t quality) noexcept {
-    if (!flow.accepted || !initialized_) {
+    if (!flow.accepted || !initialized_ || !prediction_healthy_) {
         return false;
     }
 
@@ -512,8 +520,15 @@ RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
             last_flow_estimate_.reason = RejectReason::InnovationGate;
         }
     }
-    return safety_.evaluate(now_us, imu, range, flow, last_flow_estimate_,
-                            ekf_.state(), last_innovation_ok_, attitude);
+    RuntimeOutput status = safety_.evaluate(now_us, imu, range, flow, last_flow_estimate_,
+                                                  ekf_.state(), last_innovation_ok_, attitude);
+    if (!ekf_.healthy()) {
+        status.mode = NavMode::FailsafeLand;
+        status.health.imu_valid = false;
+        status.flow.accepted = false;
+        status.flow.reason = RejectReason::ImuInvalid;
+    }
+    return status;
 }
 
 RuntimeOutput OfNavRuntime::monitor(uint64_t now_us,
@@ -523,8 +538,13 @@ RuntimeOutput OfNavRuntime::monitor(uint64_t now_us,
                                     const AttitudeSample& attitude) noexcept {
     // Never reuse a previous accepted measurement as a new measurement.
     FlowVelocityEstimate inactive{};
-    return safety_.evaluate(now_us, imu, range, flow, inactive,
-                            ekf_.state(), false, attitude);
+    RuntimeOutput status = safety_.evaluate(now_us, imu, range, flow, inactive,
+                                                  ekf_.state(), false, attitude);
+    if (!ekf_.healthy()) {
+        status.mode = NavMode::FailsafeLand;
+        status.health.imu_valid = false;
+    }
+    return status;
 }
 
 } // namespace ofnav
