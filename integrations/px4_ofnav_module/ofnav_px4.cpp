@@ -11,7 +11,6 @@
 #include <uORB/topics/distance_sensor.h>
 #include <uORB/topics/vehicle_imu.h>
 #include <uORB/topics/vehicle_attitude.h>
-#include <uORB/topics/vehicle_odometry.h>
 #include <uORB/topics/debug_vect.h>
 
 #include <poll.h>
@@ -29,7 +28,6 @@ constexpr uint64_t kMainLoopTimeoutMs = 100;
 constexpr unsigned kDefaultRateHz = 100U;
 constexpr unsigned kMinRateHz = 20U;
 constexpr unsigned kMaxRateHz = 250U;
-constexpr float kDefaultVelocityVariance = 0.09f; // (m/s)^2, conservative initial value
 
 static float safe_div(float n, uint32_t dt_us) noexcept
 {
@@ -76,22 +74,15 @@ static void set_debug_name(debug_vect_s &dbg, const char *name) noexcept
     std::strncpy(dbg.name, name, sizeof(dbg.name) - 1U);
 }
 
-static int8_t flow_quality_to_odometry_quality(uint8_t quality) noexcept
-{
-    const unsigned scaled = (static_cast<unsigned>(quality) * 100U) / 255U;
-    return static_cast<int8_t>(scaled > 100U ? 100U : scaled);
-}
-
 } // namespace
 
 class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
-    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range, bool publish_ev_velocity) :
+    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
-        _publish_ev_velocity(publish_ev_velocity),
         _runtime(make_config(min_quality))
     {
     }
@@ -167,7 +158,7 @@ public:
             PX4_ERR("external velocity fusion unavailable: no validated vertical velocity");
             return nullptr;
         }
-        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, false);
+        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -201,7 +192,7 @@ Optional fusion-output path:
 - never substitute invented vertical speed for missing measurements
 
 Safe-by-default behavior: this module does not command actuators.
-Fusion output is disabled unless -e is explicitly passed.
+Fusion output is not supported. The -e option is intentionally rejected.
 )DESCR_STR");
 
         PRINT_MODULE_USAGE_NAME("ofnav", "navigation");
@@ -217,17 +208,15 @@ Fusion output is disabled unless -e is explicitly passed.
 
     int print_status() override
     {
-        PX4_INFO("running: rate=%u Hz min_quality=%u strict_downward_range=%s ev_velocity=%s",
+        PX4_INFO("rate=%u Hz min_quality=%u downward_range=%s",
                  _rate_hz,
                  static_cast<unsigned>(_min_quality),
-                 _strict_downward_range ? "true" : "false",
-                 _publish_ev_velocity ? "true" : "false");
-        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu ev_pub=%lu",
+                 _strict_downward_range ? "true" : "false");
+        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu",
                  static_cast<unsigned long>(_samples),
                  static_cast<unsigned long>(_accepted),
                  static_cast<unsigned long>(_degraded),
-                 static_cast<unsigned long>(_failsafe),
-                 static_cast<unsigned long>(_ev_published));
+                 static_cast<unsigned long>(_failsafe));
         return 0;
     }
 
@@ -319,14 +308,6 @@ Fusion output is disabled unless -e is explicitly passed.
             publish_debug(out, flow_msg.quality);
             _last_health_pub_us = now_us;
 
-            // A horizontal-only optical-flow estimate cannot legitimately furnish
-            // the vertical component required by current PX4 EKF2 external-vision
-            // velocity fusion. Keep the flag as an explicit diagnostics-only request
-            // until a validated 3D velocity source and PX4 compatibility test exist.
-            // No vehicle_visual_odometry output until validated 3D velocity exists.
-            // External-vision velocity fusion in PX4 expects finite XYZ velocity;
-            // inventing zero vertical velocity is unsafe.
-            (void)imu;
         }
     }
 
@@ -426,7 +407,8 @@ private:
         vel.z = static_cast<float>(out.mode);
 
         if (_debug_vel_pub == nullptr) {
-            _debug_vel_pub = orb_advertise(ORB_ID(debug_vect), &vel);
+            _debug_vel_pub = orb_advertise_multi(ORB_ID(debug_vect), &vel,
+                                                &_debug_vel_instance, ORB_PRIO_DEFAULT);
 
         } else {
             orb_publish(ORB_ID(debug_vect), _debug_vel_pub, &vel);
@@ -440,74 +422,17 @@ private:
         health.z = static_cast<float>(out.flow.reason);
 
         if (_debug_health_pub == nullptr) {
-            _debug_health_pub = orb_advertise(ORB_ID(debug_vect), &health);
+            _debug_health_pub = orb_advertise_multi(ORB_ID(debug_vect), &health,
+                                                   &_debug_health_instance, ORB_PRIO_DEFAULT);
 
         } else {
             orb_publish(ORB_ID(debug_vect), _debug_health_pub, &health);
         }
     }
 
-    void publish_visual_odometry_velocity(const ofnav::RuntimeOutput &out,
-                                          const sensor_optical_flow_s &flow_msg,
-                                          const ofnav::ImuSample &imu)
-    {
-        vehicle_odometry_s odom{};
-        odom.timestamp = hrt_absolute_time();
-        odom.timestamp_sample = flow_msg.timestamp_sample;
-        odom.pose_frame = vehicle_odometry_s::POSE_FRAME_UNKNOWN;
-        odom.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_NED;
-
-        odom.position[0] = NAN;
-        odom.position[1] = NAN;
-        odom.position[2] = NAN;
-
-        odom.q[0] = NAN;
-        odom.q[1] = NAN;
-        odom.q[2] = NAN;
-        odom.q[3] = NAN;
-
-        odom.velocity[0] = out.state.vn_m_s;
-        odom.velocity[1] = out.state.ve_m_s;
-        // PX4 EKF2 external-velocity fusion requires all velocity components finite.
-        // Zero vertical velocity must NOT be invented: disable fusion until an
-        // independently validated vertical velocity channel is supplied.
-        odom.velocity[2] = NAN;
-
-        odom.angular_velocity[0] = imu.gyro_rad_s.x;
-        odom.angular_velocity[1] = imu.gyro_rad_s.y;
-        odom.angular_velocity[2] = imu.gyro_rad_s.z;
-
-        odom.position_variance[0] = NAN;
-        odom.position_variance[1] = NAN;
-        odom.position_variance[2] = NAN;
-
-        odom.orientation_variance[0] = NAN;
-        odom.orientation_variance[1] = NAN;
-        odom.orientation_variance[2] = NAN;
-
-        odom.velocity_variance[0] = kDefaultVelocityVariance;
-        odom.velocity_variance[1] = kDefaultVelocityVariance;
-        odom.velocity_variance[2] = NAN;
-
-        odom.reset_counter = 0U;
-        odom.quality = flow_quality_to_odometry_quality(flow_msg.quality);
-        // Published with NaN vertical velocity intentionally: data trace only.
-        // EKF2 should reject it. Never claim fused navigation from this message.
-
-        if (_visual_odom_pub == nullptr) {
-            _visual_odom_pub = orb_advertise(ORB_ID(vehicle_visual_odometry), &odom);
-
-        } else {
-            orb_publish(ORB_ID(vehicle_visual_odometry), _visual_odom_pub, &odom);
-        }
-
-        ++_ev_published;
-    }
-
     unsigned _rate_hz{kDefaultRateHz};
     uint8_t _min_quality{120U};
     bool _strict_downward_range{true};
-    bool _publish_ev_velocity{false};
 
     int _flow_sub{-1};
     int _range_sub{-1};
@@ -516,7 +441,8 @@ private:
 
     orb_advert_t _debug_vel_pub{nullptr};
     orb_advert_t _debug_health_pub{nullptr};
-    orb_advert_t _visual_odom_pub{nullptr};
+    int _debug_vel_instance{-1};
+    int _debug_health_instance{-1};
 
     ofnav::OfNavRuntime _runtime;
 
@@ -524,7 +450,6 @@ private:
     uint32_t _accepted{0U};
     uint32_t _degraded{0U};
     uint32_t _failsafe{0U};
-    uint32_t _ev_published{0U};
     uint64_t _last_health_pub_us{0U};
 };
 
