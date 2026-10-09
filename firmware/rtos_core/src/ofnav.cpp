@@ -21,6 +21,20 @@ constexpr float kEps = 1.0e-6F;
     return v * v;
 }
 
+[[nodiscard]] bool tiltExceeded(float roll, float pitch, float max_tilt) noexcept {
+    // Combined inclination of the down-facing optical axis from vertical.
+    return !std::isfinite(roll) || !std::isfinite(pitch) ||
+        std::fabs(roll) > max_tilt || std::fabs(pitch) > max_tilt ||
+        std::cos(roll) * std::cos(pitch) < std::cos(max_tilt);
+}
+
+[[nodiscard]] bool imuFinite(const ImuSample& imu) noexcept {
+    return imu.valid &&
+        std::isfinite(imu.gyro_rad_s.x) && std::isfinite(imu.gyro_rad_s.y) &&
+        std::isfinite(imu.gyro_rad_s.z) && std::isfinite(imu.accel_m_s2.x) &&
+        std::isfinite(imu.accel_m_s2.y) && std::isfinite(imu.accel_m_s2.z);
+}
+
 } // namespace
 
 bool isFinite(float v) noexcept {
@@ -103,8 +117,14 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
         out.reason = RejectReason::StaleRange;
         return out;
     }
-    if (!imu.valid) {
+    if (!imu.valid || !isFinite(imu.gyro_rad_s.x) || !isFinite(imu.gyro_rad_s.y) ||
+        !isFinite(imu.gyro_rad_s.z)) {
         out.reason = RejectReason::ImuInvalid;
+        return out;
+    }
+    if (!isFinite(attitude.roll_rad) || !isFinite(attitude.pitch_rad) ||
+        !isFinite(attitude.yaw_rad)) {
+        out.reason = RejectReason::NonFiniteInput;
         return out;
     }
 
@@ -118,7 +138,7 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
         return out;
     }
 
-    if (std::fabs(attitude.roll_rad) > cfg_.max_tilt_rad || std::fabs(attitude.pitch_rad) > cfg_.max_tilt_rad) {
+    if (tiltExceeded(attitude.roll_rad, attitude.pitch_rad, cfg_.max_tilt_rad)) {
         out.reason = RejectReason::ExcessiveTilt;
         return out;
     }
@@ -174,7 +194,24 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
     }
 
     out.velocity_body_m_s = Vector2f{velocity_body_at_cg.x, velocity_body_at_cg.y};
-    out.velocity_nav_m_s = rotateBodyToNav(velocity_body_at_cg.x, velocity_body_at_cg.y, attitude.yaw_rad);
+    // Full body FRD -> local NED rotation. A yaw-only projection produces
+    // biased horizontal velocity whenever roll/pitch or lever-arm Z is nonzero.
+    const float cr = std::cos(attitude.roll_rad), sr = std::sin(attitude.roll_rad);
+    const float cp = std::cos(attitude.pitch_rad), sp = std::sin(attitude.pitch_rad);
+    const float cy = std::cos(attitude.yaw_rad), sy = std::sin(attitude.yaw_rad);
+    const float vn =
+        cy * cp * velocity_body_at_cg.x +
+        (cy * sp * sr - sy * cr) * velocity_body_at_cg.y +
+        (cy * sp * cr + sy * sr) * velocity_body_at_cg.z;
+    const float ve =
+        sy * cp * velocity_body_at_cg.x +
+        (sy * sp * sr + cy * cr) * velocity_body_at_cg.y +
+        (sy * sp * cr - cy * sr) * velocity_body_at_cg.z;
+    out.velocity_nav_m_s = {vn, ve};
+    if (!isFinite(vn) || !isFinite(ve)) {
+        out.reason = RejectReason::NonFiniteInput;
+        return out;
+    }
     out.accepted = true;
     out.reason = RejectReason::Ok;
     return out;
@@ -214,6 +251,7 @@ void HorizontalEkf::reset(uint64_t time_us) noexcept {
     p_[5][5] = sq(0.03F);
     last_predict_us_ = time_us;
     initialized_ = true;
+    prediction_healthy_ = true;
     last_innovation_d2_ = 0.0F;
 }
 
@@ -222,40 +260,67 @@ void HorizontalEkf::predict(const ImuSample& imu, const AttitudeSample& attitude
         reset(imu.time_us);
         return;
     }
-    if (!imu.valid || imu.time_us <= last_predict_us_) {
+    if (!prediction_healthy_ || !imu.valid || imu.time_us <= last_predict_us_) {
         return;
     }
 
+    if (last_predict_us_ == 0U) {
+        // First sample fixes the time origin without integrating unknown history.
+        last_predict_us_ = imu.time_us;
+        return;
+    }
+
+    // Missing inertial history is not a reason to silently reset covariance
+    // to artificially low confidence; recovery needs an explicit reset.
+    if ((imu.time_us - last_predict_us_) > 200000U) {
+        prediction_healthy_ = false;
+        return;
+    }
     float dt = static_cast<float>(imu.time_us - last_predict_us_) * 1.0e-6F;
     if (dt <= 0.0F) {
         return;
     }
     dt = clampf(dt, 0.0F, 0.20F);
 
+    // IMU reports specific force in body axes. Rotate all three axes to NED;
+    // gravity acts on NED down only and therefore does not affect horizontal components.
     const float ax = imu.accel_m_s2.x - x_.accel_bias_x_m_s2;
     const float ay = imu.accel_m_s2.y - x_.accel_bias_y_m_s2;
-    const Vector2f accel_nav = rotateBodyToNav(ax, ay, attitude.yaw_rad);
+    const float az = imu.accel_m_s2.z;
+    if (!isFinite(ax) || !isFinite(ay) || !isFinite(az) ||
+        !isFinite(attitude.roll_rad) || !isFinite(attitude.pitch_rad) ||
+        !isFinite(attitude.yaw_rad)) {
+        return;
+    }
+    const float cr = std::cos(attitude.roll_rad), sr = std::sin(attitude.roll_rad);
+    const float cp = std::cos(attitude.pitch_rad), sp = std::sin(attitude.pitch_rad);
+    const float c = std::cos(attitude.yaw_rad), s = std::sin(attitude.yaw_rad);
+    const float ax_level = cp * ax + sp * sr * ay + sp * cr * az;
+    const float ay_level = cr * ay - sr * az;
+    const Vector2f accel_nav{c * ax_level - s * ay_level, s * ax_level + c * ay_level};
 
     x_.n_m += x_.vn_m_s * dt + 0.5F * accel_nav.x * dt * dt;
     x_.e_m += x_.ve_m_s * dt + 0.5F * accel_nav.y * dt * dt;
     x_.vn_m_s += accel_nav.x * dt;
     x_.ve_m_s += accel_nav.y * dt;
 
-    const float c = std::cos(attitude.yaw_rad);
-    const float s = std::sin(attitude.yaw_rad);
+    const float bx0 = c * cp - s * 0.0F;
+    const float by0 = c * sp * sr - s * cr;
+    const float bx1 = s * cp + c * 0.0F;
+    const float by1 = s * sp * sr + c * cr;
 
     Matrix6 f{};
     setIdentity(f, 1.0F);
     f[0][2] = dt;
     f[1][3] = dt;
-    f[0][4] = -0.5F * c * dt * dt;
-    f[0][5] = 0.5F * s * dt * dt;
-    f[1][4] = -0.5F * s * dt * dt;
-    f[1][5] = -0.5F * c * dt * dt;
-    f[2][4] = -c * dt;
-    f[2][5] = s * dt;
-    f[3][4] = -s * dt;
-    f[3][5] = -c * dt;
+    f[0][4] = -0.5F * bx0 * dt * dt;
+    f[0][5] = -0.5F * by0 * dt * dt;
+    f[1][4] = -0.5F * bx1 * dt * dt;
+    f[1][5] = -0.5F * by1 * dt * dt;
+    f[2][4] = -bx0 * dt;
+    f[2][5] = -by0 * dt;
+    f[3][4] = -bx1 * dt;
+    f[3][5] = -by1 * dt;
 
     Matrix6 fp{};
     for (uint8_t r = 0; r < 6U; ++r) {
@@ -294,7 +359,7 @@ void HorizontalEkf::predict(const ImuSample& imu, const AttitudeSample& attitude
 }
 
 bool HorizontalEkf::updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t quality) noexcept {
-    if (!flow.accepted || !initialized_) {
+    if (!flow.accepted || !initialized_ || !prediction_healthy_) {
         return false;
     }
 
@@ -341,16 +406,28 @@ bool HorizontalEkf::updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t
     x_.accel_bias_x_m_s2 += k[4][0] * y0 + k[4][1] * y1;
     x_.accel_bias_y_m_s2 += k[5][0] * y0 + k[5][1] * y1;
 
-    Matrix6 new_p = p_;
-    for (uint8_t row = 0; row < 6U; ++row) {
-        for (uint8_t col = 0; col < 6U; ++col) {
-            new_p[row][col] = p_[row][col] - k[row][0] * p_[2][col] - k[row][1] * p_[3][col];
+    // Joseph covariance update: (I-KH) P (I-KH)^T + K R K^T.
+    Matrix6 a{};
+    setIdentity(a, 1.0F);
+    for (uint8_t i = 0; i < 6U; ++i) {
+        a[i][2] -= k[i][0];
+        a[i][3] -= k[i][1];
+    }
+    Matrix6 ap{};
+    Matrix6 new_p{};
+    for (uint8_t i = 0; i < 6U; ++i) {
+        for (uint8_t j = 0; j < 6U; ++j) {
+            for (uint8_t t = 0; t < 6U; ++t) {
+                ap[i][j] += a[i][t] * p_[t][j];
+            }
         }
     }
-
-    for (uint8_t row = 0; row < 6U; ++row) {
-        for (uint8_t col = 0; col < 6U; ++col) {
-            new_p[row][col] += r * (k[row][0] * k[col][0] + k[row][1] * k[col][1]);
+    for (uint8_t i = 0; i < 6U; ++i) {
+        for (uint8_t j = 0; j < 6U; ++j) {
+            for (uint8_t t = 0; t < 6U; ++t) {
+                new_p[i][j] += ap[i][t] * a[j][t];
+            }
+            new_p[i][j] += r * (k[i][0] * k[j][0] + k[i][1] * k[j][1]);
         }
     }
 
@@ -365,12 +442,15 @@ RuntimeOutput SafetyMonitor::evaluate(uint64_t now_us,
                                       const OpticalFlowRadSample& flow,
                                       const FlowVelocityEstimate& flow_estimate,
                                       const EkfState& ekf_state,
-                                      bool innovation_ok) noexcept {
+                                      bool innovation_ok,
+                                      const AttitudeSample& attitude) noexcept {
     RuntimeOutput out{};
     out.flow = flow_estimate;
     out.state = ekf_state;
 
-    out.health.imu_valid = imu.valid;
+    out.health.imu_valid = imuFinite(imu) && timestampFresh(now_us, imu.time_us, cfg_.max_imu_age_us);
+    const bool attitude_valid = timestampFresh(now_us, attitude.time_us, cfg_.max_attitude_age_us) &&
+        isFinite(attitude.roll_rad) && isFinite(attitude.pitch_rad) && isFinite(attitude.yaw_rad);
     out.health.range_valid = range.valid && timestampFresh(now_us, range.time_us, cfg_.max_range_age_us);
     out.health.flow_valid = flow.valid && timestampFresh(now_us, flow.time_us, cfg_.max_flow_age_us);
     out.health.height_valid = isFinite(flow_estimate.height_m) && flow_estimate.height_m >= cfg_.min_height_m && flow_estimate.height_m <= cfg_.max_height_m;
@@ -378,9 +458,10 @@ RuntimeOutput SafetyMonitor::evaluate(uint64_t now_us,
     out.health.innovation_valid = innovation_ok;
     out.health.stale_range = !out.health.range_valid;
     out.health.stale_flow = !out.health.flow_valid;
-    out.health.excessive_tilt = flow_estimate.reason == RejectReason::ExcessiveTilt;
+    out.health.excessive_tilt = attitude_valid &&
+        tiltExceeded(attitude.roll_rad, attitude.pitch_rad, cfg_.max_tilt_rad);
 
-    if (!out.health.imu_valid || out.health.stale_range || out.health.excessive_tilt) {
+    if (!out.health.imu_valid || !attitude_valid || out.health.stale_range || out.health.excessive_tilt) {
         out.mode = NavMode::FailsafeLand;
         return out;
     }
@@ -398,22 +479,78 @@ OfNavRuntime::OfNavRuntime(Config cfg) noexcept : cfg_(cfg), flow_estimator_(cfg
 
 void OfNavRuntime::reset(uint64_t time_us) noexcept {
     ekf_.reset(time_us);
+    last_flow_estimate_ = {};
+    last_innovation_ok_ = false;
+}
+
+void OfNavRuntime::predictImu(const ImuSample& imu,
+                               const AttitudeSample& attitude) noexcept {
+    if (!imuFinite(imu) || !timestampFresh(imu.time_us, attitude.time_us,
+            cfg_.max_measurement_skew_us)) {
+        return;
+    }
+    ekf_.predict(imu, attitude);
 }
 
 RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
                                   const RangeSample& range,
                                   const OpticalFlowRadSample& flow,
-                                  const AttitudeSample& attitude) noexcept {
-    ekf_.predict(imu, attitude);
-    FlowVelocityEstimate flow_estimate = flow_estimator_.update(flow, range, imu, attitude);
-    const bool innovation_ok = ekf_.updateFlowVelocity(flow_estimate, flow.quality);
-
-    if (flow_estimate.accepted && !innovation_ok) {
-        flow_estimate.accepted = false;
-        flow_estimate.reason = RejectReason::InnovationGate;
+                                  const AttitudeSample& attitude,
+                                  uint64_t now_us) noexcept {
+    if (now_us == 0U) {
+        now_us = imu.time_us;
     }
+    const bool fresh_imu = imuFinite(imu) && timestampFresh(now_us, imu.time_us, cfg_.max_imu_age_us);
+    const bool fresh_att = timestampFresh(now_us, attitude.time_us, cfg_.max_attitude_age_us);
+    const bool fresh_range = range.valid && timestampFresh(now_us, range.time_us, cfg_.max_range_age_us);
+    const bool fresh_flow = flow.valid && timestampFresh(now_us, flow.time_us, cfg_.max_flow_age_us);
+    const uint64_t lag = (flow.time_us > imu.time_us) ? flow.time_us - imu.time_us :
+                         imu.time_us - flow.time_us;
+    const uint64_t att_lag = (flow.time_us > attitude.time_us) ?
+        flow.time_us - attitude.time_us : attitude.time_us - flow.time_us;
+    const uint64_t range_lag = (flow.time_us > range.time_us) ?
+        flow.time_us - range.time_us : range.time_us - flow.time_us;
+    const bool aligned = lag <= cfg_.max_measurement_skew_us &&
+                         att_lag <= cfg_.max_measurement_skew_us &&
+                         range_lag <= cfg_.max_measurement_skew_us;
+    if (fresh_imu && fresh_att) {
+        predictImu(imu, attitude);
+    }
+    last_flow_estimate_ = {};
+    last_innovation_ok_ = false;
+    if (fresh_imu && fresh_att && fresh_flow && fresh_range && aligned) {
+        last_flow_estimate_ = flow_estimator_.update(flow, range, imu, attitude);
+        last_innovation_ok_ = ekf_.updateFlowVelocity(last_flow_estimate_, flow.quality);
+        if (last_flow_estimate_.accepted && !last_innovation_ok_) {
+            last_flow_estimate_.accepted = false;
+            last_flow_estimate_.reason = RejectReason::InnovationGate;
+        }
+    }
+    RuntimeOutput status = safety_.evaluate(now_us, imu, range, flow, last_flow_estimate_,
+                                                  ekf_.state(), last_innovation_ok_, attitude);
+    if (!ekf_.healthy()) {
+        status.mode = NavMode::FailsafeLand;
+        status.health.imu_valid = false;
+        status.flow.accepted = false;
+        status.flow.reason = RejectReason::ImuInvalid;
+    }
+    return status;
+}
 
-    return safety_.evaluate(imu.time_us, imu, range, flow, flow_estimate, ekf_.state(), innovation_ok);
+RuntimeOutput OfNavRuntime::monitor(uint64_t now_us,
+                                    const ImuSample& imu,
+                                    const RangeSample& range,
+                                    const OpticalFlowRadSample& flow,
+                                    const AttitudeSample& attitude) noexcept {
+    // Never reuse a previous accepted measurement as a new measurement.
+    FlowVelocityEstimate inactive{};
+    RuntimeOutput status = safety_.evaluate(now_us, imu, range, flow, inactive,
+                                                  ekf_.state(), false, attitude);
+    if (!ekf_.healthy()) {
+        status.mode = NavMode::FailsafeLand;
+        status.health.imu_valid = false;
+    }
+    return status;
 }
 
 } // namespace ofnav

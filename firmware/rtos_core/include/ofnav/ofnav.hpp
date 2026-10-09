@@ -140,7 +140,10 @@ struct Config {
     Matrix3f body_from_sensor{};
 
     uint64_t max_range_age_us{200000U};
-    uint64_t max_flow_age_us{200000U};
+    uint64_t max_flow_age_us{120000U};
+    uint64_t max_imu_age_us{120000U};
+    uint64_t max_attitude_age_us{120000U};
+    uint64_t max_measurement_skew_us{100000U};
 
     float accel_noise_sigma_m_s2{0.08F};
     float flow_vel_sigma_min_m_s{0.035F};
@@ -180,7 +183,11 @@ public:
     [[nodiscard]] bool updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t quality) noexcept;
 
     [[nodiscard]] EkfState state() const noexcept { return x_; }
+    [[nodiscard]] bool healthy() const noexcept { return prediction_healthy_; }
     [[nodiscard]] float lastInnovationD2() const noexcept { return last_innovation_d2_; }
+    [[nodiscard]] float covariance(uint8_t row, uint8_t col) const noexcept {
+        return (row < 6U && col < 6U) ? p_[row][col] : kNaN;
+    }
 
 private:
     using Matrix6 = std::array<std::array<float, 6>, 6>;
@@ -191,6 +198,7 @@ private:
     Matrix6 p_{};
     uint64_t last_predict_us_{0U};
     bool initialized_{false};
+    bool prediction_healthy_{true};
     float last_innovation_d2_{0.0F};
 
     static void setIdentity(Matrix6& m, float diag) noexcept;
@@ -207,8 +215,8 @@ public:
                                          const OpticalFlowRadSample& flow,
                                          const FlowVelocityEstimate& flow_estimate,
                                          const EkfState& ekf_state,
-                                         bool innovation_ok) noexcept;
-
+                                         bool innovation_ok,
+                                         const AttitudeSample& attitude) noexcept;
 private:
     Config cfg_{};
 };
@@ -219,12 +227,23 @@ public:
 
     void reset(uint64_t time_us) noexcept;
 
+    // Feed each IMU sample separately from the slower optical-flow rate.
+    void predictImu(const ImuSample& imu, const AttitudeSample& attitude) noexcept;
+
     [[nodiscard]] RuntimeOutput step(const ImuSample& imu,
                                      const RangeSample& range,
                                      const OpticalFlowRadSample& flow,
-                                     const AttitudeSample& attitude) noexcept;
+                                     const AttitudeSample& attitude,
+                                     uint64_t now_us = 0U) noexcept;
 
+    [[nodiscard]] RuntimeOutput monitor(uint64_t now_us,
+                                        const ImuSample& imu,
+                                        const RangeSample& range,
+                                        const OpticalFlowRadSample& flow,
+                                        const AttitudeSample& attitude) noexcept;
 private:
+    FlowVelocityEstimate last_flow_estimate_{};
+    bool last_innovation_ok_{false};
     Config cfg_{};
     FlowVelocityEstimator flow_estimator_;
     HorizontalEkf ekf_;

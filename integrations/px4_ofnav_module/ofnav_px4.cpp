@@ -11,7 +11,6 @@
 #include <uORB/topics/distance_sensor.h>
 #include <uORB/topics/vehicle_imu.h>
 #include <uORB/topics/vehicle_attitude.h>
-#include <uORB/topics/vehicle_odometry.h>
 #include <uORB/topics/debug_vect.h>
 
 #include <poll.h>
@@ -29,7 +28,6 @@ constexpr uint64_t kMainLoopTimeoutMs = 100;
 constexpr unsigned kDefaultRateHz = 100U;
 constexpr unsigned kMinRateHz = 20U;
 constexpr unsigned kMaxRateHz = 250U;
-constexpr float kDefaultVelocityVariance = 0.09f; // (m/s)^2, conservative initial value
 
 static float safe_div(float n, uint32_t dt_us) noexcept
 {
@@ -76,22 +74,15 @@ static void set_debug_name(debug_vect_s &dbg, const char *name) noexcept
     std::strncpy(dbg.name, name, sizeof(dbg.name) - 1U);
 }
 
-static int8_t flow_quality_to_odometry_quality(uint8_t quality) noexcept
-{
-    const unsigned scaled = (static_cast<unsigned>(quality) * 100U) / 255U;
-    return static_cast<int8_t>(scaled > 100U ? 100U : scaled);
-}
-
 } // namespace
 
 class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
-    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range, bool publish_ev_velocity) :
+    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
-        _publish_ev_velocity(publish_ev_velocity),
         _runtime(make_config(min_quality))
     {
     }
@@ -163,7 +154,11 @@ public:
         if (rate_hz < kMinRateHz) { rate_hz = kMinRateHz; }
         if (rate_hz > kMaxRateHz) { rate_hz = kMaxRateHz; }
 
-        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, publish_ev_velocity);
+        if (publish_ev_velocity) {
+            PX4_ERR("external velocity fusion unavailable: no validated vertical velocity");
+            return nullptr;
+        }
+        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -193,12 +188,11 @@ It publishes debug_vect diagnostics:
 - OFNAV_H: height, quality and reject/accept reason code
 
 Optional fusion-output path:
-- with -e, publishes velocity-only vehicle_visual_odometry messages
-- position and orientation fields are intentionally invalid/NaN
-- only accepted FLOW_NAV estimates are published
+- -e is rejected until a validated 3D velocity source is available
+- never substitute invented vertical speed for missing measurements
 
 Safe-by-default behavior: this module does not command actuators.
-Fusion output is disabled unless -e is explicitly passed.
+Fusion output is not supported. The -e option is intentionally rejected.
 )DESCR_STR");
 
         PRINT_MODULE_USAGE_NAME("ofnav", "navigation");
@@ -206,7 +200,7 @@ Fusion output is disabled unless -e is explicitly passed.
         PRINT_MODULE_USAGE_PARAM_INT('r', static_cast<int>(kDefaultRateHz), static_cast<int>(kMinRateHz), static_cast<int>(kMaxRateHz), "Module loop rate, Hz", true);
         PRINT_MODULE_USAGE_PARAM_INT('q', 120, 0, 255, "Minimum optical-flow quality", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
-        PRINT_MODULE_USAGE_PARAM_FLAG('e', "Publish accepted velocity-only vehicle_visual_odometry for EKF2 external-vision velocity fusion", true);
+        PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
         return 0;
@@ -214,17 +208,15 @@ Fusion output is disabled unless -e is explicitly passed.
 
     int print_status() override
     {
-        PX4_INFO("running: rate=%u Hz min_quality=%u strict_downward_range=%s ev_velocity=%s",
+        PX4_INFO("rate=%u Hz min_quality=%u downward_range=%s",
                  _rate_hz,
                  static_cast<unsigned>(_min_quality),
-                 _strict_downward_range ? "true" : "false",
-                 _publish_ev_velocity ? "true" : "false");
-        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu ev_pub=%lu",
+                 _strict_downward_range ? "true" : "false");
+        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu",
                  static_cast<unsigned long>(_samples),
                  static_cast<unsigned long>(_accepted),
                  static_cast<unsigned long>(_degraded),
-                 static_cast<unsigned long>(_failsafe),
-                 static_cast<unsigned long>(_ev_published));
+                 static_cast<unsigned long>(_failsafe));
         return 0;
     }
 
@@ -241,10 +233,13 @@ Fusion output is disabled unless -e is explicitly passed.
         }
 
         orb_set_interval(_flow_sub, static_cast<unsigned>(1000U / _rate_hz));
+        orb_set_interval(_imu_sub, static_cast<unsigned>(1000U / _rate_hz));
 
-        pollfd fds{};
-        fds.fd = _flow_sub;
-        fds.events = POLLIN;
+        px4_pollfd_struct_t fds[2]{};
+        fds[0].fd = _flow_sub;
+        fds[0].events = POLLIN;
+        fds[1].fd = _imu_sub;
+        fds[1].events = POLLIN;
 
         sensor_optical_flow_s flow_msg{};
         distance_sensor_s range_msg{};
@@ -252,7 +247,7 @@ Fusion output is disabled unless -e is explicitly passed.
         vehicle_attitude_s att_msg{};
 
         while (!should_exit()) {
-            const int pret = px4_poll(&fds, 1, static_cast<int>(kMainLoopTimeoutMs));
+            const int pret = px4_poll(fds, 2, static_cast<int>(kMainLoopTimeoutMs));
 
             if (pret < 0) {
                 PX4_ERR("poll error");
@@ -275,16 +270,29 @@ Fusion output is disabled unless -e is explicitly passed.
             if (imu_updated) { orb_copy(ORB_ID(vehicle_imu), _imu_sub, &imu_msg); }
             if (att_updated) { orb_copy(ORB_ID(vehicle_attitude), _att_sub, &att_msg); }
 
+            const uint64_t now_us = hrt_absolute_time();
+            const auto imu = make_imu(imu_msg);
+            const auto attitude = make_attitude(att_msg);
+            if (imu_updated) {
+                // Independent IMU prediction, regardless of optical-flow rate.
+                _runtime.predictImu(imu, attitude);
+            }
             if (!flow_updated) {
+                // A watchdog must keep running when optical flow stops.
+                if (now_us - _last_health_pub_us >= 100000U) {
+                    const auto health = _runtime.monitor(now_us, imu,
+                                        make_range(flow_msg, range_msg), make_flow(flow_msg),
+                                        attitude);
+                    publish_debug(health, flow_msg.quality);
+                    _last_health_pub_us = now_us;
+                }
                 continue;
             }
 
-            const ofnav::ImuSample imu = make_imu(imu_msg);
             const ofnav::RangeSample range = make_range(flow_msg, range_msg);
             const ofnav::OpticalFlowRadSample flow = make_flow(flow_msg);
-            const ofnav::AttitudeSample attitude = make_attitude(att_msg);
 
-            const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude);
+            const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude, now_us);
             ++_samples;
 
             if (out.mode == ofnav::NavMode::FlowNav) {
@@ -298,10 +306,8 @@ Fusion output is disabled unless -e is explicitly passed.
             }
 
             publish_debug(out, flow_msg.quality);
+            _last_health_pub_us = now_us;
 
-            if (_publish_ev_velocity && out.mode == ofnav::NavMode::FlowNav && out.flow.accepted) {
-                publish_visual_odometry_velocity(out, flow_msg, imu);
-            }
         }
     }
 
@@ -324,15 +330,20 @@ private:
     ofnav::OpticalFlowRadSample make_flow(const sensor_optical_flow_s &msg) const noexcept
     {
         ofnav::OpticalFlowRadSample flow{};
-        flow.time_us = msg.timestamp;
+        flow.time_us = msg.timestamp_sample;
         flow.integration_time_s = static_cast<float>(msg.integration_timespan_us) * 1.0e-6f;
         flow.integrated_x_rad = msg.pixel_flow[0];
         flow.integrated_y_rad = msg.pixel_flow[1];
-        flow.integrated_xgyro_rad = msg.delta_angle_available ? msg.delta_angle[0] : 0.0f;
-        flow.integrated_ygyro_rad = msg.delta_angle_available ? msg.delta_angle[1] : 0.0f;
-        flow.integrated_zgyro_rad = msg.delta_angle_available ? msg.delta_angle[2] : 0.0f;
+        // A zero gyro correction is NOT valid when the sensor has no gyro.
+        // Separate IMU integration over the camera exposure is required for that case.
+        flow.integrated_xgyro_rad = msg.delta_angle_available ? msg.delta_angle[0] : NAN;
+        flow.integrated_ygyro_rad = msg.delta_angle_available ? msg.delta_angle[1] : NAN;
+        flow.integrated_zgyro_rad = msg.delta_angle_available ? msg.delta_angle[2] : NAN;
         flow.quality = msg.quality;
-        flow.valid = msg.timestamp != 0U && msg.integration_timespan_us > 0U && finite(flow.integrated_x_rad) && finite(flow.integrated_y_rad);
+        flow.valid = msg.timestamp_sample != 0U && msg.integration_timespan_us > 0U &&
+                     msg.delta_angle_available && finite(flow.integrated_x_rad) &&
+                     finite(flow.integrated_y_rad) && finite(flow.integrated_xgyro_rad) &&
+                     finite(flow.integrated_ygyro_rad);
         return flow;
     }
 
@@ -341,7 +352,7 @@ private:
         ofnav::RangeSample range{};
 
         if (flow_msg.distance_available && finite(flow_msg.distance_m) && flow_msg.distance_m > 0.0f) {
-            range.time_us = flow_msg.timestamp;
+            range.time_us = flow_msg.timestamp_sample;
             range.distance_m = flow_msg.distance_m;
             range.valid = true;
             return range;
@@ -361,7 +372,7 @@ private:
     ofnav::ImuSample make_imu(const vehicle_imu_s &msg) const noexcept
     {
         ofnav::ImuSample imu{};
-        imu.time_us = msg.timestamp;
+        imu.time_us = msg.timestamp_sample;
         imu.gyro_rad_s = {
             safe_div(msg.delta_angle[0], msg.delta_angle_dt),
             safe_div(msg.delta_angle[1], msg.delta_angle_dt),
@@ -372,7 +383,7 @@ private:
             safe_div(msg.delta_velocity[1], msg.delta_velocity_dt),
             safe_div(msg.delta_velocity[2], msg.delta_velocity_dt)
         };
-        imu.valid = msg.timestamp != 0U && msg.delta_angle_dt > 0U && msg.delta_velocity_dt > 0U &&
+        imu.valid = msg.timestamp_sample != 0U && msg.delta_angle_dt > 0U && msg.delta_velocity_dt > 0U &&
                     msg.delta_angle_clipping == 0U && msg.delta_velocity_clipping == 0U;
         return imu;
     }
@@ -383,7 +394,7 @@ private:
         float pitch = 0.0f;
         float yaw = 0.0f;
         quat_to_euler(msg.q, roll, pitch, yaw);
-        return ofnav::AttitudeSample{msg.timestamp, roll, pitch, yaw};
+        return ofnav::AttitudeSample{msg.timestamp_sample, roll, pitch, yaw};
     }
 
     void publish_debug(const ofnav::RuntimeOutput &out, uint8_t quality)
@@ -396,7 +407,8 @@ private:
         vel.z = static_cast<float>(out.mode);
 
         if (_debug_vel_pub == nullptr) {
-            _debug_vel_pub = orb_advertise(ORB_ID(debug_vect), &vel);
+            _debug_vel_pub = orb_advertise_multi(ORB_ID(debug_vect), &vel,
+                                                &_debug_vel_instance);
 
         } else {
             orb_publish(ORB_ID(debug_vect), _debug_vel_pub, &vel);
@@ -410,69 +422,17 @@ private:
         health.z = static_cast<float>(out.flow.reason);
 
         if (_debug_health_pub == nullptr) {
-            _debug_health_pub = orb_advertise(ORB_ID(debug_vect), &health);
+            _debug_health_pub = orb_advertise_multi(ORB_ID(debug_vect), &health,
+                                                   &_debug_health_instance);
 
         } else {
             orb_publish(ORB_ID(debug_vect), _debug_health_pub, &health);
         }
     }
 
-    void publish_visual_odometry_velocity(const ofnav::RuntimeOutput &out,
-                                          const sensor_optical_flow_s &flow_msg,
-                                          const ofnav::ImuSample &imu)
-    {
-        vehicle_odometry_s odom{};
-        odom.timestamp = hrt_absolute_time();
-        odom.timestamp_sample = flow_msg.timestamp;
-        odom.pose_frame = vehicle_odometry_s::POSE_FRAME_UNKNOWN;
-        odom.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_NED;
-
-        odom.position[0] = NAN;
-        odom.position[1] = NAN;
-        odom.position[2] = NAN;
-
-        odom.q[0] = NAN;
-        odom.q[1] = NAN;
-        odom.q[2] = NAN;
-        odom.q[3] = NAN;
-
-        odom.velocity[0] = out.state.vn_m_s;
-        odom.velocity[1] = out.state.ve_m_s;
-        odom.velocity[2] = NAN;
-
-        odom.angular_velocity[0] = imu.gyro_rad_s.x;
-        odom.angular_velocity[1] = imu.gyro_rad_s.y;
-        odom.angular_velocity[2] = imu.gyro_rad_s.z;
-
-        odom.position_variance[0] = NAN;
-        odom.position_variance[1] = NAN;
-        odom.position_variance[2] = NAN;
-
-        odom.orientation_variance[0] = NAN;
-        odom.orientation_variance[1] = NAN;
-        odom.orientation_variance[2] = NAN;
-
-        odom.velocity_variance[0] = kDefaultVelocityVariance;
-        odom.velocity_variance[1] = kDefaultVelocityVariance;
-        odom.velocity_variance[2] = NAN;
-
-        odom.reset_counter = 0U;
-        odom.quality = flow_quality_to_odometry_quality(flow_msg.quality);
-
-        if (_visual_odom_pub == nullptr) {
-            _visual_odom_pub = orb_advertise(ORB_ID(vehicle_visual_odometry), &odom);
-
-        } else {
-            orb_publish(ORB_ID(vehicle_visual_odometry), _visual_odom_pub, &odom);
-        }
-
-        ++_ev_published;
-    }
-
     unsigned _rate_hz{kDefaultRateHz};
     uint8_t _min_quality{120U};
     bool _strict_downward_range{true};
-    bool _publish_ev_velocity{false};
 
     int _flow_sub{-1};
     int _range_sub{-1};
@@ -481,7 +441,8 @@ private:
 
     orb_advert_t _debug_vel_pub{nullptr};
     orb_advert_t _debug_health_pub{nullptr};
-    orb_advert_t _visual_odom_pub{nullptr};
+    int _debug_vel_instance{-1};
+    int _debug_health_instance{-1};
 
     ofnav::OfNavRuntime _runtime;
 
@@ -489,7 +450,7 @@ private:
     uint32_t _accepted{0U};
     uint32_t _degraded{0U};
     uint32_t _failsafe{0U};
-    uint32_t _ev_published{0U};
+    uint64_t _last_health_pub_us{0U};
 };
 
 extern "C" __EXPORT int ofnav_main(int argc, char *argv[])
