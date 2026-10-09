@@ -23,7 +23,13 @@ jobs:
           repository: PX4/PX4-Autopilot
           ref: v1.16.2
           path: PX4-Autopilot
+          fetch-depth: 0
           submodules: recursive
+
+      - name: Fetch NuttX version tags required by PX4
+        run: |
+          git -C PX4-Autopilot/platforms/nuttx/NuttX/nuttx fetch --tags --force
+          git -C PX4-Autopilot/platforms/nuttx/NuttX/nuttx tag --list 'nuttx-*' | head -5
 
       - name: Install PX4 SITL build dependencies
         run: bash PX4-Autopilot/Tools/setup/ubuntu.sh --no-nuttx --no-sim-tools
