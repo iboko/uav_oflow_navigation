@@ -180,7 +180,24 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
     }
 
     out.velocity_body_m_s = Vector2f{velocity_body_at_cg.x, velocity_body_at_cg.y};
-    out.velocity_nav_m_s = rotateBodyToNav(velocity_body_at_cg.x, velocity_body_at_cg.y, attitude.yaw_rad);
+    // Full body FRD -> local NED rotation. A yaw-only projection produces
+    // biased horizontal velocity whenever roll/pitch or lever-arm Z is nonzero.
+    const float cr = std::cos(attitude.roll_rad), sr = std::sin(attitude.roll_rad);
+    const float cp = std::cos(attitude.pitch_rad), sp = std::sin(attitude.pitch_rad);
+    const float cy = std::cos(attitude.yaw_rad), sy = std::sin(attitude.yaw_rad);
+    const float vn =
+        cy * cp * velocity_body_at_cg.x +
+        (cy * sp * sr - sy * cr) * velocity_body_at_cg.y +
+        (cy * sp * cr + sy * sr) * velocity_body_at_cg.z;
+    const float ve =
+        sy * cp * velocity_body_at_cg.x +
+        (sy * sp * sr + cy * cr) * velocity_body_at_cg.y +
+        (sy * sp * cr - cy * sr) * velocity_body_at_cg.z;
+    out.velocity_nav_m_s = {vn, ve};
+    if (!isFinite(vn) || !isFinite(ve)) {
+        out.reason = RejectReason::NonFiniteInput;
+        return out;
+    }
     out.accepted = true;
     out.reason = RejectReason::Ok;
     return out;
@@ -466,9 +483,13 @@ RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
     const bool fresh_flow = flow.valid && timestampFresh(now_us, flow.time_us, cfg_.max_flow_age_us);
     const uint64_t lag = (flow.time_us > imu.time_us) ? flow.time_us - imu.time_us :
                          imu.time_us - flow.time_us;
+    const uint64_t att_lag = (flow.time_us > attitude.time_us) ?
+        flow.time_us - attitude.time_us : attitude.time_us - flow.time_us;
+    const uint64_t range_lag = (flow.time_us > range.time_us) ?
+        flow.time_us - range.time_us : range.time_us - flow.time_us;
     const bool aligned = lag <= cfg_.max_measurement_skew_us &&
-                         ((flow.time_us > attitude.time_us ? flow.time_us - attitude.time_us :
-                         attitude.time_us - flow.time_us) <= cfg_.max_measurement_skew_us);
+                         att_lag <= cfg_.max_measurement_skew_us &&
+                         range_lag <= cfg_.max_measurement_skew_us;
     if (fresh_imu && fresh_att) {
         predictImu(imu, attitude);
     }
