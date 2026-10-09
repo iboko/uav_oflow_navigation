@@ -163,7 +163,11 @@ public:
         if (rate_hz < kMinRateHz) { rate_hz = kMinRateHz; }
         if (rate_hz > kMaxRateHz) { rate_hz = kMaxRateHz; }
 
-        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, publish_ev_velocity);
+        if (publish_ev_velocity) {
+            PX4_ERR("external velocity fusion unavailable: no validated vertical velocity");
+            return nullptr;
+        }
+        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, false);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -193,9 +197,8 @@ It publishes debug_vect diagnostics:
 - OFNAV_H: height, quality and reject/accept reason code
 
 Optional fusion-output path:
-- with -e, publishes velocity-only vehicle_visual_odometry messages
-- position and orientation fields are intentionally invalid/NaN
-- only accepted FLOW_NAV estimates are published
+- -e is rejected until a validated 3D velocity source is available
+- never substitute invented vertical speed for missing measurements
 
 Safe-by-default behavior: this module does not command actuators.
 Fusion output is disabled unless -e is explicitly passed.
@@ -206,7 +209,7 @@ Fusion output is disabled unless -e is explicitly passed.
         PRINT_MODULE_USAGE_PARAM_INT('r', static_cast<int>(kDefaultRateHz), static_cast<int>(kMinRateHz), static_cast<int>(kMaxRateHz), "Module loop rate, Hz", true);
         PRINT_MODULE_USAGE_PARAM_INT('q', 120, 0, 255, "Minimum optical-flow quality", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
-        PRINT_MODULE_USAGE_PARAM_FLAG('e', "Publish accepted velocity-only vehicle_visual_odometry for EKF2 external-vision velocity fusion", true);
+        PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
         return 0;
@@ -310,9 +313,10 @@ Fusion output is disabled unless -e is explicitly passed.
             // the vertical component required by current PX4 EKF2 external-vision
             // velocity fusion. Keep the flag as an explicit diagnostics-only request
             // until a validated 3D velocity source and PX4 compatibility test exist.
-            if (_publish_ev_velocity && out.mode == ofnav::NavMode::FlowNav && out.flow.accepted) {
-                publish_visual_odometry_velocity(out, flow_msg, imu);
-            }
+            // No vehicle_visual_odometry output until validated 3D velocity exists.
+            // External-vision velocity fusion in PX4 expects finite XYZ velocity;
+            // inventing zero vertical velocity is unsafe.
+            (void)imu;
         }
     }
 
