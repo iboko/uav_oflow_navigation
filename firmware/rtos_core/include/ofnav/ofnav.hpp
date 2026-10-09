@@ -183,6 +183,7 @@ public:
     [[nodiscard]] bool updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t quality) noexcept;
 
     [[nodiscard]] EkfState state() const noexcept { return x_; }
+    [[nodiscard]] bool healthy() const noexcept { return prediction_healthy_; }
     [[nodiscard]] float lastInnovationD2() const noexcept { return last_innovation_d2_; }
     [[nodiscard]] float covariance(uint8_t row, uint8_t col) const noexcept {
         return (row < 6U && col < 6U) ? p_[row][col] : kNaN;
@@ -197,6 +198,7 @@ private:
     Matrix6 p_{};
     uint64_t last_predict_us_{0U};
     bool initialized_{false};
+    bool prediction_healthy_{true};
     float last_innovation_d2_{0.0F};
 
     static void setIdentity(Matrix6& m, float diag) noexcept;
