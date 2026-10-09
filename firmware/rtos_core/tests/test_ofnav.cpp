@@ -128,7 +128,7 @@ void test_gravity_projection_does_not_create_horizontal_velocity() {
     const float g = 9.81F;
     // NED gravity, specific force for a stationary body with pitch.
     const ofnav::ImuSample imu{1010000U, {},
-        {-g * std::sin(pitch), 0.0F, -g * std::cos(pitch)}, true};
+        {g * std::sin(pitch), 0.0F, -g * std::cos(pitch)}, true};
     const ofnav::AttitudeSample att{1010000U, 0.0F, pitch, 0.0F};
     ekf.predict(imu, att);
     assert(near(ekf.state().vn_m_s, 0.0F, 1.0e-4F));
