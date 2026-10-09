@@ -244,10 +244,13 @@ Fusion output is disabled unless -e is explicitly passed.
         }
 
         orb_set_interval(_flow_sub, static_cast<unsigned>(1000U / _rate_hz));
+        orb_set_interval(_imu_sub, static_cast<unsigned>(1000U / _rate_hz));
 
-        pollfd fds{};
-        fds.fd = _flow_sub;
-        fds.events = POLLIN;
+        pollfd fds[2]{};
+        fds[0].fd = _flow_sub;
+        fds[0].events = POLLIN;
+        fds[1].fd = _imu_sub;
+        fds[1].events = POLLIN;
 
         sensor_optical_flow_s flow_msg{};
         distance_sensor_s range_msg{};
@@ -255,7 +258,7 @@ Fusion output is disabled unless -e is explicitly passed.
         vehicle_attitude_s att_msg{};
 
         while (!should_exit()) {
-            const int pret = px4_poll(&fds, 1, static_cast<int>(kMainLoopTimeoutMs));
+            const int pret = px4_poll(fds, 2, static_cast<int>(kMainLoopTimeoutMs));
 
             if (pret < 0) {
                 PX4_ERR("poll error");
@@ -278,21 +281,27 @@ Fusion output is disabled unless -e is explicitly passed.
             if (imu_updated) { orb_copy(ORB_ID(vehicle_imu), _imu_sub, &imu_msg); }
             if (att_updated) { orb_copy(ORB_ID(vehicle_attitude), _att_sub, &att_msg); }
 
-            // Read the last samples on every iteration. Missing optical-flow updates
-            // must still result in a watchdog/health update, not a frozen status.
             const uint64_t now_us = hrt_absolute_time();
+            const auto imu = make_imu(imu_msg);
+            const auto attitude = make_attitude(att_msg);
+            if (imu_updated) {
+                // Independent IMU prediction, regardless of optical-flow rate.
+                _runtime.predictImu(imu, attitude);
+            }
             if (!flow_updated) {
-                const auto health = _runtime.monitor(now_us, make_imu(imu_msg),
-                                  make_range(flow_msg, range_msg), make_flow(flow_msg),
-                                  make_attitude(att_msg));
-                publish_debug(health, flow_msg.quality);
+                // A watchdog must keep running when optical flow stops.
+                if (now_us - _last_health_pub_us >= 100000U) {
+                    const auto health = _runtime.monitor(now_us, imu,
+                                        make_range(flow_msg, range_msg), make_flow(flow_msg),
+                                        attitude);
+                    publish_debug(health, flow_msg.quality);
+                    _last_health_pub_us = now_us;
+                }
                 continue;
             }
 
-            const ofnav::ImuSample imu = make_imu(imu_msg);
             const ofnav::RangeSample range = make_range(flow_msg, range_msg);
             const ofnav::OpticalFlowRadSample flow = make_flow(flow_msg);
-            const ofnav::AttitudeSample attitude = make_attitude(att_msg);
 
             const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude, now_us);
             ++_samples;
@@ -308,6 +317,7 @@ Fusion output is disabled unless -e is explicitly passed.
             }
 
             publish_debug(out, flow_msg.quality);
+            _last_health_pub_us = now_us;
 
             // A horizontal-only optical-flow estimate cannot legitimately furnish
             // the vertical component required by current PX4 EKF2 external-vision
@@ -515,6 +525,7 @@ private:
     uint32_t _degraded{0U};
     uint32_t _failsafe{0U};
     uint32_t _ev_published{0U};
+    uint64_t _last_health_pub_us{0U};
 };
 
 extern "C" __EXPORT int ofnav_main(int argc, char *argv[])
