@@ -275,7 +275,14 @@ Fusion output is disabled unless -e is explicitly passed.
             if (imu_updated) { orb_copy(ORB_ID(vehicle_imu), _imu_sub, &imu_msg); }
             if (att_updated) { orb_copy(ORB_ID(vehicle_attitude), _att_sub, &att_msg); }
 
+            // Read the last samples on every iteration. Missing optical-flow updates
+            // must still result in a watchdog/health update, not a frozen status.
+            const uint64_t now_us = hrt_absolute_time();
             if (!flow_updated) {
+                const auto health = _runtime.monitor(now_us, make_imu(imu_msg),
+                                  make_range(flow_msg, range_msg), make_flow(flow_msg),
+                                  make_attitude(att_msg));
+                publish_debug(health, flow_msg.quality);
                 continue;
             }
 
@@ -284,7 +291,7 @@ Fusion output is disabled unless -e is explicitly passed.
             const ofnav::OpticalFlowRadSample flow = make_flow(flow_msg);
             const ofnav::AttitudeSample attitude = make_attitude(att_msg);
 
-            const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude);
+            const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude, now_us);
             ++_samples;
 
             if (out.mode == ofnav::NavMode::FlowNav) {
@@ -299,6 +306,10 @@ Fusion output is disabled unless -e is explicitly passed.
 
             publish_debug(out, flow_msg.quality);
 
+            // A horizontal-only optical-flow estimate cannot legitimately furnish
+            // the vertical component required by current PX4 EKF2 external-vision
+            // velocity fusion. Keep the flag as an explicit diagnostics-only request
+            // until a validated 3D velocity source and PX4 compatibility test exist.
             if (_publish_ev_velocity && out.mode == ofnav::NavMode::FlowNav && out.flow.accepted) {
                 publish_visual_odometry_velocity(out, flow_msg, imu);
             }
@@ -324,15 +335,20 @@ private:
     ofnav::OpticalFlowRadSample make_flow(const sensor_optical_flow_s &msg) const noexcept
     {
         ofnav::OpticalFlowRadSample flow{};
-        flow.time_us = msg.timestamp;
+        flow.time_us = msg.timestamp_sample;
         flow.integration_time_s = static_cast<float>(msg.integration_timespan_us) * 1.0e-6f;
         flow.integrated_x_rad = msg.pixel_flow[0];
         flow.integrated_y_rad = msg.pixel_flow[1];
-        flow.integrated_xgyro_rad = msg.delta_angle_available ? msg.delta_angle[0] : 0.0f;
-        flow.integrated_ygyro_rad = msg.delta_angle_available ? msg.delta_angle[1] : 0.0f;
-        flow.integrated_zgyro_rad = msg.delta_angle_available ? msg.delta_angle[2] : 0.0f;
+        // A zero gyro correction is NOT valid when the sensor has no gyro.
+        // Separate IMU integration over the camera exposure is required for that case.
+        flow.integrated_xgyro_rad = msg.delta_angle_available ? msg.delta_angle[0] : NAN;
+        flow.integrated_ygyro_rad = msg.delta_angle_available ? msg.delta_angle[1] : NAN;
+        flow.integrated_zgyro_rad = msg.delta_angle_available ? msg.delta_angle[2] : NAN;
         flow.quality = msg.quality;
-        flow.valid = msg.timestamp != 0U && msg.integration_timespan_us > 0U && finite(flow.integrated_x_rad) && finite(flow.integrated_y_rad);
+        flow.valid = msg.timestamp_sample != 0U && msg.integration_timespan_us > 0U &&
+                     msg.delta_angle_available && finite(flow.integrated_x_rad) &&
+                     finite(flow.integrated_y_rad) && finite(flow.integrated_xgyro_rad) &&
+                     finite(flow.integrated_ygyro_rad);
         return flow;
     }
 
@@ -341,7 +357,7 @@ private:
         ofnav::RangeSample range{};
 
         if (flow_msg.distance_available && finite(flow_msg.distance_m) && flow_msg.distance_m > 0.0f) {
-            range.time_us = flow_msg.timestamp;
+            range.time_us = flow_msg.timestamp_sample;
             range.distance_m = flow_msg.distance_m;
             range.valid = true;
             return range;
@@ -361,7 +377,7 @@ private:
     ofnav::ImuSample make_imu(const vehicle_imu_s &msg) const noexcept
     {
         ofnav::ImuSample imu{};
-        imu.time_us = msg.timestamp;
+        imu.time_us = msg.timestamp_sample;
         imu.gyro_rad_s = {
             safe_div(msg.delta_angle[0], msg.delta_angle_dt),
             safe_div(msg.delta_angle[1], msg.delta_angle_dt),
@@ -372,7 +388,7 @@ private:
             safe_div(msg.delta_velocity[1], msg.delta_velocity_dt),
             safe_div(msg.delta_velocity[2], msg.delta_velocity_dt)
         };
-        imu.valid = msg.timestamp != 0U && msg.delta_angle_dt > 0U && msg.delta_velocity_dt > 0U &&
+        imu.valid = msg.timestamp_sample != 0U && msg.delta_angle_dt > 0U && msg.delta_velocity_dt > 0U &&
                     msg.delta_angle_clipping == 0U && msg.delta_velocity_clipping == 0U;
         return imu;
     }
@@ -383,7 +399,7 @@ private:
         float pitch = 0.0f;
         float yaw = 0.0f;
         quat_to_euler(msg.q, roll, pitch, yaw);
-        return ofnav::AttitudeSample{msg.timestamp, roll, pitch, yaw};
+        return ofnav::AttitudeSample{msg.timestamp_sample, roll, pitch, yaw};
     }
 
     void publish_debug(const ofnav::RuntimeOutput &out, uint8_t quality)
@@ -423,7 +439,7 @@ private:
     {
         vehicle_odometry_s odom{};
         odom.timestamp = hrt_absolute_time();
-        odom.timestamp_sample = flow_msg.timestamp;
+        odom.timestamp_sample = flow_msg.timestamp_sample;
         odom.pose_frame = vehicle_odometry_s::POSE_FRAME_UNKNOWN;
         odom.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_NED;
 
@@ -438,6 +454,9 @@ private:
 
         odom.velocity[0] = out.state.vn_m_s;
         odom.velocity[1] = out.state.ve_m_s;
+        // PX4 EKF2 external-velocity fusion requires all velocity components finite.
+        // Zero vertical velocity must NOT be invented: disable fusion until an
+        // independently validated vertical velocity channel is supplied.
         odom.velocity[2] = NAN;
 
         odom.angular_velocity[0] = imu.gyro_rad_s.x;
@@ -458,6 +477,8 @@ private:
 
         odom.reset_counter = 0U;
         odom.quality = flow_quality_to_odometry_quality(flow_msg.quality);
+        // Published with NaN vertical velocity intentionally: data trace only.
+        // EKF2 should reject it. Never claim fused navigation from this message.
 
         if (_visual_odom_pub == nullptr) {
             _visual_odom_pub = orb_advertise(ORB_ID(vehicle_visual_odometry), &odom);
