@@ -124,3 +124,32 @@ def align_current_to_previous(
     if overlap < min_overlap_fraction:
         raise ValueError("Слишком малое перекрытие кадров после компенсации")
     return aligned, overlap
+
+
+def camera_delta_to_center_ned(
+    camera_delta_body_prev_m: tuple[float, float],
+    previous_rpy: tuple[float, float, float],
+    current_rpy: tuple[float, float, float],
+    camera_offset_body_m: tuple[float, float, float],
+) -> np.ndarray:
+    """Горизонтальное перемещение центра масс с поправкой на плечо камеры.
+
+    p_camera^N = p_center^N + R_nb r_camera^B, следовательно:
+    delta_p_center^N = R_nb_prev delta_p_camera^Bprev
+                       - (R_nb_curr - R_nb_prev) r_camera^B.
+    Исходный визуальный перенос выражен в СК корпуса ПРЕДЫДУЩЕГО кадра.
+    Вертикальное движение камеры и неплоская местность не моделируются.
+    """
+    xy = np.asarray(camera_delta_body_prev_m, dtype=np.float64)
+    lever = np.asarray(camera_offset_body_m, dtype=np.float64)
+    if xy.shape != (2,) or lever.shape != (3,):
+        raise ValueError("Неверные размеры вектора перемещения или плеча")
+    if not np.isfinite(xy).all() or not np.isfinite(lever).all():
+        raise ValueError("Нечисловое перемещение или плечо установки")
+    if np.linalg.norm(lever) > 5.0:
+        raise ValueError("Плечо камеры превышает допустимый диапазон")
+    r_prev = body_to_ned(*previous_rpy)
+    r_curr = body_to_ned(*current_rpy)
+    delta_cam_nav = r_prev @ np.array([xy[0], xy[1], 0.0])
+    delta_lever_nav = (r_curr - r_prev) @ lever
+    return (delta_cam_nav - delta_lever_nav)[:2]
