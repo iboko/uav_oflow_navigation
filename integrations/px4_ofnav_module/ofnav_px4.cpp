@@ -408,7 +408,7 @@ private:
 
         if (_debug_vel_pub == nullptr) {
             _debug_vel_pub = orb_advertise_multi(ORB_ID(debug_vect), &vel,
-                                                &_debug_vel_instance, ORB_PRIO_DEFAULT);
+                                                &_debug_vel_instance);
 
         } else {
             orb_publish(ORB_ID(debug_vect), _debug_vel_pub, &vel);
@@ -423,7 +423,7 @@ private:
 
         if (_debug_health_pub == nullptr) {
             _debug_health_pub = orb_advertise_multi(ORB_ID(debug_vect), &health,
-                                                   &_debug_health_instance, ORB_PRIO_DEFAULT);
+                                                   &_debug_health_instance);
 
         } else {
             orb_publish(ORB_ID(debug_vect), _debug_health_pub, &health);
