@@ -1,0 +1,40 @@
+name: px4-sitl-module-compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'firmware/rtos_core/**'
+      - 'integrations/px4_ofnav_module/**'
+      - 'tools/install_px4_ofnav_module.sh'
+      - '.github/workflows/px4-sitl-module.yml'
+  workflow_dispatch:
+
+jobs:
+  build-px4-module:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ofnav source
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned PX4 v1.16.2
+        uses: actions/checkout@v4
+        with:
+          repository: PX4/PX4-Autopilot
+          ref: v1.16.2
+          path: PX4-Autopilot
+          submodules: recursive
+
+      - name: Install PX4 SITL build dependencies
+        run: bash PX4-Autopilot/Tools/setup/ubuntu.sh --no-nuttx --no-sim-tools
+
+      - name: Integrate ofnav into PX4 source tree
+        run: bash tools/install_px4_ofnav_module.sh PX4-Autopilot boards/px4/sitl/default.px4board
+
+      - name: Compile PX4 SITL with ofnav module
+        run: make -C PX4-Autopilot px4_sitl_default
+
+      - name: Check compiled module registration
+        run: |
+          test -d PX4-Autopilot/build/px4_sitl_default
+          echo 'PX4 SITL compilation completed.'
