@@ -21,6 +21,13 @@ constexpr float kEps = 1.0e-6F;
     return v * v;
 }
 
+[[nodiscard]] bool imuFinite(const ImuSample& imu) noexcept {
+    return imu.valid &&
+        std::isfinite(imu.gyro_rad_s.x) && std::isfinite(imu.gyro_rad_s.y) &&
+        std::isfinite(imu.gyro_rad_s.z) && std::isfinite(imu.accel_m_s2.x) &&
+        std::isfinite(imu.accel_m_s2.y) && std::isfinite(imu.accel_m_s2.z);
+}
+
 } // namespace
 
 bool isFinite(float v) noexcept {
@@ -426,7 +433,7 @@ RuntimeOutput SafetyMonitor::evaluate(uint64_t now_us,
     out.flow = flow_estimate;
     out.state = ekf_state;
 
-    out.health.imu_valid = imu.valid && timestampFresh(now_us, imu.time_us, cfg_.max_imu_age_us);
+    out.health.imu_valid = imuFinite(imu) && timestampFresh(now_us, imu.time_us, cfg_.max_imu_age_us);
     const bool attitude_valid = timestampFresh(now_us, attitude.time_us, cfg_.max_attitude_age_us) &&
         isFinite(attitude.roll_rad) && isFinite(attitude.pitch_rad) && isFinite(attitude.yaw_rad);
     out.health.range_valid = range.valid && timestampFresh(now_us, range.time_us, cfg_.max_range_age_us);
@@ -436,7 +443,9 @@ RuntimeOutput SafetyMonitor::evaluate(uint64_t now_us,
     out.health.innovation_valid = innovation_ok;
     out.health.stale_range = !out.health.range_valid;
     out.health.stale_flow = !out.health.flow_valid;
-    out.health.excessive_tilt = flow_estimate.reason == RejectReason::ExcessiveTilt;
+    out.health.excessive_tilt = attitude_valid &&
+        (std::fabs(attitude.roll_rad) > cfg_.max_tilt_rad ||
+         std::fabs(attitude.pitch_rad) > cfg_.max_tilt_rad);
 
     if (!out.health.imu_valid || !attitude_valid || out.health.stale_range || out.health.excessive_tilt) {
         out.mode = NavMode::FailsafeLand;
@@ -462,7 +471,7 @@ void OfNavRuntime::reset(uint64_t time_us) noexcept {
 
 void OfNavRuntime::predictImu(const ImuSample& imu,
                                const AttitudeSample& attitude) noexcept {
-    if (!imu.valid || !timestampFresh(imu.time_us, attitude.time_us,
+    if (!imuFinite(imu) || !timestampFresh(imu.time_us, attitude.time_us,
             cfg_.max_measurement_skew_us)) {
         return;
     }
@@ -477,7 +486,7 @@ RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
     if (now_us == 0U) {
         now_us = imu.time_us;
     }
-    const bool fresh_imu = imu.valid && timestampFresh(now_us, imu.time_us, cfg_.max_imu_age_us);
+    const bool fresh_imu = imuFinite(imu) && timestampFresh(now_us, imu.time_us, cfg_.max_imu_age_us);
     const bool fresh_att = timestampFresh(now_us, attitude.time_us, cfg_.max_attitude_age_us);
     const bool fresh_range = range.valid && timestampFresh(now_us, range.time_us, cfg_.max_range_age_us);
     const bool fresh_flow = flow.valid && timestampFresh(now_us, flow.time_us, cfg_.max_flow_age_us);
