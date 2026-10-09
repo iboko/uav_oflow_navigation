@@ -103,6 +103,66 @@ void test_ekf_innovation_gate_rejects_outlier() {
     assert(ekf.lastInnovationD2() > cfg.innovation_gate_2d);
 }
 
+void test_covariance_joseph_update() {
+    auto cfg = baseConfig();
+    ofnav::HorizontalEkf ekf(cfg);
+    ekf.reset(0U);
+    const float p_before = ekf.covariance(2, 2);
+    const ofnav::FlowVelocityEstimate flow{true, ofnav::RejectReason::Ok,
+        1.0F, {0.0F, 0.0F}, {0.0F, 0.0F}, 0.0F, 0.0F};
+    assert(ekf.updateFlowVelocity(flow, 220U));
+    const float quality = 220.0F;
+    float sigma = cfg.flow_vel_sigma_min_m_s +
+        cfg.flow_vel_sigma_quality_gain_m_s * (1.0F - quality / 255.0F);
+    const float r = sigma * sigma;
+    const float expected = p_before * r / (p_before + r);
+    assert(near(ekf.covariance(2, 2), expected, 1.0e-6F));
+    assert(ekf.covariance(2, 2) > 0.0F);
+}
+
+void test_gravity_projection_does_not_create_horizontal_velocity() {
+    const auto cfg = baseConfig();
+    ofnav::HorizontalEkf ekf(cfg);
+    ekf.reset(1000000U);
+    const float pitch = 0.20F;
+    const float g = 9.81F;
+    // NED gravity, specific force for a stationary body with pitch.
+    const ofnav::ImuSample imu{1010000U, {},
+        {-g * std::sin(pitch), 0.0F, -g * std::cos(pitch)}, true};
+    const ofnav::AttitudeSample att{1010000U, 0.0F, pitch, 0.0F};
+    ekf.predict(imu, att);
+    assert(near(ekf.state().vn_m_s, 0.0F, 1.0e-4F));
+    assert(near(ekf.state().ve_m_s, 0.0F, 1.0e-4F));
+}
+
+void test_stale_flow_is_never_fused() {
+    auto cfg = baseConfig();
+    cfg.max_flow_age_us = 100000U;
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    const ofnav::ImuSample imu{1200000U, {}, {}, true};
+    const ofnav::RangeSample range{1200000U, 1.0F, true};
+    const ofnav::OpticalFlowRadSample flow{1000000U, 0.04F, 0.0F, 0.01F,
+        0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::AttitudeSample att{1200000U, 0.0F, 0.0F, 0.0F};
+    const auto out = runtime.step(imu, range, flow, att, 1200000U);
+    assert(out.mode != ofnav::NavMode::FlowNav);
+    assert(!out.flow.accepted);
+}
+
+void test_timeout_without_new_flow_samples() {
+    auto cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    const ofnav::ImuSample imu{1200000U, {}, {}, true};
+    const ofnav::RangeSample range{1200000U, 1.0F, true};
+    const ofnav::OpticalFlowRadSample flow{1000000U, 0.04F, 0.0F, 0.01F,
+        0.0F, 0.0F, 0.0F, 220U, true};
+    const ofnav::AttitudeSample att{1200000U, 0.0F, 0.0F, 0.0F};
+    const auto out = runtime.monitor(1200000U, imu, range, flow, att);
+    assert(out.mode == ofnav::NavMode::DegradedHold);
+    assert(out.health.stale_flow);
+}
+
 } // namespace
 
 int main() {
@@ -112,6 +172,10 @@ int main() {
     test_quality_rejection();
     test_runtime_failsafe_without_range();
     test_ekf_innovation_gate_rejects_outlier();
+    test_covariance_joseph_update();
+    test_gravity_projection_does_not_create_horizontal_velocity();
+    test_stale_flow_is_never_fused();
+    test_timeout_without_new_flow_samples();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }
