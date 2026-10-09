@@ -214,19 +214,8 @@ public:
                                          const FlowVelocityEstimate& flow_estimate,
                                          const EkfState& ekf_state,
                                          bool innovation_ok,
-                                         const AttitudeSample& attitude,
-                                     uint64_t now_us = 0U) noexcept;
-
-    // Called periodically even when no new optical-flow sample arrives.
-    [[nodiscard]] RuntimeOutput monitor(uint64_t now_us,
-                                        const ImuSample& imu,
-                                        const RangeSample& range,
-                                        const OpticalFlowRadSample& flow,
-                                        const AttitudeSample& attitude) noexcept;
-
+                                         const AttitudeSample& attitude) noexcept;
 private:
-    FlowVelocityEstimate last_flow_estimate_{};
-    bool last_innovation_ok_{false};
     Config cfg_{};
 };
 
@@ -239,9 +228,17 @@ public:
     [[nodiscard]] RuntimeOutput step(const ImuSample& imu,
                                      const RangeSample& range,
                                      const OpticalFlowRadSample& flow,
-                                     const AttitudeSample& attitude) noexcept;
+                                     const AttitudeSample& attitude,
+                                     uint64_t now_us = 0U) noexcept;
 
+    [[nodiscard]] RuntimeOutput monitor(uint64_t now_us,
+                                        const ImuSample& imu,
+                                        const RangeSample& range,
+                                        const OpticalFlowRadSample& flow,
+                                        const AttitudeSample& attitude) noexcept;
 private:
+    FlowVelocityEstimate last_flow_estimate_{};
+    bool last_innovation_ok_{false};
     Config cfg_{};
     FlowVelocityEstimator flow_estimator_;
     HorizontalEkf ekf_;
