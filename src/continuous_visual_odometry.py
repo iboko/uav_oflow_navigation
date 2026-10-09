@@ -13,7 +13,8 @@ from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
 import numpy as np
 
 from .ground_visual_motion import CameraCalibration, GroundMotionEstimate, estimate_ground_motion
-from .camera_rotation_compensation import CameraMountCalibration, align_current_to_previous
+from .camera_rotation_compensation import (CameraMountCalibration, align_current_to_previous,
+                                           camera_delta_to_center_ned)
 
 
 def _wrap(angle: float) -> float:
@@ -63,6 +64,7 @@ class ContinuousPlanarOdometry:
         calibration: CameraCalibration,
         *,
         camera_mount: CameraMountCalibration | None = None,
+        camera_offset_body_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
         max_pair_dt_s: float = 0.35,
         max_yaw_change_rad: float = 0.30,
         max_relative_height_change: float = 0.12,
@@ -86,6 +88,14 @@ class ContinuousPlanarOdometry:
             raise ValueError("Неверные параметры контроля визуальной одометрии")
         if camera_mount is not None and not camera_mount.valid(calibration):
             raise ValueError("Несогласованная пространственная калибровка камеры")
+        offset = np.asarray(camera_offset_body_m, dtype=np.float64)
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("Плечо установки камеры должно быть конечным 3D-вектором")
+        if float(np.linalg.norm(offset)) > 5.0:
+            raise ValueError("Плечо камеры слишком велико")
+        if camera_mount is None and np.any(offset != 0.0):
+            raise ValueError("Ненулевое плечо требует трехмерной калибровки камеры")
+        self._offset = tuple(float(v) for v in offset)
         self._calib = calibration
         self._mount = camera_mount
         self._max_pair_dt = max_pair_dt_s
@@ -105,6 +115,11 @@ class ContinuousPlanarOdometry:
     def reset(self) -> None:
         """Явный разрыв относительной траектории."""
         self._restart(None)
+
+    def reject_frame(self, timestamp_us: int, reason: str) -> VisualOdomResult:
+        """Явно зарегистрировать отказ внешнего канала измерений."""
+        self._restart(None)
+        return self._out(timestamp_us, reason)
 
     def _restart(self, anchor: VisualFrame | None) -> None:
         self._segment_id += 1
@@ -231,14 +246,27 @@ class ContinuousPlanarOdometry:
             self._restart(current)
             return self._out(current.timestamp_us, f"TRACK_LOST:{motion.reason}", motion=motion)
 
-        # A derotated image is expressed in the previous camera frame.
-        # Thus the velocity has the previous-body heading. The legacy
-        # yaw-only approximation retains midpoint heading for compatibility.
-        mid_yaw = (previous.yaw_rad if self._mount is not None
-                   else previous.yaw_rad + 0.5 * yaw_delta)
-        c, s = cos(mid_yaw), sin(mid_yaw)
-        vn = c * motion.velocity_body_x_m_s - s * motion.velocity_body_y_m_s
-        ve = s * motion.velocity_body_x_m_s + c * motion.velocity_body_y_m_s
+        # Derotated visual displacement is expressed in PREVIOUS body axes.
+        # Correct for rotation of the rigid camera lever arm before treating
+        # camera displacement as centre-of-mass displacement.
+        if self._mount is not None:
+            try:
+                dn_de = camera_delta_to_center_ned(
+                    (motion.velocity_body_x_m_s * dt_s,
+                     motion.velocity_body_y_m_s * dt_s),
+                    (previous.roll_rad, previous.pitch_rad, previous.yaw_rad),
+                    (current.roll_rad, current.pitch_rad, current.yaw_rad),
+                    self._offset,
+                )
+            except ValueError:
+                self._restart(current)
+                return self._out(current.timestamp_us, "LEVER_ARM_CORRECTION_FAILED")
+            vn, ve = float(dn_de[0] / dt_s), float(dn_de[1] / dt_s)
+        else:
+            mid_yaw = previous.yaw_rad + 0.5 * yaw_delta
+            c, s = cos(mid_yaw), sin(mid_yaw)
+            vn = c * motion.velocity_body_x_m_s - s * motion.velocity_body_y_m_s
+            ve = s * motion.velocity_body_x_m_s + c * motion.velocity_body_y_m_s
         if not isfinite(vn) or not isfinite(ve):
             self._restart(current)
             return self._out(current.timestamp_us, "NONFINITE_VELOCITY")
