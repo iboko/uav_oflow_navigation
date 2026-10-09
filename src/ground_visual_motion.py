@@ -139,6 +139,22 @@ def estimate_ground_motion(
     if n_inlier < min_inliers or n_inlier / tracked < min_inlier_ratio:
         return reject("INSUFFICIENT_INLIERS", tracked, n_inlier)
 
+    # A cluster of points in a tiny image region cannot reliably separate
+    # image translation, scale and rotation over the full field of view.
+    inliers = old[mask.reshape(-1).astype(bool)]
+    height_px, width_px = previous_image.shape
+    cells_x = np.clip((inliers[:, 0] * 4 / width_px).astype(int), 0, 3)
+    cells_y = np.clip((inliers[:, 1] * 4 / height_px).astype(int), 0, 3)
+    spatial_cells = len(set(zip(cells_x.tolist(), cells_y.tolist())))
+    if spatial_cells < 6:
+        return reject("INSUFFICIENT_SPATIAL_DISTRIBUTION", tracked, n_inlier)
+
+    projected = inliers @ transform[:, :2].T + transform[:, 2]
+    target = new[mask.reshape(-1).astype(bool)]
+    residual = np.linalg.norm(projected - target, axis=1)
+    if not np.isfinite(residual).all() or float(np.median(residual)) > 1.25:
+        return reject("EXCESSIVE_REPROJECTION_ERROR", tracked, n_inlier)
+
     principal = np.array([calibration.center_x_px, calibration.center_y_px])
     pixel_shift = transform[:, :2] @ principal + transform[:, 2] - principal
     image_plane_speed = np.array([
