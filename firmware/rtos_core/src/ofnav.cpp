@@ -439,6 +439,17 @@ OfNavRuntime::OfNavRuntime(Config cfg) noexcept : cfg_(cfg), flow_estimator_(cfg
 
 void OfNavRuntime::reset(uint64_t time_us) noexcept {
     ekf_.reset(time_us);
+    last_flow_estimate_ = {};
+    last_innovation_ok_ = false;
+}
+
+void OfNavRuntime::predictImu(const ImuSample& imu,
+                               const AttitudeSample& attitude) noexcept {
+    if (!imu.valid || !timestampFresh(imu.time_us, attitude.time_us,
+            cfg_.max_measurement_skew_us)) {
+        return;
+    }
+    ekf_.predict(imu, attitude);
 }
 
 RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
@@ -459,7 +470,7 @@ RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
                          ((flow.time_us > attitude.time_us ? flow.time_us - attitude.time_us :
                          attitude.time_us - flow.time_us) <= cfg_.max_measurement_skew_us);
     if (fresh_imu && fresh_att) {
-        ekf_.predict(imu, attitude);
+        predictImu(imu, attitude);
     }
     last_flow_estimate_ = {};
     last_innovation_ok_ = false;
