@@ -130,12 +130,10 @@ def run_manifest(
                     raise ValueError(f"Строка {line_no}: неверный эталон") from exc
                 if not isfinite(tn) or not isfinite(te):
                     raise ValueError(f"Строка {line_no}: эталон не конечен")
-                # Every uninterrupted segment gets its own reference origin;
-                # comparing against absolute global truth would be misleading.
-                if result.status in ("INITIALIZED", "TIME_GAP_REINITIALIZED",
-                                     "IMAGE_SIZE_CHANGED", "HEIGHT_JUMP",
-                                     "EXCESSIVE_YAW_CHANGE") or result.status.startswith("TRACK_LOST:"):
-                    origin_by_segment[result.segment_id] = (tn, te)
+                # A newly assigned segment_id always denotes a new
+                # independent reference origin, regardless of the status
+                # which caused reinitialization. Never compare global positions.
+                origin_by_segment.setdefault(result.segment_id, (tn, te))
                 if result.accepted and result.segment_id in origin_by_segment:
                     n0, e0 = origin_by_segment[result.segment_id]
                     error = hypot(result.north_m - (tn - n0),
