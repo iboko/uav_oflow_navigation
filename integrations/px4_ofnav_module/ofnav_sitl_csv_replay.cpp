@@ -62,8 +62,9 @@ int ofnav_sitl_csv_replay(const char *filename)
     }
 
     char line[512]{};
+    constexpr char kHeaderPrefix[] = "timestamp_us,arrival_us,height_m,yaw_rad,";
     if (std::fgets(line, sizeof(line), fp) == nullptr ||
-            std::strncmp(line, "timestamp_us,arrival_us,height_m,yaw_rad,", 40) != 0) {
+            std::strncmp(line, kHeaderPrefix, sizeof(kHeaderPrefix) - 1U) != 0) {
         PX4_ERR("OFNAV_SITL_REPLAY invalid header");
         std::fclose(fp);
         return -1;
