@@ -41,7 +41,7 @@ def test_false_map_fix_is_counted_among_accepted_not_hidden_by_ransac():
 
 
 def test_missing_reference_must_reject_without_silent_interpolation():
-    with pytest.raises(ValueError, match="не у всех"):
+    with pytest.raises(ValueError, match="у всех кадров"):
         evaluate_flight(
             [c(1_000_000, 0.), c(1_100_000, 0.)],
             [truth(1_000_000)],
