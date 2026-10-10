@@ -28,6 +28,9 @@ struct Visual {
 };
 
 struct Parameters {
+    Quat initial_quaternion_body_to_ned{1., 0., 0., 0.};
+    Vec3 initial_gyro_bias_rad_s{};
+    Vec3 initial_accel_bias_m_s2{};
     std::array<double, 15> initial_sigma{
         10., 10., 10., 1., 1., 1., .1, .1, .1,
         .02, .02, .02, .2, .2, .2
