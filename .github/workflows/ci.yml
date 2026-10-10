@@ -57,3 +57,18 @@ jobs:
 
       - name: Run C++ tests
         run: ctest --test-dir build/rtos_core --output-on-failure
+
+      - name: Compare full C++15 ESKF against Python delayed replay
+        run: |
+          python -m src.compare_cpp15_python \
+            --cpp-executable build/rtos_core/eskf15_parity \
+            --output build/eskf15_parity/cpp_python_full_covariance.json
+
+      - name: Archive C++15 Python mathematical parity report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp15-python-full-covariance-parity
+          path: build/eskf15_parity/cpp_python_full_covariance.json
+          if-no-files-found: error
+          retention-days: 30
+

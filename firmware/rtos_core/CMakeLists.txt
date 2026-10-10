@@ -5,6 +5,7 @@ option(OFNAV_BUILD_TESTS "Build RTOS core tests" ON)
 
 add_library(ofnav_rtos_core STATIC
     src/ofnav.cpp
+    src/eskf15.cpp
 )
 
 target_include_directories(ofnav_rtos_core
@@ -27,4 +28,13 @@ if(OFNAV_BUILD_TESTS)
     target_link_libraries(test_ofnav PRIVATE ofnav_rtos_core)
     target_compile_options(test_ofnav PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME test_ofnav COMMAND test_ofnav)
+
+    add_executable(test_eskf15 tests/test_eskf15.cpp)
+    target_link_libraries(test_eskf15 PRIVATE ofnav_rtos_core)
+    target_compile_options(test_eskf15 PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME test_eskf15 COMMAND test_eskf15)
+
+    add_executable(eskf15_parity tests/eskf15_parity.cpp)
+    target_link_libraries(eskf15_parity PRIVATE ofnav_rtos_core)
+    target_compile_options(eskf15_parity PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
