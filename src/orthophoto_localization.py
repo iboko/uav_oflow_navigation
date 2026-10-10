@@ -133,6 +133,7 @@ class OrthophotoLocalizer:
         min_spatial_cells: int = 6,
         max_jacobian_error_fraction: float = 0.30,
         competing_score_fraction: float = 0.75,
+        distinct_position_threshold_m: float = 2.0,
     ) -> None:
         if not calibration.valid() or not mount.valid(calibration):
             raise ValueError("Некорректная/несогласованная пространственная калибровка камеры")
@@ -144,6 +145,8 @@ class OrthophotoLocalizer:
             raise ValueError("Недопустимая точность геометрической проверки")
         if not 0 < competing_score_fraction < 1:
             raise ValueError("Недопустимый критерий альтернативной привязки")
+        if not isfinite(distinct_position_threshold_m) or not 0.5 <= distinct_position_threshold_m <= 20:
+            raise ValueError("Недопустимый порог разделения пространственных гипотез")
         if not tiles or len({t.name for t in tiles}) != len(tiles):
             raise ValueError("Нужны разные идентификаторы листов ортофотоплана")
         self.calibration = calibration
@@ -159,7 +162,9 @@ class OrthophotoLocalizer:
         self.min_cells = min_spatial_cells
         self.max_geom_error = max_jacobian_error_fraction
         self.competing_fraction = competing_score_fraction
+        self.distinct_position_threshold_m = distinct_position_threshold_m
         self.tiles = []
+        self.search_windows = []
         self.orb = cv2.ORB_create(nfeatures=2400, fastThreshold=9)
         for tile in tiles:
             if not tile.name.strip() or not isinstance(tile.gray, np.ndarray):
@@ -170,6 +175,23 @@ class OrthophotoLocalizer:
             keypoints, descriptors = self.orb.detectAndCompute(tile.gray, None)
             if descriptors is not None and len(keypoints) >= min_inliers:
                 self.tiles.append((tile, keypoints, descriptors))
+                # In a single orthophoto, repeated terrain can support two
+                # different homographies. Global KNN often misses this
+                # because repeated descriptors fail the ratio test. Re-match
+                # independently in four overlapping spatial windows, then
+                # compare the resulting *metric* position hypotheses.
+                self.search_windows.append((tile, keypoints, descriptors))
+                height, width = tile.gray.shape
+                for x0 in (0, width // 3):
+                    for y0 in (0, height // 3):
+                        x1, y1 = x0 + (2 * width) // 3, y0 + (2 * height) // 3
+                        indices = [j for j, kp in enumerate(keypoints)
+                                   if x0 <= kp.pt[0] < x1 and y0 <= kp.pt[1] < y1]
+                        if len(indices) >= min_inliers:
+                            subset = [keypoints[j] for j in indices]
+                            self.search_windows.append(
+                                (tile, subset, descriptors[np.asarray(indices)])
+                            )
         if not self.tiles:
             raise ValueError("Нет пригодных характерных точек на ортофотоплане")
 
@@ -220,9 +242,10 @@ class OrthophotoLocalizer:
             return reject("INSUFFICIENT_TEXTURE")
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         candidates: list[_Candidate] = []
-        for tile, kp_map, des_map in self.tiles:
+        for tile, kp_map, des_map in self.search_windows:
             pairs = bf.knnMatch(des_query, des_map, k=2)
-            good = [a for a, b in pairs if a.distance < 0.72*b.distance]
+            good = [pair[0] for pair in pairs if len(pair) == 2
+                    and pair[0].distance < 0.72 * pair[1].distance]
             if len(good) < self.min_inliers:
                 continue
             src = np.asarray([kp_query[m.queryIdx].pt for m in good], dtype=np.float32)
@@ -277,12 +300,14 @@ class OrthophotoLocalizer:
             return reject("NO_GEOMETRICALLY_VALID_MAP_MATCH")
         candidates.sort(key=lambda c: (c.inliers, c.ratio, -c.residual), reverse=True)
         best = candidates[0]
-        if len(candidates) > 1:
-            other = candidates[1]
-            # No claim of uniqueness when a second sheet explains the same
-            # view nearly as well. Spatially overlapping identical tiles may
-            # also be ambiguous; safest behaviour is to reject.
-            if other.inliers >= self.competing_fraction * best.inliers:
+        # Multiple overlapping windows can return the same physical
+        # location. Only a DISTINCT and comparably supported location
+        # constitutes a competing map hypothesis, regardless of whether
+        # it comes from this tile or another tile.
+        for other in candidates[1:]:
+            if (np.linalg.norm(other.ne - best.ne) >
+                    self.distinct_position_threshold_m and
+                    other.inliers >= self.competing_fraction * best.inliers):
                 return reject("AMBIGUOUS_MAP_MATCH")
         return MapLocalizationFix(
             True, "GEOMETRICALLY_ACCEPTED_UNVALIDATED", best.tile.name,
