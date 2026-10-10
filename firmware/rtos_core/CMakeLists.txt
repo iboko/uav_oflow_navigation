@@ -5,6 +5,7 @@ option(OFNAV_BUILD_TESTS "Build RTOS core tests" ON)
 
 add_library(ofnav_rtos_core STATIC
     src/ofnav.cpp
+    src/eskf15.cpp
 )
 
 target_include_directories(ofnav_rtos_core
