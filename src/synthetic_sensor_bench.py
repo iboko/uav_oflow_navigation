@@ -170,6 +170,7 @@ def generate_dataset(output_dir: str | Path,
 
     rng = np.random.default_rng(config.seed+1)
     imu_data = []
+    truth_imu_rows = []
     count = int(round((config.frames-1)*config.camera_dt_s/config.imu_dt_s))
     for i in range(count+1):
         t=i*config.imu_dt_s
@@ -180,6 +181,7 @@ def generate_dataset(output_dir: str | Path,
         force_body += rng.normal(0., .012, 3)
         gyro += rng.normal(0., .00015, 3)
         time_us=1_000_000+int(round(t*1e6))
+        truth_imu_rows.append([time_us,*velocity.tolist()])
         if config.scenario=="imu_gap" and .42 <= t <= .56:
             continue
         imu_data.append([time_us,*gyro.tolist(),*force_body.tolist()])
@@ -189,6 +191,10 @@ def generate_dataset(output_dir: str | Path,
                          "gyro_x_rad_s","gyro_y_rad_s","gyro_z_rad_s",
                          "accel_x_m_s2","accel_y_m_s2","accel_z_m_s2"])
         writer.writerows(imu_data)
+    with (dest/"truth_imu.csv").open("w",newline="",encoding="utf-8") as f:
+        writer=csv.writer(f)
+        writer.writerow(["timestamp_us","vn_m_s","ve_m_s"])
+        writer.writerows(truth_imu_rows)
 
     camera_rows=[]
     truth_rows=[]
@@ -234,6 +240,7 @@ def generate_dataset(output_dir: str | Path,
             "imu_file":"imu.csv",
             "range_source":"synthetic camera optical-centre height",
             "truth_file":"truth.csv",
+            "truth_at_imu_times_file":"truth_imu.csv",
             "ground_truth_used_by_estimators":False,
             "px4_control_enabled":False,
         },f,ensure_ascii=False,indent=2)
@@ -372,11 +379,14 @@ def run_sensor_bench(data_dir: str | Path,
             "eskf_status":fusion_status,
             "eskf_vn_m_s":state.velocity_ned_m_s[0],
             "eskf_ve_m_s":state.velocity_ned_m_s[1],
+            "eskf_state_timestamp_us":state.timestamp_us,
             "applied_map_correction":0,
         })
     # Independent synthetic truth opened only for scoring, after estimating.
     with (base/"truth.csv").open(newline="",encoding="utf-8") as f:
         truth={int(r["timestamp_us"]):r for r in csv.DictReader(f)}
+    with (base/"truth_imu.csv").open(newline="",encoding="utf-8") as f:
+        truth_imu={int(r["timestamp_us"]):r for r in csv.DictReader(f)}
     map_errors=[]
     vo_errors=[]
     fusion_errors=[]
@@ -393,9 +403,15 @@ def run_sensor_bench(data_dir: str | Path,
                 row["ve_vo_m_s"]-float(ref["ve_m_s"])
             )))
         if row["eskf_status"]=="VISUAL_CORRECTED":
+            # Delayed correction is applied at exposure time, but the
+            # replayed filter snapshot is at the latest received IMU time.
+            # Comparing it with exposure-time truth would be a false error.
+            at_state=truth_imu.get(row["eskf_state_timestamp_us"])
+            if at_state is None:
+                raise ValueError("Отсутствует эталон на времени оценки РФК")
             fusion_errors.append(float(np.hypot(
-                row["eskf_vn_m_s"]-float(ref["vn_m_s"]),
-                row["eskf_ve_m_s"]-float(ref["ve_m_s"])
+                row["eskf_vn_m_s"]-float(at_state["vn_m_s"]),
+                row["eskf_ve_m_s"]-float(at_state["ve_m_s"])
             )))
     def rmse(errors):
         return float(np.sqrt(np.mean(np.square(errors)))) if errors else None
