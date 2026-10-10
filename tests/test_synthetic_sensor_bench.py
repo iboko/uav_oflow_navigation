@@ -159,3 +159,29 @@ def test_invalid_motion_design_fails_before_render(tmp_path):
         generate_dataset(tmp_path,BenchConfig(frames=2))
     with pytest.raises(ValueError):
         generate_dataset(tmp_path,BenchConfig(imu_dt_s=.013))
+
+
+def test_modified_camera_extrinsics_or_georeference_cannot_be_silently_used(tmp_path):
+    folder=generate_dataset(tmp_path/"input",BenchConfig(frames=4))
+    path=folder/"calibration.json"
+    original=json.loads(path.read_text())
+    original["map_georeference"]["origin_ne_m"][0] += 50.
+    path.write_text(json.dumps(original))
+    with pytest.raises(ValueError,match="калибровка противоречит"):
+        run_sensor_bench(folder,tmp_path/"evaluation")
+
+
+def test_range_height_mismatch_is_rejected_before_geometry_is_used(tmp_path):
+    folder=generate_dataset(tmp_path/"input",BenchConfig(frames=4))
+    path=folder/"camera.csv"
+    with path.open(newline="",encoding="utf-8") as f:
+        reader=csv.DictReader(f)
+        fields=reader.fieldnames
+        rows=list(reader)
+    rows[1]["range_height_m"]="110.0"
+    with path.open("w",newline="",encoding="utf-8") as f:
+        writer=csv.DictWriter(f,fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ValueError,match="Дальномер и высота"):
+        run_sensor_bench(folder,tmp_path/"evaluation")
