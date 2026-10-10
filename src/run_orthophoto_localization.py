@@ -20,6 +20,7 @@ import yaml
 from .camera_rotation_compensation import CameraMountCalibration
 from .ground_visual_motion import CameraCalibration
 from .map_correction_gate import assess_map_correction
+from .map_temporal_integrity import TemporalMapIntegrityMonitor
 from .orthophoto_localization import (
     MapGeoReference, OrthophotoTile, OrthophotoLocalizer
 )
@@ -90,9 +91,29 @@ def run_orthophoto_log(
         samples = list(reader)
     if not samples:
         raise ValueError("Нет изображений для сопоставления")
+    integrity_conf = config.get("temporal_integrity")
+    temporal_monitor = None
+    if integrity_conf is not None:
+        if not isinstance(integrity_conf, dict):
+            raise ValueError("Словарь temporal_integrity должен быть объектом YAML")
+        try:
+            temporal_monitor = TemporalMapIntegrityMonitor(
+                max_horizontal_speed_m_s=float(
+                    integrity_conf.get("max_horizontal_speed_m_s", 8.)
+                ),
+                max_interframe_gap_s=float(
+                    integrity_conf.get("max_interframe_gap_s", .5)
+                ),
+                minimum_consistent_intervals=int(
+                    integrity_conf.get("minimum_consistent_intervals", 3)
+                ),
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Неверные настройки временной целостности карты") from exc
     rows = []
     statuses = Counter()
     gating = Counter()
+    temporal_statuses = Counter()
     last_time = 0
     for index, row in enumerate(samples, 2):
         try:
@@ -110,6 +131,12 @@ def run_orthophoto_log(
                 pitch_rad=float(row["pitch_rad"]),
                 yaw_rad=float(row["yaw_rad"]),
             )
+            temporal_status = "NOT_EVALUATED"
+            temporal_consistent = False
+            if temporal_monitor is not None:
+                temporal = temporal_monitor.inspect(t, fixed)
+                temporal_status = temporal.status
+                temporal_consistent = temporal.consistent
             gate_status = "NOT_REQUESTED_NO_ESTIMATOR_PRIOR"
             gate_nis = float("nan")
             if has_prediction:
@@ -137,10 +164,18 @@ def run_orthophoto_log(
                     ),
                 )
                 gate_status, gate_nis = assessed.status, assessed.nis_2d
+                # A declared validated covariance is not enough to use a
+                # candidate in a sequence with impossible map jumps or without
+                # the explicitly requested temporal support.
+                if assessed.eligible and temporal_monitor is not None and (
+                    not temporal_consistent
+                ):
+                    gate_status = "MAP_TEMPORAL_NOT_CONFIRMED"
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Ошибка строки видеолога {index}: {exc}") from exc
         statuses[fixed.status] += 1
         gating[gate_status] += 1
+        temporal_statuses[temporal_status] += 1
         rows.append({
             "timestamp_us": t,
             "image_path": row["image_path"],
@@ -154,6 +189,8 @@ def run_orthophoto_log(
             "median_residual_map_px": fixed.median_residual_map_px,
             "jacobian_error_fraction": fixed.geometric_jacobian_error,
             "map_gate_status": gate_status,
+            "temporal_integrity_status": temporal_status,
+            "temporal_integrity_only_unvalidated": True,
             "map_gate_nis_2d": gate_nis,
             "applied_to_estimator": 0,
         })
@@ -173,6 +210,7 @@ def run_orthophoto_log(
         ),
         "map_status_counts": dict(sorted(statuses.items())),
         "correction_gate_counts": dict(sorted(gating.items())),
+        "temporal_integrity_counts": dict(sorted(temporal_statuses.items())),
         "applied_to_estimator": 0,
         "remarks": [
             "Предложение положения БВС в локальных метрах N/E, не абсолютные широта/долгота.",
