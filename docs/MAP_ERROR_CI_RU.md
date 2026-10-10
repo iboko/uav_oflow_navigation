@@ -125,6 +125,55 @@ x_CI = P_CI [w P_prior^{-1} x_prior
 маргинальные ошибки и отсутствие необъяснимого
 скачка положения.
 
+## 3. Воспроизводимая офлайн-проверка кандидата объединения
+
+`src/run_map_ci_offline.py` принимает CSV с предварительными
+двухмерными координатами и маргинальной ковариацией РФК:
+
+```csv
+timestamp_us,prior_n_m,prior_e_m,prior_cov_nn_m2,prior_cov_ne_m2,prior_cov_ee_m2
+1000000,10.0,-2.0,1.0,0.0,1.0
+```
+
+Дополнительно требуются `orthophoto_candidates.csv`
+из PR #12 с полем `temporal_integrity_status`,
+файл `map_error_calibration.json` от этапа настройки
+и подтверждения испытательной группы в YAML:
+
+```yaml
+prior_covariance_independently_validated: false
+map_covariance_independently_validated: false
+reference_frames_and_timestamps_aligned: false
+independent_map_integrity_review: false
+max_position_disagreement_m: 20.0
+```
+
+Эти признаки **по умолчанию false**. Выставлять их
+в true без измерений, подтверждений СК, статистики
+ложных привязок и проверки погрешностей запрещается.
+Программа проверяет, что временные метки двух журналов
+совпадают строго, вычитает обученное смещение `b`
+из картографической координаты и формирует
+`map_ci_candidates.csv` только для дальнейшего
+математического анализа. Выход `applied_to_eskf=0`
+фиксирован, даже если все призна́ки объявлены true.
+
+```bash
+python -m src.run_map_ci_offline \
+  --prior-csv data/prior_ne.csv \
+  --map-candidates-csv outputs/map_localization/orthophoto_candidates.csv \
+  --calibration-json outputs/map_calibration/map_error_calibration.json \
+  --verification-yaml data/ci_review.yaml \
+  --output-dir outputs/map_ci
+```
+
+`map_ci_summary.json` дополнительно фиксирует,
+что признаки подтверждения — **декларации испытательной
+группы**, а не автоматически проверенный допуск.
+Двухмерная ковариация CI не заменяет матрицу полного
+15-мерного РФК и не дает права напрямую передать
+результат в PX4.
+
 ## 3. Обязательная экспериментальная проверка НИИВК
 
 Испытательная группа предоставляет минимум раздельные
