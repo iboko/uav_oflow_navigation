@@ -58,6 +58,7 @@ def test_synthetic_sensor_manifest_has_one_time_basis_and_truth_is_separate(tmp_
     assert float(truth[0]["vn_m_s"]) > 1.
     assert (folder/"frame_000.png").exists()
     assert (folder/"synthetic_orthophoto.png").exists()
+    assert (folder/"truth_imu.csv").exists()
 
 
 def test_actual_vo_map_fixed_lag_eskf_pipeline_handles_100m_nominal(tmp_path):
@@ -75,6 +76,16 @@ def test_actual_vo_map_fixed_lag_eskf_pipeline_handles_100m_nominal(tmp_path):
         rows=list(csv.DictReader(f))
     assert len(rows)==5
     assert all(x["applied_map_correction"]=="0" for x in rows)
+    # A delayed update returns the latest replayed state, not the state at
+    # exposure. Scoring must compare velocity at this ACTUAL IMU timestamp.
+    corrected = [r for r in rows if r["eskf_status"]=="VISUAL_CORRECTED"]
+    assert corrected
+    assert any(
+        int(r["eskf_state_timestamp_us"])>int(r["timestamp_us"])
+        for r in corrected
+    )
+    assert report["eskf_speed_rmse_m_s"] is not None
+    assert report["eskf_speed_rmse_m_s"] < 0.5
 
 
 def test_real_camera_rotations_are_generated_and_nadir_derotation_is_exercised(tmp_path):
