@@ -23,6 +23,23 @@ jobs:
       - name: Run Python tests
         run: pytest -q
 
+      - name: Run deterministic synthetic map campaign
+        run: |
+          python -m src.synthetic_map_campaign \
+            --output-dir build/synthetic_map_campaign \
+            --seed 14921 \
+            --frames-per-flight 120
+
+      - name: Archive synthetic campaign reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-map-campaign
+          path: |
+            build/synthetic_map_campaign/synthetic_map_campaign.json
+            build/synthetic_map_campaign/synthetic_map_scenarios.csv
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Configure C++ RTOS core
         run: cmake -S firmware/rtos_core -B build/rtos_core -DOFNAV_BUILD_TESTS=ON
 
