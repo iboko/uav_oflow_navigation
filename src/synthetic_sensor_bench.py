@@ -273,6 +273,17 @@ def run_sensor_bench(data_dir: str | Path,
     config=BenchConfig(**metadata["config"])
     config.validate()
     camera,mount,georef=_calibration()
+    # The generated calibration is a recorded contract for this bench.
+    # Never silently ignore a changed calibration while using hardcoded
+    # simulator parameters: it would invalidate all metric comparisons.
+    recorded=json.loads((base/"calibration.json").read_text(encoding="utf-8"))
+    expected={
+        "camera":json.loads(json.dumps(asdict(camera))),
+        "mount":json.loads(json.dumps(asdict(mount))),
+        "map_georeference":json.loads(json.dumps(asdict(georef))),
+    }
+    if any(recorded.get(name)!=value for name,value in expected.items()):
+        raise ValueError("Записанная калибровка противоречит модели синтетического стенда")
     with (base/"camera.csv").open(newline="",encoding="utf-8") as f:
         camera_rows=list(csv.DictReader(f))
     imu=_imu_rows(base/"imu.csv")
@@ -335,6 +346,8 @@ def run_sensor_bench(data_dir: str | Path,
             # Synthetic range timestamp refers to exposure time exactly.
             if int(row["range_timestamp_us"])!=stamp:
                 raise ValueError("Дальность и экспозиция не синхронизированы")
+            if abs(float(row["range_height_m"])-float(row["height_agl_m"])) > .05:
+                raise ValueError("Дальномер и высота геометрической модели не согласованы")
             observation=vo.process(VisualFrame(
                 stamp,image,float(row["range_height_m"]),
                 float(row["yaw_rad"]),float(row["roll_rad"]),
