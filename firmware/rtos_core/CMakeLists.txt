@@ -33,4 +33,8 @@ if(OFNAV_BUILD_TESTS)
     target_link_libraries(test_eskf15 PRIVATE ofnav_rtos_core)
     target_compile_options(test_eskf15 PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME test_eskf15 COMMAND test_eskf15)
+
+    add_executable(eskf15_parity tests/eskf15_parity.cpp)
+    target_link_libraries(eskf15_parity PRIVATE ofnav_rtos_core)
+    target_compile_options(eskf15_parity PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
