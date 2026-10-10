@@ -59,7 +59,7 @@ def export_replay(
     if len(frame_by_t) != len(frames) or len(imu_by_t) != len(imus):
         raise ValueError("Повтор временной метки исходного журнала")
     last = 0
-    last_flow = None
+    camera_stamps = sorted(frame_by_t)
     exported = []
     invalid = 0
     for row in results:
@@ -95,16 +95,18 @@ def export_replay(
         yaw = float(frame["yaw_rad"])
         if not (math.isfinite(height) and height > 0 and math.isfinite(yaw)):
             raise ValueError("Недопустимая модель высоты/курса")
-        dt = ((t - last_flow) * 1e-6) if last_flow is not None else 0.0
+        dt = 0.0
         if valid:
-            if last_flow is None:
-                # The first accepted VO velocity spans the preceding camera
-                # pair, not an arbitrary first timestamp.
-                previous_stamps = [int(f["timestamp_us"]) for f in frames
-                                   if int(f["timestamp_us"]) < t]
-                if not previous_stamps:
-                    raise ValueError("Нет начального кадра для интеграла потока")
-                dt = (t-max(previous_stamps)) * 1e-6
+            # VO velocity belongs to the last observed frame pair in its
+            # independent segment. After a blackout, use the preceding
+            # image timestamp, never the last *accepted velocity* timestamp.
+            previous_stamps = [stamp for stamp in camera_stamps if stamp < t]
+            if not previous_stamps:
+                raise ValueError("Нет начального кадра для интеграла потока")
+            previous_stamp = previous_stamps[-1]
+            if int(frame_by_t[previous_stamp]["available"]) != 1:
+                raise ValueError("Принят VO после недоступного предыдущего кадра")
+            dt = (t - previous_stamp) * 1e-6
             if not 0 < dt <= 0.2 + 1e-8:
                 raise ValueError("Неподдерживаемый интервал интеграции оптического потока")
             vn, ve = float(row["vn_vo_m_s"]), float(row["ve_vo_m_s"])
@@ -114,7 +116,6 @@ def export_replay(
             body_y = -math.sin(yaw)*vn + math.cos(yaw)*ve
             integrated_x = -(body_y / height) * dt
             integrated_y = (body_x / height) * dt
-            last_flow = t
         else:
             integrated_x = integrated_y = 0.0
             dt = 0.0
