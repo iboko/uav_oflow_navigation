@@ -22,6 +22,11 @@
 
 #include "ofnav/ofnav.hpp"
 
+// Flight builds never include the POSIX-only synthetic CSV replay command.
+#if defined(__PX4_POSIX)
+int ofnav_sitl_csv_replay(const char *filename);
+#endif
+
 namespace {
 
 constexpr uint64_t kMainLoopTimeoutMs = 100;
@@ -163,6 +168,11 @@ public:
 
     static int custom_command(int argc, char *argv[])
     {
+#if defined(__PX4_POSIX)
+        if (argc == 2 && std::strcmp(argv[0], "sitl-replay") == 0) {
+            return ofnav_sitl_csv_replay(argv[1]);
+        }
+#endif
         return print_usage("unknown command");
     }
 
@@ -203,6 +213,9 @@ Fusion output is not supported. The -e option is intentionally rejected.
         PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
+#if defined(__PX4_POSIX)
+        PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-replay", "Read a synthetic sensor CSV through C++ diagnostics only; no uORB publish, EKF2 or control");
+#endif
         return 0;
     }
 
