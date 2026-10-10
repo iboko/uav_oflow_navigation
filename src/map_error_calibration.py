@@ -81,6 +81,11 @@ def calibrate_map_error(
     labels = [x.name for x in fit + holdout]
     if len(set(labels)) != len(labels):
         raise ValueError("Полеты настройки и независимой проверки пересекаются")
+    if any(f.false_fixes for f in fit):
+        raise ValueError(
+            "В обучающих данных есть ложные принятые привязки; "
+            "одна гауссова ковариация непригодна без модели выбросов"
+        )
     train = [_errors(f, min_samples=min_samples_per_flight) for f in fit]
     test = [_errors(f, min_samples=min_samples_per_flight) for f in holdout]
     bias = np.mean(np.stack([np.mean(x, axis=0) for x in train]), axis=0)
@@ -91,10 +96,9 @@ def calibrate_map_error(
     cov = _covariance(cov, "оцененная ковариация ошибок карты")
 
     details = {}
-    accepted_total = 0
-    rejected_total = 0
-    covered = []
-    all_nees = []
+    flight_coverages = []
+    flight_means = []
+    flight_false_rates = []
     for flight, errors in zip(holdout, test):
         corrected = errors - bias
         nees = np.einsum("ij,ij->i", corrected,
@@ -102,10 +106,9 @@ def calibrate_map_error(
         if not np.isfinite(nees).all() or np.min(nees) < -1e-10:
             raise ValueError("Недопустимые нормированные ошибки на эталоне")
         within = nees <= 5.991464547107979
-        covered.extend(bool(v) for v in within)
-        all_nees.extend(float(x) for x in nees)
-        accepted_total += len(errors)
-        rejected_total += flight.false_fixes
+        flight_coverages.append(float(np.mean(within)))
+        flight_means.append(float(np.mean(nees)))
+        flight_false_rates.append(flight.false_fixes / len(errors))
         details[flight.name] = {
             "matched_accepted_frames": len(errors),
             "total_frames": flight.total_frames,
@@ -121,9 +124,9 @@ def calibrate_map_error(
         tuple(tuple(float(v) for v in line) for line in cov),
         tuple(x.name for x in fit),
         tuple(x.name for x in holdout),
-        sum(covered) / len(covered),
-        float(np.mean(all_nees)),
-        rejected_total / accepted_total,
+        float(np.mean(flight_coverages)),
+        float(np.mean(flight_means)),
+        float(np.mean(flight_false_rates)),
         details,
         False,
     )
