@@ -121,10 +121,12 @@ public:
 private:
     [[nodiscard]] bool replayPrefix(std::size_t count, const Visual *observations,
                                     std::size_t observations_count,
-                                    Filter &result) const noexcept;
+                                    Filter &result, std::uint64_t watch_time = 0,
+                                    Status *watch_status = nullptr) const noexcept;
     [[nodiscard]] bool replay(const Visual *observations,
                               std::size_t observations_count,
-                              Filter &result) const noexcept;
+                              Filter &result, std::uint64_t watch_time = 0,
+                              Status *watch_status = nullptr) const noexcept;
     void trim() noexcept;
 
     Parameters parameters_{};
