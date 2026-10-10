@@ -183,6 +183,19 @@ bool validParameters(const Parameters &c) noexcept {
           c.nis_gate>0 && c.max_gyro_bias>0 && c.max_accel_bias>0)) {
         return false;
     }
+    const auto &q=c.initial_quaternion_body_to_ned;
+    double qnorm2=0.;
+    for(double x:q) {
+        if (!std::isfinite(x)) {return false;}
+        qnorm2+=x*x;
+    }
+    if (qnorm2<.64 || qnorm2>1.44 ||
+        !finite3(c.initial_gyro_bias_rad_s) ||
+        !finite3(c.initial_accel_bias_m_s2) ||
+        length(c.initial_gyro_bias_rad_s)>c.max_gyro_bias ||
+        length(c.initial_accel_bias_m_s2)>c.max_accel_bias) {
+        return false;
+    }
     for (double x:c.initial_sigma) {
         if (!std::isfinite(x) || x<=0.) {return false;}
     }
@@ -236,7 +249,12 @@ const char *statusName(Status s) noexcept {
     }
     return "UNKNOWN";
 }
-Filter::Filter(const Parameters &c) noexcept : config_(c),valid_config_(validParameters(c)) {
+Filter::Filter(const Parameters &c) noexcept :
+    config_(c),
+    bg_(c.initial_gyro_bias_rad_s),
+    ba_(c.initial_accel_bias_m_s2),
+    q_(unit(c.initial_quaternion_body_to_ned)),
+    valid_config_(validParameters(c)) {
     for(int i=0;i<15;++i) {at(p_cov_,i,i)=c.initial_sigma[i]*c.initial_sigma[i];}
     if (!valid_config_) {status_=Status::NumericalFailure;}
 }
