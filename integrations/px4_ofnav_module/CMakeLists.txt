@@ -9,6 +9,7 @@ px4_add_module(
         ofnav_px4.cpp
         ofnav_sitl_csv_replay.cpp
         ofnav_core/src/ofnav.cpp
+        ofnav_core/src/eskf15.cpp
     INCLUDES
         ofnav_core/include
     DEPENDS
