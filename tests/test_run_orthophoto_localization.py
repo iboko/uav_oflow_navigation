@@ -92,3 +92,33 @@ def test_reject_missing_frame_and_out_of_order_timestamps(tmp_path):
         csv.writer(f).writerows(data)
     with pytest.raises(ValueError,match="возрастать"):
         run_orthophoto_log(log,config,tmp_path/"out")
+
+
+def test_offline_temporal_confirmation_is_explicit_and_never_applied(tmp_path):
+    log, config = fixtures(tmp_path, declared=True)
+    with log.open(newline="", encoding="utf-8") as f:
+        records = list(csv.reader(f))
+    second = records[1].copy()
+    second[0] = "1100000"
+    records.append(second)
+    with log.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(records)
+    with config.open("a", encoding="utf-8") as f:
+        f.write(
+            "temporal_integrity:\n"
+            "  minimum_consistent_intervals: 1\n"
+            "  max_horizontal_speed_m_s: 5\n"
+            "  max_interframe_gap_s: 0.2\n"
+        )
+    summary = run_orthophoto_log(log, config, tmp_path / "out")
+    assert summary["temporal_integrity_counts"] == {
+        "MAP_HISTORY_INITIALIZED": 1,
+        "MAP_TEMPORALLY_CONSISTENT_UNVALIDATED": 1,
+    }
+    assert summary["correction_gate_counts"] == {
+        "MAP_TEMPORAL_NOT_CONFIRMED": 1,
+        "CANDIDATE_ONLY_NOT_APPLIED": 1,
+    }
+    with (tmp_path / "out" / "orthophoto_candidates.csv").open(newline="") as f:
+        outputs = list(csv.DictReader(f))
+    assert all(x["applied_to_estimator"] == "0" for x in outputs)
