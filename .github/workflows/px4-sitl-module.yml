@@ -6,6 +6,9 @@ on:
       - 'firmware/rtos_core/**'
       - 'integrations/px4_ofnav_module/**'
       - 'tools/install_px4_ofnav_module.sh'
+      - 'tools/run_px4_sitl_replay_smoke.sh'
+      - 'src/export_px4_sitl_replay.py'
+      - 'src/synthetic_sensor_bench.py'
       - '.github/workflows/px4-sitl-module.yml'
   workflow_dispatch:
 
@@ -44,3 +47,41 @@ jobs:
         run: |
           test -d PX4-Autopilot/build/px4_sitl_default
           echo 'PX4 SITL compilation completed.'
+
+      - name: Install Python dependencies for deterministic image+IMU fixture
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e '.[vision]'
+
+      - name: Generate 100m synthetic camera, IMU and read-only PX4 replay
+        run: |
+          python3 -m src.synthetic_sensor_bench \
+            --output-dir build/px4_sitl_replay_input \
+            --scenario nominal \
+            --frames 6 \
+            --seed 72118
+          python3 -m src.export_px4_sitl_replay \
+            --results-csv build/px4_sitl_replay_input/evaluation/sensor_bench_results.csv \
+            --camera-csv build/px4_sitl_replay_input/sensors/camera.csv \
+            --imu-csv build/px4_sitl_replay_input/sensors/imu.csv \
+            --output-csv build/px4_sitl_replay_input/ofnav_sitl_replay.csv
+
+      - name: Runtime PX4 SITL POSIX read-only replay and 100m height safety
+        run: |
+          bash tools/run_px4_sitl_replay_smoke.sh \
+            PX4-Autopilot \
+            build/px4_sitl_replay_input/ofnav_sitl_replay.csv \
+            build/px4_sitl_runtime_results
+
+      - name: Archive PX4 SITL diagnostic replay proof
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: px4-sitl-read-only-synthetic-replay
+          path: |
+            build/px4_sitl_replay_input/ofnav_sitl_replay.csv
+            build/px4_sitl_replay_input/evaluation/sensor_bench_summary.json
+            build/px4_sitl_runtime_results/px4_sitl_boot.log
+            build/px4_sitl_runtime_results/ofnav_sitl_replay.log
+          if-no-files-found: warn
+          retention-days: 30

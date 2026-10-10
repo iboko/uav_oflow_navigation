@@ -7,6 +7,7 @@ px4_add_module(
     STACK_MAIN 4096
     SRCS
         ofnav_px4.cpp
+        ofnav_sitl_csv_replay.cpp
         ofnav_core/src/ofnav.cpp
     INCLUDES
         ofnav_core/include
