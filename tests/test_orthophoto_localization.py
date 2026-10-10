@@ -215,3 +215,40 @@ def test_covariance_gate_checks_consistency_without_applying_position_update():
         measurement_errors_independent_from_prior=True,
     )
     assert singular.status=="INVALID_COVARIANCE"
+
+
+def test_two_far_apart_identical_regions_inside_one_tile_are_ambiguous():
+    """Two identical scene copies in ONE orthophoto must not produce a fix."""
+    rng = np.random.default_rng(9004)
+    patch = np.zeros((480, 600), np.uint8)
+    for _ in range(1100):
+        x = int(rng.integers(12, 588))
+        y = int(rng.integers(12, 468))
+        cv2.circle(patch, (x, y), 2, int(rng.integers(140, 255)), -1)
+    mosaic = np.zeros((1100, 1900), np.uint8)
+    mosaic[270:750, 100:700] = patch
+    mosaic[270:750, 1130:1730] = patch
+    # Use an exact camera crop; the source is physically ambiguous.
+    candidate = OrthophotoLocalizer([
+        OrthophotoTile("repeated_inside_tile", mosaic, reference())
+    ], camera(), mount())
+    result = candidate.localize(
+        patch, height_agl_m=100., roll_rad=0.,
+        pitch_rad=0., yaw_rad=0.
+    )
+    assert result.status == "AMBIGUOUS_MAP_MATCH", result
+    assert not result.accepted
+
+
+def test_identical_overlapping_map_tiles_with_same_georeference_are_not_distinct():
+    texture = map_texture()
+    tiles = [
+        OrthophotoTile("same_a", texture, reference()),
+        OrthophotoTile("same_b", texture.copy(), reference()),
+    ]
+    result = OrthophotoLocalizer(tiles, camera(), mount()).localize(
+        frame(texture), height_agl_m=100.,
+        roll_rad=0., pitch_rad=0., yaw_rad=0.,
+    )
+    assert result.accepted, result
+    assert result.north_m == pytest.approx(50., abs=.4)
