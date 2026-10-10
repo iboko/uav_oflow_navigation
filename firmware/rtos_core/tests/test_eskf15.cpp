@@ -63,6 +63,35 @@ void test_constant_acceleration_and_yaw_rotation() {
     assert(near(angle,.5,1.e-7));
     assert(finiteCov(yaw.covariance()));
 }
+void test_nonzero_calibrated_initial_attitude_and_imu_biases() {
+    ofnav15::Parameters config{};
+    const double roll=.2;
+    config.initial_quaternion_body_to_ned={
+        std::cos(.5*roll),std::sin(.5*roll),0.,0.
+    };
+    config.initial_gyro_bias_rad_s={0.,0.,.02};
+    config.initial_accel_bias_m_s2={.1,0.,0.};
+    Filter f(config);
+    for(int i=0;i<=100;++i) {
+        const double g=9.80665;
+        const Imu m{
+            1000000U+static_cast<std::uint64_t>(i*10000),
+            {0.,0.,.02},
+            {.1,-g*std::sin(roll),-g*std::cos(roll)}
+        };
+        assert(f.predict(m)==Status::InertialOnly);
+    }
+    for(double x:f.position()) {assert(std::abs(x)<1.e-7);}
+    for(double x:f.velocity()) {assert(std::abs(x)<1.e-7);}
+    assert(near(f.quaternion()[1],std::sin(.5*roll),1.e-10));
+    assert(finiteCov(f.covariance()));
+    ofnav15::Parameters invalid=config;
+    invalid.initial_quaternion_body_to_ned={0.,0.,0.,0.};
+    Filter rejected(invalid);
+    assert(!rejected.healthy());
+    assert(rejected.predict(sample(1000000U))==Status::NumericalFailure);
+}
+
 void test_visual_joseph_and_rejection_are_safe() {
     Filter f{};
     assert(f.predict(sample(1000000U))==Status::InertialOnly);
@@ -180,6 +209,7 @@ void test_capacity_fails_explicitly_without_heap_growth() {
 int main() {
     test_static_frd_ned_gravity_and_spd_15();
     test_constant_acceleration_and_yaw_rotation();
+    test_nonzero_calibrated_initial_attitude_and_imu_biases();
     test_visual_joseph_and_rejection_are_safe();
     test_invalid_covariances_and_imu_gap_fail_closed();
     test_delayed_measurements_replay_transactionally_same_as_time_sorted();
