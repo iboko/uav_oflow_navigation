@@ -101,3 +101,27 @@ def test_csv_runner_exports_unvalidated_model_without_using_holdout_for_fit(tmp_
     stored=json.loads((tmp_path/"out"/"map_error_calibration.json").read_text())
     assert stored["holdout_flights"]==["F3","F4"]
     assert np.linalg.eigvalsh(stored["covariance_ne_m2"]).min()>0
+
+
+def test_training_false_match_invalidates_single_gaussian_model():
+    bad = flight("T0", error=True)
+    training = [bad, flight("T1"), flight("T2")]
+    with pytest.raises(ValueError, match="ложные принятые"):
+        calibrate_map_error(training, [flight("H0"), flight("H1")])
+
+
+def test_holdout_flights_weighted_equally_independent_of_camera_frame_rate():
+    training = [flight("T0"), flight("T1"), flight("T2")]
+    normal = flight("H0", count=50)
+    different = flight("H1", count=100, bias=(1.0, 1.0))
+    result = calibrate_map_error(training, [normal, different])
+    expected = (
+        result.holdout_flight_details["H0"]["mean_nees_2d"] +
+        result.holdout_flight_details["H1"]["mean_nees_2d"]
+    ) / 2.0
+    assert result.holdout_mean_nees_2d == pytest.approx(expected)
+    expected_cover = (
+        result.holdout_flight_details["H0"]["fraction_within_chi2_2_95"] +
+        result.holdout_flight_details["H1"]["fraction_within_chi2_2_95"]
+    ) / 2.0
+    assert result.holdout_nees_coverage_95pct == pytest.approx(expected_cover)
