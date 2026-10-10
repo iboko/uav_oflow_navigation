@@ -23,6 +23,32 @@ jobs:
       - name: Run Python tests
         run: pytest -q
 
+      - name: Run synthetic camera IMU map and delayed ESKF integration
+        run: |
+          python -m src.synthetic_sensor_bench \
+            --output-dir build/synthetic_sensor_bench \
+            --scenario nominal \
+            --frames 6 \
+            --seed 72118
+
+      - name: Archive synthetic camera and IMU integration results
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-camera-imu-integration
+          path: |
+            build/synthetic_sensor_bench/sensors/bench_metadata.json
+            build/synthetic_sensor_bench/sensors/calibration.json
+            build/synthetic_sensor_bench/sensors/camera.csv
+            build/synthetic_sensor_bench/sensors/imu.csv
+            build/synthetic_sensor_bench/sensors/truth.csv
+            build/synthetic_sensor_bench/sensors/truth_imu.csv
+            build/synthetic_sensor_bench/sensors/frame_002.png
+            build/synthetic_sensor_bench/sensors/synthetic_orthophoto.png
+            build/synthetic_sensor_bench/evaluation/sensor_bench_results.csv
+            build/synthetic_sensor_bench/evaluation/sensor_bench_summary.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Configure C++ RTOS core
         run: cmake -S firmware/rtos_core -B build/rtos_core -DOFNAV_BUILD_TESTS=ON
 
