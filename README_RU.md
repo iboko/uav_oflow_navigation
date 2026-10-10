@@ -274,6 +274,39 @@ python -m src.synthetic_sensor_bench \
 в ESKF/PX4 не вносится, управление отсутствует, архивов
 НИИВК для его работы не требуется.
 
+## PX4 SITL: безопасный диагностический replay синтетических датчиков
+
+В POSIX/SITL-сборке модуля `ofnav` появилась отдельная
+команда `sitl-replay`. Она читает синтетические
+записи горизонтальной визуальной скорости и ИИМ,
+согласованные по времени экспозиции и приведенные
+к формату интегрального оптического потока C++-ядра.
+
+**Данные не публикуются в uORB и не передаются
+в EKF2 или исполнительные органы БВС.**
+Для высоты 100 м C++-ядро по-прежнему должно
+возвращать отказ `HEIGHT_TOO_HIGH`, поскольку
+его прежний подтвержденный программный диапазон
+составляет только 0,2–4 м. Это не готовая
+навигация на 100 м.
+
+```bash
+python -m src.export_px4_sitl_replay \
+  --results-csv outputs/synthetic_sensor_bench/evaluation/sensor_bench_results.csv \
+  --camera-csv outputs/synthetic_sensor_bench/sensors/camera.csv \
+  --imu-csv outputs/synthetic_sensor_bench/sensors/imu.csv \
+  --output-csv outputs/ofnav_sitl_replay.csv
+
+bash tools/run_px4_sitl_replay_smoke.sh \
+  PX4-Autopilot outputs/ofnav_sitl_replay.csv outputs/px4_sitl_logs
+```
+
+Сборка PX4 v1.16.2 и проверка внутри исполняемого
+PX4 проходят в GitHub Actions. Диагностический журнал
+публикуется как `px4-sitl-read-only-synthetic-replay`.
+Описание протокола и ограничений:
+`docs/PX4_SITL_READONLY_REPLAY_RU.md`.
+
 ## Быстрый запуск PX4 uORB/NuttX-модуля
 
 Сначала иметь рядом репозиторий PX4-Autopilot. Затем из корня этого проекта:
