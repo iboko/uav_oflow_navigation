@@ -73,11 +73,13 @@ void test_visual_joseph_and_rejection_are_safe() {
     assert(f.covariance()[15*3+3]<before);
     assert(finiteCov(f.covariance()));
     assert(f.updateVelocity(visual(1010000U,.1))==Status::RepeatedVisual);
-    const double v=f.velocity()[0];
     assert(f.predict(sample(1020000U))==Status::InertialOnly);
+    const double predicted_velocity=f.velocity()[0];
+    const auto predicted_covariance=f.covariance();
     assert(f.updateVelocity(visual(1020000U,500.))==Status::VisualOutlier);
     assert(f.rejected()==1U);
-    assert(near(f.velocity()[0],v,1.e-8));
+    assert(near(f.velocity()[0],predicted_velocity,1.e-10));
+    assert(f.covariance()==predicted_covariance);
     assert(finiteCov(f.covariance()));
 }
 void test_invalid_covariances_and_imu_gap_fail_closed() {
