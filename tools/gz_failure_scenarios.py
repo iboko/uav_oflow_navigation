@@ -217,6 +217,22 @@ def ofnav_status(px4: Px4) -> dict:
     return out
 
 
+def new_report(world: str) -> dict:
+    """Provenance and explicit non-claims for safety-only SITL tests."""
+    return {
+        "type": "PX4_SITL_GAZEBO_X500_FLOW_FAILURE_SCENARIOS",
+        "world": world,
+        "scenarios": {},
+        "validation_scope": "PX4_SITL_SAFETY_MODE_TRANSITIONS_ONLY",
+        "gnss_denied_navigation_verified": False,
+        "ekf2_ofnav_fusion_verified": False,
+        "ofnav_position_hold_verified": False,
+        "real_aircraft_tested": False,
+        "caveat": ("POSCTL is provided by PX4; scenario success proves the safety "
+                   "mode-transition chain, not GNSS-denied ofnav position estimation."),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("px4_dir", type=Path)
@@ -228,18 +244,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     if args.world == TEXTURED_WORLD:
         install_textured_world(args.px4_dir.resolve())
-    report: dict = {
-        "type": "PX4_SITL_GAZEBO_X500_FLOW_FAILURE_SCENARIOS",
-        "world": args.world,
-        "scenarios": {},
-        "validation_scope": "PX4_SITL_SAFETY_MODE_TRANSITIONS_ONLY",
-        "gnss_denied_navigation_verified": False,
-        "ekf2_ofnav_fusion_verified": False,
-        "ofnav_position_hold_verified": False,
-        "real_aircraft_tested": False,
-        "caveat": ("POSCTL is provided by PX4; scenario success proves the safety "
-                   "mode-transition chain, not GNSS-denied ofnav position estimation."),
-    }
+    report: dict = new_report(args.world)
     px4 = Px4(args.px4_dir.resolve(), args.out / "px4_gz.log", args.world)
     link = Link()
     global SIM_CLOCK
