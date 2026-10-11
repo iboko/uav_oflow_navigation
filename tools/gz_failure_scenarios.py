@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -83,8 +84,11 @@ class Px4:
         env = dict(os.environ, HEADLESS="1", PX4_SIM_MODEL="gz_x500_flow", GZ_IP="127.0.0.1",
                    PX4_GZ_WORLD=world)
         self.log = log.open("w")
+        # Isolate the SITL/Gazebo process tree. Never terminate unrelated
+        # Gazebo simulations running on the same development machine.
         self.proc = subprocess.Popen([str(self.build / "bin" / "px4"), "-d"], cwd=self.rootfs,
-                                     env=env, stdout=self.log, stderr=subprocess.STDOUT)
+                                     env=env, stdout=self.log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
 
     def cmd(self, *args: str, timeout: float = 120.) -> str:
         r = subprocess.run([str(self.build / "bin" / f"px4-{args[0]}"), *args[1:]],
@@ -96,13 +100,22 @@ class Px4:
             self.cmd("shutdown", timeout=10)
         except Exception:
             pass
-        self.proc.terminate()
+        # Own session = own process group, including Gazebo children which
+        # may outlive the PX4 parent. A global 'pkill gz sim' is unsafe.
         try:
-            self.proc.wait(10)
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-        subprocess.run(["pkill", "-f", "[g]z sim"], check=False)
-        self.log.close()
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.proc.wait(timeout=10)
+        finally:
+            self.log.close()
 
 
 class Link:
