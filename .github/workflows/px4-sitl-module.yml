@@ -83,5 +83,6 @@ jobs:
             build/px4_sitl_replay_input/evaluation/sensor_bench_summary.json
             build/px4_sitl_runtime_results/px4_sitl_boot.log
             build/px4_sitl_runtime_results/ofnav_sitl_replay.log
+            build/px4_sitl_runtime_results/ofnav_sitl_replay_camera.log
           if-no-files-found: warn
           retention-days: 30

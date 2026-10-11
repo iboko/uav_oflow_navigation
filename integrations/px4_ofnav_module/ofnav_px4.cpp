@@ -24,7 +24,7 @@
 
 // Flight builds never include the POSIX-only synthetic CSV replay command.
 #if defined(__PX4_POSIX)
-int ofnav_sitl_csv_replay(const char *filename);
+int ofnav_sitl_csv_replay(const char *filename, ofnav::SensorProfile profile);
 #endif
 
 namespace {
@@ -73,6 +73,21 @@ static void quat_to_euler(const float q[4], float &roll, float &pitch, float &ya
     yaw = std::atan2(siny_cosp, cosy_cosp);
 }
 
+static bool parse_profile(const char *text, ofnav::SensorProfile &profile) noexcept
+{
+    if (text == nullptr || std::strcmp(text, "flow") == 0) {
+        profile = ofnav::SensorProfile::OpticalFlowSensor;
+        return true;
+    }
+
+    if (std::strcmp(text, "camera") == 0) {
+        profile = ofnav::SensorProfile::DownwardCameraVo;
+        return true;
+    }
+
+    return false;
+}
+
 static void set_debug_name(debug_vect_s &dbg, const char *name) noexcept
 {
     std::memset(dbg.name, 0, sizeof(dbg.name));
@@ -84,11 +99,13 @@ static void set_debug_name(debug_vect_s &dbg, const char *name) noexcept
 class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
-    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range) :
+    Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range,
+          ofnav::SensorProfile profile) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
-        _runtime(make_config(min_quality))
+        _profile(profile),
+        _runtime(ofnav::makeProfileConfig(profile, min_quality))
     {
     }
 
@@ -123,12 +140,13 @@ public:
         unsigned min_quality = 120U;
         bool strict_downward_range = true;
         bool publish_ev_velocity = false;
+        ofnav::SensorProfile profile = ofnav::SensorProfile::OpticalFlowSensor;
 
         int ch = 0;
         int myoptind = 1;
         const char *myoptarg = nullptr;
 
-        while ((ch = px4_getopt(argc, argv, "r:q:ne", &myoptind, &myoptarg)) != EOF) {
+        while ((ch = px4_getopt(argc, argv, "r:q:p:ne", &myoptind, &myoptarg)) != EOF) {
             switch (ch) {
             case 'r': {
                     const int value = std::atoi(myoptarg);
@@ -141,6 +159,14 @@ public:
                     min_quality = static_cast<unsigned>(value < 0 ? 0 : (value > 255 ? 255 : value));
                     break;
                 }
+
+            case 'p':
+                if (!parse_profile(myoptarg, profile)) {
+                    PX4_ERR("unknown profile, use flow or camera");
+                    return nullptr;
+                }
+
+                break;
 
             case 'n':
                 strict_downward_range = false;
@@ -163,14 +189,20 @@ public:
             PX4_ERR("external velocity fusion unavailable: no validated vertical velocity");
             return nullptr;
         }
-        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range);
+        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, profile);
     }
 
     static int custom_command(int argc, char *argv[])
     {
 #if defined(__PX4_POSIX)
-        if (argc == 2 && std::strcmp(argv[0], "sitl-replay") == 0) {
-            return ofnav_sitl_csv_replay(argv[1]);
+        if ((argc == 2 || argc == 3) && std::strcmp(argv[0], "sitl-replay") == 0) {
+            ofnav::SensorProfile profile = ofnav::SensorProfile::OpticalFlowSensor;
+
+            if (!parse_profile(argc == 3 ? argv[2] : nullptr, profile)) {
+                return print_usage("unknown profile, use flow or camera");
+            }
+
+            return ofnav_sitl_csv_replay(argv[1], profile);
         }
 #endif
         return print_usage("unknown command");
@@ -209,19 +241,21 @@ Fusion output is not supported. The -e option is intentionally rejected.
         PRINT_MODULE_USAGE_COMMAND("start");
         PRINT_MODULE_USAGE_PARAM_INT('r', static_cast<int>(kDefaultRateHz), static_cast<int>(kMinRateHz), static_cast<int>(kMaxRateHz), "Module loop rate, Hz", true);
         PRINT_MODULE_USAGE_PARAM_INT('q', 120, 0, 255, "Minimum optical-flow quality", true);
+        PRINT_MODULE_USAGE_PARAM_STRING('p', "flow", "flow|camera", "Measurement envelope: optical-flow sensor 0.2-4 m or downward camera VO 5-120 m", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
 #if defined(__PX4_POSIX)
-        PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-replay", "Read a synthetic sensor CSV through C++ diagnostics only; no uORB publish, EKF2 or control");
+        PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-replay", "<csv> [flow|camera]: read a synthetic sensor CSV through C++ diagnostics only; no uORB publish, EKF2 or control");
 #endif
         return 0;
     }
 
     int print_status() override
     {
-        PX4_INFO("rate=%u Hz min_quality=%u downward_range=%s",
+        PX4_INFO("profile=%s rate=%u Hz min_quality=%u downward_range=%s",
+                 ofnav::toString(_profile),
                  _rate_hz,
                  static_cast<unsigned>(_min_quality),
                  _strict_downward_range ? "true" : "false");
@@ -325,21 +359,6 @@ Fusion output is not supported. The -e option is intentionally rejected.
     }
 
 private:
-    static ofnav::Config make_config(uint8_t min_quality) noexcept
-    {
-        ofnav::Config cfg{};
-        cfg.min_height_m = 0.20f;
-        cfg.max_height_m = 4.00f;
-        cfg.max_tilt_rad = 0.45f;
-        cfg.max_abs_flow_rate_rad_s = 7.4f;
-        cfg.max_horizontal_speed_m_s = 1.5f;
-        cfg.min_quality = min_quality;
-        cfg.flow_scale_x = 1.0f;
-        cfg.flow_scale_y = 1.0f;
-        cfg.sensor_offset_body_m = {0.0f, 0.0f, 0.0f};
-        return cfg;
-    }
-
     ofnav::OpticalFlowRadSample make_flow(const sensor_optical_flow_s &msg) const noexcept
     {
         ofnav::OpticalFlowRadSample flow{};
@@ -446,6 +465,7 @@ private:
     unsigned _rate_hz{kDefaultRateHz};
     uint8_t _min_quality{120U};
     bool _strict_downward_range{true};
+    ofnav::SensorProfile _profile{ofnav::SensorProfile::OpticalFlowSensor};
 
     int _flow_sub{-1};
     int _range_sub{-1};

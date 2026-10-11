@@ -308,6 +308,75 @@ void test_combined_roll_pitch_exceeds_inclination_limit() {
     assert(result.reason == ofnav::RejectReason::ExcessiveTilt);
 }
 
+ofnav::OpticalFlowRadSample cameraFlow(float height, float vx_body, float dt) {
+    return ofnav::OpticalFlowRadSample{1000000U, dt, 0.0F, (vx_body / height) * dt,
+                                       0.0F, 0.0F, 0.0F, 200U, true};
+}
+
+void test_flow_sensor_profile_still_rejects_100m() {
+    const auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::OpticalFlowSensor);
+    assert(near(cfg.max_height_m, 4.0F));
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::RangeSample range{1000000U, 100.0F, true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto result = estimator.update(cameraFlow(100.0F, 1.0F, 0.2F), range, imu, att);
+    assert(!result.accepted);
+    assert(result.reason == ofnav::RejectReason::HeightTooHigh);
+}
+
+void test_camera_profile_accepts_100m_with_height_scaled_sigma() {
+    const auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::DownwardCameraVo);
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::RangeSample range{1000000U, 100.0F, true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto result = estimator.update(cameraFlow(100.0F, 1.2F, 0.2F), range, imu, att);
+    assert(result.accepted);
+    assert(near(result.velocity_nav_m_s.x, 1.2F, 1.0e-3F));
+    // sqrt(0.05^2 + (100*0.0015)^2 + (1.2*0.01)^2)
+    const float expected = std::sqrt(0.0025F + 0.0225F + 0.000144F);
+    assert(near(result.velocity_sigma_m_s, expected, 1.0e-4F));
+    const auto low = estimator.update(cameraFlow(20.0F, 1.2F, 0.2F),
+        ofnav::RangeSample{1000000U, 20.0F, true}, imu, att);
+    assert(low.accepted && low.velocity_sigma_m_s < result.velocity_sigma_m_s);
+}
+
+void test_camera_profile_rejects_coarse_measurement_by_uncertainty() {
+    auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::DownwardCameraVo);
+    cfg.max_velocity_sigma_m_s = 0.12F;  // 100 m * 1.5 mrad/s = 0.15 m/s
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto result = estimator.update(cameraFlow(100.0F, 1.0F, 0.2F),
+        ofnav::RangeSample{1000000U, 100.0F, true}, imu, att);
+    assert(!result.accepted);
+    assert(result.reason == ofnav::RejectReason::VelocityUncertainty);
+    const auto below = estimator.update(cameraFlow(3.0F, 1.0F, 0.2F),
+        ofnav::RangeSample{1000000U, 3.0F, true}, imu, att);
+    assert(below.reason == ofnav::RejectReason::HeightTooLow);
+}
+
+void test_camera_profile_ekf_uses_estimator_sigma() {
+    const auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::DownwardCameraVo);
+    ofnav::OfNavRuntime runtime(cfg);
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    for (uint64_t t = 1000000U; t <= 1200000U; t += 10000U) {
+        const ofnav::ImuSample imu{t, {}, {0.0F, 0.0F, -9.80665F}, true};
+        runtime.predictImu(imu, ofnav::AttitudeSample{t, 0.0F, 0.0F, 0.0F});
+    }
+    const uint64_t t = 1200000U;
+    const ofnav::ImuSample imu{t, {}, {0.0F, 0.0F, -9.80665F}, true};
+    ofnav::OpticalFlowRadSample flow = cameraFlow(100.0F, 0.3F, 0.2F);
+    flow.time_us = t;
+    const auto out = runtime.step(imu, ofnav::RangeSample{t, 100.0F, true}, flow,
+                                  ofnav::AttitudeSample{t, 0.0F, 0.0F, 0.0F}, t);
+    (void)att;
+    assert(out.flow.accepted);
+    assert(out.mode == ofnav::NavMode::FlowNav);
+    assert(out.state.vn_m_s > 0.0F && out.state.vn_m_s < 0.3F);
+}
+
 } // namespace
 
 int main() {
@@ -330,6 +399,10 @@ int main() {
     test_nonfinite_imu_does_not_enter_flow_mode();
     test_missing_imu_history_requires_explicit_reset();
     test_combined_roll_pitch_exceeds_inclination_limit();
+    test_flow_sensor_profile_still_rejects_100m();
+    test_camera_profile_accepts_100m_with_height_scaled_sigma();
+    test_camera_profile_rejects_coarse_measurement_by_uncertainty();
+    test_camera_profile_ekf_uses_estimator_sigma();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }

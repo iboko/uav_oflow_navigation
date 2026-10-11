@@ -76,7 +76,18 @@ enum class RejectReason : uint8_t {
     InnovationGate,
     StaleRange,
     StaleFlow,
-    ImuInvalid
+    ImuInvalid,
+    // Physics-based velocity uncertainty h * sigma_flow exceeds the
+    // configured limit: the measurement is too coarse at this height.
+    VelocityUncertainty
+};
+
+// Explicit measurement-source envelope. The legacy optical-flow sensor
+// envelope (0.2-4 m) stays the default; a downward camera VO source has its
+// own height range and an uncertainty model scaled by height.
+enum class SensorProfile : uint8_t {
+    OpticalFlowSensor = 0,
+    DownwardCameraVo = 1
 };
 
 enum class NavMode : uint8_t {
@@ -107,6 +118,8 @@ struct FlowVelocityEstimate {
     Vector2f velocity_nav_m_s{};
     float flow_x_rate_rad_s{0.0F};
     float flow_y_rate_rad_s{0.0F};
+    // One-sigma horizontal velocity uncertainty used for the EKF update.
+    float velocity_sigma_m_s{kNaN};
 };
 
 struct EkfState {
@@ -150,7 +163,22 @@ struct Config {
     float flow_vel_sigma_quality_gain_m_s{0.18F};
     float flow_vel_sigma_height_gain_m_s{0.025F};
     float innovation_gate_2d{9.21F};
+
+    float max_integration_time_s{0.20F};
+    // If > 0: sigma_v^2 = sigma_min^2 + (h*sigma_flow)^2 + (|v|*sigma_h_rel)^2,
+    // inflated by low quality, and rejected above max_velocity_sigma_m_s.
+    // If == 0: legacy empirical optical-flow sensor model (clamped 0.35 m/s).
+    float flow_rate_sigma_rad_s{0.0F};
+    float height_rel_sigma{0.0F};
+    float max_velocity_sigma_m_s{0.35F};
 };
+
+// Validated configuration for a measurement-source envelope.
+[[nodiscard]] Config makeProfileConfig(SensorProfile profile, uint8_t min_quality = 120U) noexcept;
+[[nodiscard]] const char* toString(SensorProfile profile) noexcept;
+// One-sigma velocity uncertainty for given height, speed and quality.
+[[nodiscard]] float flowVelocitySigma(const Config& cfg, float height_m,
+                                      float speed_m_s, uint8_t quality) noexcept;
 
 [[nodiscard]] bool isFinite(float v) noexcept;
 [[nodiscard]] Vector3f cross(Vector3f a, Vector3f b) noexcept;
