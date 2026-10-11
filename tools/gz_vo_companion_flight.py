@@ -194,7 +194,8 @@ def main() -> None:
         companion = subprocess.Popen(
             [args.companion_python, str(Path(__file__).with_name("gz_vo_companion.py")), "--world", args.world,
              "--camera-topic", CAMERA_TOPIC, "--log", str(args.out / "companion_vo.csv"),
-             "--estimator", args.estimator],
+             "--estimator", args.estimator]
+            + (["--msckf-record", str(args.out / "msckf_inputs.jsonl")] if args.estimator == "msckf" else []),
             stdout=companion_log, stderr=subprocess.STDOUT)
         # On the ground the camera is ~0.2 m above the texture and VO has no
         # track: the takeoff is GNSS-aided, VO fusion is checked in the air.

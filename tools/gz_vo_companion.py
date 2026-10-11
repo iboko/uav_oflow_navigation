@@ -79,7 +79,7 @@ MSCKF_IMU_NOISE = ImuNoiseDensity(gyro_rad_s_sqrt_hz=0.004, accel_m_s2_sqrt_hz=0
 
 
 def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: KltTracker, t_frame: int,
-                      gray: np.ndarray, last_t: int) -> BodyVelocityMeasurement | None:
+                      gray: np.ndarray, last_t: int, record=None) -> BodyVelocityMeasurement | None:
     """MSCKF output in the same form as the VO measurement (body-FRD velocity,
     N/E velocity in the autopilot heading frame for the map anchor)."""
     state = pipeline.state_at_camera_time(t_frame)
@@ -89,8 +89,11 @@ def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: Klt
         msckf.count("NO_ATTITUDE_OR_RANGE")
         return None
     roll, pitch, yaw, height = state
-    out = msckf.process(t_frame, feats, attitude_q=q, roll=roll, pitch=pitch,
-                        range_m=height / (math.cos(roll) * math.cos(pitch)))
+    range_m = height / (math.cos(roll) * math.cos(pitch))
+    if record:
+        record.write(json.dumps({"frame": t_frame, "q": list(q), "roll": roll, "pitch": pitch, "yaw": yaw,
+                                 "range": range_m, "features": {str(k): v for k, v in feats.items()}}) + "\n")
+    out = msckf.process(t_frame, feats, attitude_q=q, roll=roll, pitch=pitch, range_m=range_m)
     if out is None:
         return None
     r_nb = body_to_ned(roll, pitch, yaw)          # autopilot attitude, not the MSCKF heading
@@ -140,6 +143,8 @@ def main() -> None:
     ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo",
                     help="msckf: tightly coupled VIO on the autopilot IMU (HIGHRES_IMU), initialised "
                          "without GNSS from the rangefinder")
+    ap.add_argument("--msckf-record", type=Path,
+                    help="JSON lines: IMU samples and per-frame MSCKF inputs (offline replay)")
     ap.add_argument("--log", type=Path)
     ap.add_argument("--status-s", type=float, default=5.0)
     args = ap.parse_args()
@@ -168,6 +173,7 @@ def main() -> None:
     pipeline: CompanionVo | None = None
     pending: list[tuple[int, np.ndarray]] = []
     log = args.log.open("w") if args.log else None
+    record = args.msckf_record.open("w", buffering=1) if args.msckf_record else None
     if log:
         log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
@@ -203,10 +209,17 @@ def main() -> None:
             elif t == "ATTITUDE_QUATERNION":
                 pipeline.attitude.add(msg.time_boot_ms * 1000, (msg.q1, msg.q2, msg.q3, msg.q4))
             elif t == "HIGHRES_IMU" and msckf is not None and pipeline.clock.valid:
-                msckf.add_imu(ImuReading(int(msg.time_usec) - pipeline.clock.offset_us,
-                                         (msg.xgyro, msg.ygyro, msg.zgyro), (msg.xacc, msg.yacc, msg.zacc)))
+                reading = ImuReading(int(msg.time_usec) - pipeline.clock.offset_us,
+                                     (msg.xgyro, msg.ygyro, msg.zgyro), (msg.xacc, msg.yacc, msg.zacc))
+                msckf.add_imu(reading)
+                if record:
+                    record.write(json.dumps({"imu": reading.timestamp_us, "g": list(reading.gyro_body_rad_s),
+                                             "a": list(reading.specific_force_body_m_s2)}) + "\n")
             elif t == "LOCAL_POSITION_NED":
                 local_ne = np.array([msg.x, msg.y])
+                if record and pipeline.clock.valid:
+                    record.write(json.dumps({"lpos": msg.time_boot_ms * 1000 - pipeline.clock.offset_us,
+                                             "v": [msg.vx, msg.vy, msg.vz]}) + "\n")
             elif t == "DISTANCE_SENSOR" and msg.orientation == 25 and msg.current_distance > 0:
                 pipeline.distance.add(msg.time_boot_ms * 1000, msg.current_distance * 0.01)
         if pipeline is None and link.target_system and now > 0:
@@ -286,7 +299,7 @@ def main() -> None:
                 args.save_frames.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(args.save_frames / f"{t_frame}.png"), gray)
             if msckf is not None:
-                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t)
+                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t, record)
                 if out is not None:
                     last_msckf_t = t_frame
             else:
@@ -393,7 +406,8 @@ def main() -> None:
                       "time_offset_us": pipeline.clock.offset_us if pipeline.clock.valid else None,
                       "counts": pipeline.counts}
             if msckf is not None:
-                status["msckf"] = {"counts": msckf.counts, "last_init": msckf.last_init}
+                status["msckf"] = {"counts": msckf.counts, "last_init": msckf.last_init,
+                                   "last_error": msckf.last_error}
             if localizer is not None:
                 status["map_localizer"] = map_counts
             if anchor is not None:

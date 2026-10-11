@@ -12,7 +12,10 @@
    ковариация. Курс MSCKF ненаблюдаем, скорость в осях корпуса от него
    не зависит;
 4. расхождение (СКО скорости > ``max_sigma_v``, скорость > ``max_speed``
-   или численный отказ) — сброс и новая выставка, без вывода.
+   или численный отказ) — сброс и новая выставка, без вывода;
+5. разрыв ИИМ до 0,1 с (потерянные пакеты MAVLink) заполняется линейной
+   интерполяцией и считается (``IMU_GAP_BRIDGED``), длиннее — сброс
+   (``RESET_IMU_GAP``).
 """
 from __future__ import annotations
 
@@ -38,7 +41,8 @@ class MsckfVelocity:
 class CompanionMsckf:
     def __init__(self, camera: PinholeCamera, noise: ImuNoiseDensity, *, max_clones: int = 10,
                  min_window_s: float = 1.5, max_window_s: float = 5.0, min_height_m: float = 3.0,
-                 max_sigma_v: float = 1.0, max_speed_m_s: float = 25.0) -> None:
+                 max_sigma_v: float = 1.0, max_speed_m_s: float = 25.0, max_imu_step_s: float = 0.02,
+                 max_imu_gap_s: float = 0.1) -> None:
         self.camera = camera
         self.noise = noise
         self.max_clones = max_clones
@@ -47,6 +51,8 @@ class CompanionMsckf:
         self.min_height = min_height_m
         self.max_sigma_v = max_sigma_v
         self.max_speed = max_speed_m_s
+        self.max_imu_step_us = int(max_imu_step_s * 1e6)
+        self.max_imu_gap_us = int(max_imu_gap_s * 1e6)
         self.imu: list[ImuReading] = []
         self.filter: Msckf | None = None
         self._window: list[tuple[int, dict]] = []
@@ -55,6 +61,7 @@ class CompanionMsckf:
         self._last_try = 0
         self.counts: dict[str, int] = {}
         self.last_init: dict | None = None
+        self.last_error: str | None = None
 
     def count(self, key: str) -> None:
         self.counts[key] = self.counts.get(key, 0) + 1
@@ -62,11 +69,35 @@ class CompanionMsckf:
     def add_imu(self, reading: ImuReading) -> None:
         if self.imu and reading.timestamp_us <= self.imu[-1].timestamp_us:
             return
+        if self.imu:
+            last = self.imu[-1]
+            gap = reading.timestamp_us - last.timestamp_us
+            if gap > self.max_imu_gap_us:
+                # Lost IMU data: neither the window nor the filter can be
+                # propagated through it.
+                self.imu.clear()
+                if self.filter is not None or self._window:
+                    self.reset("RESET_IMU_GAP")
+            elif gap > self.max_imu_step_us:
+                # A dropped MAVLink packet or two (56 ms seen in SITL at
+                # 125 Hz): linear interpolation of the rates, i.e. the same
+                # trapezoidal integration over a longer step. Counted.
+                n = int(np.ceil(gap / self.max_imu_step_us))
+                for k in range(1, n):
+                    self.imu.append(self._interpolate(last, reading, last.timestamp_us + k * gap // n))
+                self.count("IMU_GAP_BRIDGED")
         self.imu.append(reading)
         # Keep ~8 s: enough for the longest initialisation window.
         cut = reading.timestamp_us - 8_000_000
         while self.imu and self.imu[0].timestamp_us < cut:
             self.imu.pop(0)
+
+    @staticmethod
+    def _interpolate(a: ImuReading, b: ImuReading, t_us: int) -> ImuReading:
+        w = (t_us - a.timestamp_us) / (b.timestamp_us - a.timestamp_us)
+        mix = lambda x, y: tuple((1 - w) * np.asarray(x) + w * np.asarray(y))  # noqa: E731
+        return ImuReading(t_us, mix(a.gyro_body_rad_s, b.gyro_body_rad_s),
+                          mix(a.specific_force_body_m_s2, b.specific_force_body_m_s2))
 
     def _reading_at(self, t_us: int) -> ImuReading | None:
         ts = [r.timestamp_us for r in self.imu]
@@ -75,11 +106,7 @@ class CompanionMsckf:
             return self.imu[i]
         if i == 0 or i == len(ts):
             return None
-        a, b = self.imu[i - 1], self.imu[i]
-        w = (t_us - a.timestamp_us) / (b.timestamp_us - a.timestamp_us)
-        mix = lambda x, y: tuple((1 - w) * np.asarray(x) + w * np.asarray(y))  # noqa: E731
-        return ImuReading(t_us, mix(a.gyro_body_rad_s, b.gyro_body_rad_s),
-                          mix(a.specific_force_body_m_s2, b.specific_force_body_m_s2))
+        return self._interpolate(self.imu[i - 1], self.imu[i], t_us)
 
     def ready_for(self, t_us: int) -> bool:
         return bool(self.imu) and self.imu[-1].timestamp_us >= t_us
@@ -112,7 +139,12 @@ class CompanionMsckf:
             if span < self.min_window_s or t_us - self._last_try < 500_000:
                 return None
             self._last_try = t_us
-            res = initialize(self.imu, self._window, self.camera, self._q0, heights_agl_m=self._heights)
+            try:
+                res = initialize(self.imu, self._window, self.camera, self._q0, heights_agl_m=self._heights)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                self.last_error = f"init {type(exc).__name__}: {exc}"
+                self.reset("INIT_ERROR")
+                return None
             self.last_init = {"status": res.status, "window_s": round(span, 2),
                               "sigma_velocity_m_s": res.sigma_velocity_m_s, "features": res.features,
                               "median_depth_m": res.median_depth_m, "chi2_per_dof": res.chi2_per_dof,
@@ -142,7 +174,8 @@ class CompanionMsckf:
             if f.last_imu.timestamp_us != t_us:
                 f.predict(self._reading_at(t_us))
             f.process_frame(t_us, features)
-        except (ValueError, np.linalg.LinAlgError):
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
             self.reset("RESET_NUMERICAL")
             return None
         r_nb = rotation_body_to_ned(f.q)
