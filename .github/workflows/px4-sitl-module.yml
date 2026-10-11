@@ -81,7 +81,6 @@ jobs:
             build/px4_sitl_runtime_results \
             build/px4_sitl_replay_input/eskf_events.csv \
             build/px4_sitl_replay_input/eskf_expected.json
-            build/px4_sitl_runtime_results/ofnav_bench.log
 
       - name: Archive PX4 SITL diagnostic replay proof
         uses: actions/upload-artifact@v4
@@ -96,6 +95,7 @@ jobs:
             build/px4_sitl_runtime_results/ofnav_sitl_replay_camera.log
             build/px4_sitl_runtime_results/ofnav_live.log
             build/px4_sitl_runtime_results/ofnav_sitl_eskf.log
+            build/px4_sitl_runtime_results/ofnav_bench.log
             build/px4_sitl_replay_input/eskf_expected.json
           if-no-files-found: warn
           retention-days: 30
@@ -129,7 +129,7 @@ jobs:
 
       - name: Build px4_fmu-v6x_default with ofnav
         run: |
-          bash tools/install_px4_ofnav_module.sh PX4-Autopilot boards/px4/fmu-v6x/default.px4board
+          bash tools/install_px4_ofnav_module.sh --multicopter-only PX4-Autopilot boards/px4/fmu-v6x/default.px4board
           make -C PX4-Autopilot px4_fmu-v6x_default
 
       - name: Static worst-case stack of the ofnav task (target flags)
