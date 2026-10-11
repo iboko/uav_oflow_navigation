@@ -7,7 +7,7 @@
 //    user-supplied stack, so an EMPTY thread is measured first and
 //    subtracted: the remainder is the filter call-chain stack.
 // 2. Time: worst and mean wall time of pushImu() (including checkpoint
-//    trim replay) and pushDelayedFrame() of a four-event camera frame with
+//    trim replay) and pushDelayedFrame() of a five-event camera frame with
 //    FULL IMU history (64 samples) and up to 24 stored aiding events.
 //
 // Host timing is NOT target WCET; docs/ESKF15_PX4_RUNTIME_RU.md gives the
@@ -58,24 +58,48 @@ ofnav15::Imu imu(std::uint64_t t, int i) {
                          -9.80665 + .02 * std::sin(.41 * s)}};
 }
 
-ofnav15::Measurement event(std::uint64_t t, ofnav15::MeasurementKind kind) {
+struct Truth {
+    std::uint64_t t{0};
+    ofnav15::Vec3 p{}, v{};
+    ofnav15::Quat q{1., 0., 0., 0.};
+};
+
+// Aiding consistent with the SAME IMU stream: values from an unaided
+// reference filter (no corrections) plus small deterministic offsets.
+ofnav15::Measurement event(const Truth &x, ofnav15::MeasurementKind kind, int n) {
     ofnav15::Measurement m{};
-    m.time_us = t;
+    m.time_us = x.t;
     m.kind = kind;
+    const double w = x.q[0], qx = x.q[1], qy = x.q[2], qz = x.q[3];
+    const double r[9] = {1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - w * qz), 2 * (qx * qz + w * qy),
+                         2 * (qx * qy + w * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - w * qx),
+                         2 * (qx * qz - w * qy), 2 * (qy * qz + w * qx), 1 - 2 * (qx * qx + qy * qy)};
+    const double e = .01 * std::sin(1.3 * n);
     switch (kind) {
     case ofnav15::MeasurementKind::VelocityNe:
+        m.value = {x.v[0] + e, x.v[1] - e};
+        m.covariance = {0.04, 0., 0., 0.04};
+        break;
     case ofnav15::MeasurementKind::BodyVelocityXy:
-        m.value = {0.01, -0.01};
+        m.value = {r[0] * x.v[0] + r[3] * x.v[1] + r[6] * x.v[2] + e,
+                   r[1] * x.v[0] + r[4] * x.v[1] + r[7] * x.v[2] - e};
         m.covariance = {0.04, 0., 0., 0.04};
         break;
     case ofnav15::MeasurementKind::Yaw:
-        m.value = {0.002, 0.};
-        m.covariance = {0.01, 0., 0., 0.};
+        m.value = {std::atan2(r[3], r[0]) + .1 * e, 0.};
+        m.covariance = {0.0004, 0., 0., 0.};
         break;
     case ofnav15::MeasurementKind::PositionNe:
-        m.value = {0.05, -0.05};
+        m.value = {x.p[0] + 10. * e, x.p[1] - 10. * e};
         m.covariance = {4., 0., 0., 4.};
         m.ci_weight = 0.;  // automatic covariance intersection
+        break;
+    case ofnav15::MeasurementKind::MapGroundPointNe:
+        // Nadir axis d_b = (0,0,1): ground point = p + h (R d)_NE / (R d)_D.
+        m.value = {x.p[0] + 100. * r[2] / r[8] + e, x.p[1] + 100. * r[5] / r[8] - e};
+        m.covariance = {.04, 0., 0., .04};
+        m.ci_weight = 0.;
+        m.aux = {100., 0., 0., 1.};
         break;
     }
     return m;
@@ -88,14 +112,26 @@ void *workload(void *arg) {
     void *storage = std::malloc(sizeof(ofnav15::FixedLag));
     if (storage == nullptr) { return nullptr; }
     auto *lag = new (storage) ofnav15::FixedLag({}, 630000U);
+    // Unaided reference filter on the heap with its own heap workspace,
+    // so it does not contribute to the measured stack.
+    auto *reference = new ofnav15::Filter({});
+    auto *reference_ws = new ofnav15::Workspace{};
+    // Harness buffers on the heap too: only filter call frames are measured.
+    auto *history = new Truth[16]{};
+    auto *frame_events = new ofnav15::Measurement[5]{};
     std::uint64_t t = 1000000U;
     int i = 0;
     double imu_sum = 0., delayed_sum = 0.;
+    bool ok = true;
     // 0.63 s lag at 100 Hz keeps all 64 IMU samples; trim engages after.
-    for (int frame = 0; frame < 30; ++frame) {
+    for (int frame = 0; frame < 30 && ok; ++frame) {
         for (int k = 0; k < 10; ++k, ++i) {
+            const ofnav15::Imu sample = imu(t, i);
+            (void)reference->predict(sample, *reference_ws);
+            history[i % 16] = Truth{t, reference->position(), reference->velocity(),
+                                    reference->quaternion()};
             const auto a = Clock::now();
-            const auto s = lag->pushImu(imu(t, i));
+            const auto s = lag->pushImu(sample);
             const auto b = Clock::now();
             const double us = elapsedUs(a, b);
             imu_sum += us;
@@ -103,24 +139,21 @@ void *workload(void *arg) {
             result->imu_worst_us = std::max(result->imu_worst_us, us);
             if (s != ofnav15::Status::InertialOnly) {
                 std::fprintf(stderr, "pushImu status %s at %d\n", ofnav15::statusName(s), i);
-                result->healthy = false;
-                lag->~FixedLag();
-                std::free(storage);
-                return nullptr;
+                ok = false;
+                break;
             }
             t += 10000U;
         }
-        // One camera frame per 0.1 s: four aiding events of one exposure,
-        // delivered 55 ms late and inserted by ONE replay.
-        const std::uint64_t exposure = t - 55000U;
-        const ofnav15::Measurement frame_events[4] = {
-            event(exposure, ofnav15::MeasurementKind::VelocityNe),
-            event(exposure, ofnav15::MeasurementKind::BodyVelocityXy),
-            event(exposure, ofnav15::MeasurementKind::Yaw),
-            event(exposure, ofnav15::MeasurementKind::PositionNe)};
-        ofnav15::Status statuses[4]{};
+        if (!ok) { break; }
+        // One camera frame per 0.1 s: all five aiding kinds of one
+        // exposure, delivered 60 ms late and inserted by ONE replay.
+        const Truth &x = history[(i - 6) % 16];
+        for (int k = 0; k < 5; ++k) {
+            frame_events[k] = event(x, static_cast<ofnav15::MeasurementKind>(k), frame);
+        }
+        ofnav15::Status statuses[5]{};
         const auto a = Clock::now();
-        (void)lag->pushDelayedFrame(frame_events, 4, statuses);
+        (void)lag->pushDelayedFrame(frame_events, 5, statuses);
         const auto b = Clock::now();
         const double us = elapsedUs(a, b);
         delayed_sum += us;
@@ -133,11 +166,18 @@ void *workload(void *arg) {
         }
         for (const auto s : statuses) {
             if (ofnav15::measurementProcessed(s)) { ++result->processed; }
+            else if (s != ofnav15::Status::BufferLimit) {
+                std::fprintf(stderr, "frame %d status %s\n", frame, ofnav15::statusName(s));
+            }
         }
     }
+    delete[] frame_events;
+    delete[] history;
+    delete reference_ws;
+    delete reference;
     result->imu_mean_us = imu_sum / result->imu_samples;
     result->delayed_mean_us = delayed_sum / result->delayed_samples;
-    result->healthy = !lag->failed() && lag->current().healthy();
+    result->healthy = ok && !lag->failed() && lag->current().healthy();
     lag->~FixedLag();
     std::free(storage);
     return nullptr;
@@ -179,7 +219,9 @@ int main() {
     const std::size_t total = paintedRun(workload, &result);
     if (baseline == 0 || total < baseline) { return 2; }
     const std::size_t used = total - baseline;
-    const bool pass = result.healthy && result.processed > 0 && used <= kFilterStackBudget;
+    // Every event except explicit BUFFER_LIMIT must be processed.
+    const bool pass = result.healthy && result.processed >= 4U * result.delayed_samples &&
+                      used <= kFilterStackBudget;
     std::printf("{\"type\":\"HOST_ESKF15_RESOURCE_MEASUREMENT\","
                 "\"sizeof_fixed_lag_bytes\":%zu,\"sizeof_filter_bytes\":%zu,"
                 "\"sizeof_workspace_bytes\":%zu,"

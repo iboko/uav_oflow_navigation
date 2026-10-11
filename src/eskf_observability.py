@@ -35,7 +35,8 @@ STATE_NAMES = (
 )
 PRIOR_SIGMA = np.array([10., 10., 10., 1., 1., 1., .1, .1, .1,
                         .02, .02, .02, .2, .2, .2])
-AIDING = ("velocity_ne", "body_velocity_xy", "yaw", "position_ne")
+AIDING = ("velocity_ne", "body_velocity_xy", "yaw", "position_ne", "ground_point_ne")
+GROUND_HEIGHT_M = 100.
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ SCENARIOS = (
     Scenario("hover_body_velocity_yaw", "hover", ("body_velocity_xy", "yaw")),
     Scenario("hover_body_velocity_yaw_map", "hover",
              ("body_velocity_xy", "yaw", "position_ne")),
+    Scenario("hover_body_velocity_yaw_ground_point", "hover",
+             ("body_velocity_xy", "yaw", "ground_point_ne")),
     Scenario("maneuver_velocity_ne", "maneuver", ("velocity_ne",)),
     Scenario("maneuver_body_velocity", "maneuver", ("body_velocity_xy",)),
     Scenario("maneuver_body_velocity_map", "maneuver",
@@ -92,6 +95,15 @@ def _measurement_jacobian(kind: str, rotation: np.ndarray,
     if kind == "position_ne":
         h = np.zeros((2, 15))
         h[:, 0:2] = np.eye(2)
+        return h
+    if kind == "ground_point_ne":
+        d = np.array([0., 0., 1.])
+        dn = rotation @ d
+        jac = -rotation @ skew(d)
+        h = np.zeros((2, 15))
+        h[:, 0:2] = np.eye(2)
+        h[:, 6:9] = GROUND_HEIGHT_M * (jac[:2, :] / dn[2] -
+                                       np.outer(dn[:2], jac[2, :]) / dn[2] ** 2)
         return h
     raise ValueError("Неизвестный вид коррекции")
 

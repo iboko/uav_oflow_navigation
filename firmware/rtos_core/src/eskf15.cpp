@@ -23,7 +23,7 @@ void multiplyInto(const Matrix15 &a, const Matrix15 &b, Matrix15 &r) noexcept {
     for (int i = 0; i < 15; ++i) {
         for (int k = 0; k < 15; ++k) {
             const double v = at(a, i, k);
-            if (v == 0.) { continue; }
+            if (!(std::fabs(v) > 0.)) { continue; }  // skip structural zeros
             for (int j = 0; j < 15; ++j) { at(r, i, j) += v * at(b, k, j); }
         }
     }
@@ -220,7 +220,16 @@ bool measurementValid(const Measurement &m) noexcept {
         !std::isfinite(m.ci_weight) || m.ci_weight>1.) {
         return false;
     }
-    if (m.ci_weight<1. && m.kind!=MeasurementKind::PositionNe) {return false;}
+    const bool position_like=m.kind==MeasurementKind::PositionNe ||
+                             m.kind==MeasurementKind::MapGroundPointNe;
+    if (m.ci_weight<1. && !position_like) {return false;}
+    if (m.kind==MeasurementKind::MapGroundPointNe) {
+        const double n2=m.aux[1]*m.aux[1]+m.aux[2]*m.aux[2]+m.aux[3]*m.aux[3];
+        if (!std::isfinite(m.aux[0]) || !(m.aux[0]>0.) || m.aux[0]>500. ||
+            !std::isfinite(n2) || n2<.81 || n2>1.21) {
+            return false;
+        }
+    }
     if (m.ci_weight>0. && m.ci_weight<1. && (m.ci_weight<.01 || m.ci_weight>.99)) {
         return false;
     }
@@ -253,23 +262,23 @@ bool before(const Measurement &a, const Measurement &b) noexcept {
 bool sameEvent(const Measurement &a, const Measurement &b) noexcept {
     return a.time_us==b.time_us && a.kind==b.kind;
 }
-// CI weight minimising det of the fused 2x2 position covariance:
-// argmax_w log det(w P^-1 + (1-w) R^-1) on a fixed 91-point grid.
-// The SAME grid is used by src/error_state_inertial_filter.py.
-double chooseCiWeight(const double p[4], const double r[4]) noexcept {
-    const double pdet=p[0]*p[3]-p[1]*p[2];
-    const double rdet=r[0]*r[3]-r[1]*r[2];
-    const double pi[4]={p[3]/pdet,-p[1]/pdet,-p[2]/pdet,p[0]/pdet};
-    const double ri[4]={r[3]/rdet,-r[1]/rdet,-r[2]/rdet,r[0]/rdet};
-    double best_w=.5, best=-std::numeric_limits<double>::infinity();
+// Full-state covariance-intersection weight: minimise
+// ln det P+(w) = -15 ln w + ln det(R/(1-w)) - ln det(HPH^T/w + R/(1-w)) + const
+// on a fixed 91-point grid w = 0.05..0.95. Minimising only the position
+// block would choose w -> 0 and inflate EVERY state by 1/w on every map
+// fix. The SAME grid and criterion are used by error_state_inertial_filter.py.
+double chooseCiWeight(const double hph[4], const double r[4]) noexcept {
+    double best_w=.5, best=std::numeric_limits<double>::infinity();
     for(int step=5;step<=95;++step) {
         const double w=static_cast<double>(step)/100.;
-        const double c0=w*pi[0]+(1.-w)*ri[0];
-        const double c1=w*pi[1]+(1.-w)*ri[1];
-        const double c2=w*pi[2]+(1.-w)*ri[2];
-        const double c3=w*pi[3]+(1.-w)*ri[3];
-        const double det=c0*c3-c1*c2;
-        if (det>best) {best=det;best_w=w;}
+        const double a=1./(1.-w);
+        const double rd=(r[0]*r[3]-r[1]*r[2])*a*a;
+        const double s0=hph[0]/w+r[0]*a, s1=hph[1]/w+r[1]*a;
+        const double s2=hph[2]/w+r[2]*a, s3=hph[3]/w+r[3]*a;
+        const double sd=s0*s3-s1*s2;
+        if (!(rd>0.) || !(sd>0.)) {continue;}
+        const double cost=-15.*std::log(w)+std::log(rd)-std::log(sd);
+        if (cost<best) {best=cost;best_w=w;}
     }
     return best_w;
 }
@@ -390,14 +399,25 @@ AlignmentStatus staticAlignment(const Imu *samples, std::size_t n, double yaw,
     return AlignmentStatus::Aligned;
 }
 
-Filter::Filter(const Parameters &c) noexcept :
-    config_(c),
-    bg_(c.initial_gyro_bias_rad_s),
-    ba_(c.initial_accel_bias_m_s2),
-    q_(unit(c.initial_quaternion_body_to_ned)),
-    valid_config_(validParameters(c)) {
+Filter::Filter(const Parameters &c) noexcept {
+    reset(c);
+}
+void Filter::reset(const Parameters &c) noexcept {
+    config_=c;
+    p_={}; v_={};
+    bg_=c.initial_gyro_bias_rad_s;
+    ba_=c.initial_accel_bias_m_s2;
+    q_=unit(c.initial_quaternion_body_to_ned);
+    p_cov_.fill(0.);
     for(int i=0;i<15;++i) {at(p_cov_,i,i)=c.initial_sigma[i]*c.initial_sigma[i];}
-    if (!valid_config_) {status_=Status::NumericalFailure;}
+    last_=Imu{};
+    last_measurement_us_.fill(0U);
+    nis_=std::numeric_limits<double>::quiet_NaN();
+    ci_weight_=1.;
+    accepted_=rejected_=0;
+    has_imu_=false;
+    valid_config_=validParameters(c);
+    status_=valid_config_?Status::WaitingForImu:Status::NumericalFailure;
 }
 bool Filter::healthy() const noexcept {
     return status_!=Status::ImuGap && status_!=Status::NumericalFailure &&
@@ -467,7 +487,8 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
     Status corrected=Status::VisualCorrected, outlier=Status::VisualOutlier;
     // Measurement model: residual y = z - h(x), Jacobian H (n x 15).
     const int n=m.kind==MeasurementKind::Yaw?1:2;
-    double h[2][15]{};
+    auto &h=ws.h;
+    for(auto &row:h) {for(double &x:row) {x=0.;}}
     double y[2]{};
     double r[4]{m.covariance[0],m.covariance[1],m.covariance[2],m.covariance[3]};
     const Mat3 rot=matrixFromQuat(q_);
@@ -505,9 +526,36 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
         h[0][0]=1.; h[1][1]=1.;
         corrected=Status::PositionCorrected; outlier=Status::PositionOutlier;
         break;
+    case MeasurementKind::MapGroundPointNe: {
+        // d_n = R d_b; offset = h d_n[0:2] / d_n[2].
+        // R_true d_b ~ d_n + J dtheta with J = -R [d_b]x.
+        const double norm=std::sqrt(m.aux[1]*m.aux[1]+m.aux[2]*m.aux[2]+m.aux[3]*m.aux[3]);
+        const Vec3 db={m.aux[1]/norm,m.aux[2]/norm,m.aux[3]/norm};
+        const Vec3 dn=matVec(rot,db);
+        if (!(dn[2]>.5)) {++rejected_;return Status::InvalidVisual;}
+        const double height=m.aux[0];
+        const Mat3 sd=skew(db);
+        double jac[3][3]{};
+        for(int i=0;i<3;++i) {
+            for(int j=0;j<3;++j) {
+                double sum=0.;
+                for(int k=0;k<3;++k) {sum+=rot[3*i+k]*sd[3*k+j];}
+                jac[i][j]=-sum;
+            }
+        }
+        for(int i=0;i<2;++i) {
+            y[i]=m.value[i]-(p_[i]+height*dn[i]/dn[2]);
+            h[i][i]=1.;
+            for(int j=0;j<3;++j) {
+                h[i][6+j]=height*(jac[i][j]/dn[2]-dn[i]*jac[2][j]/(dn[2]*dn[2]));
+            }
+        }
+        corrected=Status::PositionCorrected; outlier=Status::PositionOutlier;
+        break;
+    }
     }
     // Innovation covariance S = H P H^T + R (honest, unscaled) for the gate.
-    double pht[15][2]{};
+    auto &pht=ws.pht;
     for(int i=0;i<15;++i) {
         for(int k=0;k<n;++k) {
             double sum=0.;
@@ -543,12 +591,13 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
     }
     // Covariance intersection for unknown cross-correlation (position only).
     double w=1.;
-    if (m.kind==MeasurementKind::PositionNe && m.ci_weight<1.) {
+    if ((m.kind==MeasurementKind::PositionNe ||
+         m.kind==MeasurementKind::MapGroundPointNe) && m.ci_weight<1.) {
         if (m.ci_weight>0.) {
             w=m.ci_weight;
         } else {
-            const double pp[4]={at(p_cov_,0,0),at(p_cov_,0,1),at(p_cov_,1,0),at(p_cov_,1,1)};
-            w=chooseCiWeight(pp,r);
+            const double hph[4]={s[0]-r[0],s[1]-r[1],s[2]-r[2],s[3]-r[3]};
+            w=chooseCiWeight(hph,r);
         }
     }
     const double pscale=1./w;
@@ -569,9 +618,10 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
         if (!(det>1.e-16)) {++rejected_;return Status::InvalidVisual;}
         si[0]=sc[3]/det; si[1]=-sc[1]/det; si[2]=-sc[2]/det; si[3]=sc[0]/det;
     }
-    double k[15][2]{};
-    double dx[15]{};
+    auto &k=ws.gain;
+    auto &dx=ws.dx;
     for(int i=0;i<15;++i) {
+        dx[i]=0.;
         for(int b=0;b<n;++b) {
             double sum=0.;
             for(int a=0;a<n;++a) {sum+=pht[i][a]*pscale*si[2*a+b];}
@@ -636,6 +686,23 @@ FixedLag::FixedLag(const Parameters &params, std::uint64_t lag) noexcept :
     parameters_(params),max_lag_us_(lag),checkpoint_(params),current_(params),
     scratch_(params),replay_(params) {
     if (lag==0 || lag>5000000U || !current_.healthy()) {failed_=true;}
+}
+void FixedLag::reset(const Parameters &params, std::uint64_t lag) noexcept {
+    parameters_=params;
+    max_lag_us_=lag;
+    latest_=0;
+    checkpoint_.reset(params);
+    current_.reset(params);
+    scratch_.reset(params);
+    replay_.reset(params);
+    checkpoint_imu_=Imu{};
+    initialized_=false;
+    failed_=lag==0 || lag>5000000U || !current_.healthy();
+    count_=0;
+    visual_count_=0;
+    for (auto &snap:snapshots_) {snap.valid=false;}
+    since_snapshot_=0;
+    last_replay_length_=0;
 }
 void FixedLag::invalidateSnapshotsFrom(std::uint64_t time_us) noexcept {
     for (auto &s:snapshots_) {
@@ -792,7 +859,7 @@ Status FixedLag::pushDelayedFrame(const Measurement *events, std::size_t n,
     // Merge admitted events into a sorted candidate history.
     std::size_t c=0;
     std::size_t i=0;
-    std::array<Measurement,kMaxFrameEvents> batch{};
+    auto &batch=batch_;
     std::size_t batch_count=0;
     for(std::size_t e=0;e<n;++e) {if (admit[e]) {batch[batch_count++]=events[e];}}
     for(std::size_t x=1;x<batch_count;++x) {

@@ -15,7 +15,7 @@ import numpy as np
 
 from src.error_state_inertial_filter import (
     BodyVelocityMeasurement, ImuNoiseDensity, InertialErrorStateFilter,
-    MapPositionMeasurement, YawMeasurement,
+    MapGroundPointMeasurement, MapPositionMeasurement, YawMeasurement,
 )
 from src.fixed_lag_eskf_replay import FixedLagEskfReplay
 from src.horizontal_visual_inertial_filter import VisualVelocityMeasurement
@@ -58,6 +58,8 @@ def run_parity(executable: str | Path, *, atol: float = 1.e-6) -> dict:
     early=[
         VisualVelocityMeasurement(1120000,.07,.02,((.04,0.),(0.,.04))),
         MapPositionMeasurement(1120000,.1,.05,((9.,0.),(0.,9.)),1.),
+        MapGroundPointMeasurement(1120000,.3,-.2,((.25,.02),(.02,.36)),100.,
+                                  (.02,-.01,1.),0.),
     ]
     processed={"VISUAL_CORRECTED","VISUAL_OUTLIER_REJECTED","YAW_CORRECTED",
                "YAW_OUTLIER_REJECTED","POSITION_CORRECTED",
@@ -111,7 +113,8 @@ def run_parity(executable: str | Path, *, atol: float = 1.e-6) -> dict:
         "covariance_entries_compared":225,
         "imu_samples":50,
         "out_of_order_frames":2,
-        "measurement_kinds":["velocity_ne","body_velocity_xy","yaw","position_ne"],
+        "measurement_kinds":["velocity_ne","body_velocity_xy","yaw","position_ne",
+                             "ground_point_ne"],
         "automatic_covariance_intersection_weight":cpp["ci_weight"],
         "one_frame_time_interpolated_between_imu_samples":True,
         "timestamp_us":cpp["timestamp_us"],

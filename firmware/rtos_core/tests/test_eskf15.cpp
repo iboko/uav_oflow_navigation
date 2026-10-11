@@ -365,6 +365,36 @@ void test_position_ci_update_is_conservative() {
     assert(far.predict(sample(1000000U),ws)==Status::InertialOnly);
     assert(far.update(meas(1000000U,K::PositionNe,500.,0.,1.),ws)==Status::PositionOutlier);
 }
+void test_ground_point_corrects_tilt_and_position() {
+    using K=ofnav15::MeasurementKind;
+    ofnav15::Parameters cfg{};
+    const double pitch_err=.02;  // nominal pitch while the vehicle is level
+    cfg.initial_quaternion_body_to_ned={std::cos(.5*pitch_err),0.,std::sin(.5*pitch_err),0.};
+    cfg.initial_sigma[6]=cfg.initial_sigma[7]=.05;
+    Filter f(cfg);
+    ofnav15::Workspace ws{};
+    // Level vehicle at the origin, 100 m above ground: true ground point (0,0).
+    // Two independent pieces: map ground point and an NE position aid.
+    for(int i=0;i<=40;++i) {
+        const std::uint64_t t=1000000U+static_cast<std::uint64_t>(10000*i);
+        // Accelerometer of a LEVEL vehicle; the filter believes it is pitched.
+        assert(f.predict(Imu{t,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+        if (i%10==0) {
+            auto gp=meas(t,K::MapGroundPointNe,0.,0.,.01);
+            gp.aux={100.,0.,0.,1.};
+            assert(ofnav15::measurementProcessed(f.update(gp,ws)));
+            assert(ofnav15::measurementProcessed(f.update(meas(t,K::PositionNe,0.,0.,.01),ws)));
+        }
+    }
+    const auto &q=f.quaternion();
+    const double pitch=std::asin(2.*(q[0]*q[2]-q[3]*q[1]));
+    assert(std::abs(pitch)<.2*pitch_err);
+    assert(std::abs(f.position()[0])<.2);
+    assert(f.predict(Imu{1410000U,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+    ofnav15::Measurement bad=meas(1410000U,K::MapGroundPointNe,0.,0.,.01);
+    bad.aux={100.,0.,0.,0.};  // not a unit optical axis
+    assert(f.update(bad,ws)==Status::InvalidVisual);
+}
 void test_static_alignment_roll_pitch_gyro_bias() {
     const double roll=.1, pitch=-.05, g=9.80665;
     const ofnav15::Vec3 bias{.01,-.02,.005};
@@ -415,6 +445,7 @@ int main() {
     test_yaw_update_with_tilt_and_wraparound();
     test_position_ci_update_is_conservative();
     test_static_alignment_roll_pitch_gyro_bias();
+    test_ground_point_corrects_tilt_and_position();
     std::cout<<"C++ 15-state ESKF and fixed-lag regression PASS\n";
     return 0;
 }

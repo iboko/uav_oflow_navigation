@@ -41,7 +41,8 @@ GRAVITY = 9.80665
 EARTH_RATE_RAD_S = 7.2921159e-5
 CHI2_1_99 = 6.6348966010212145
 # Kind order == processing order for equal timestamps (same as C++).
-KIND_ORDER = {"velocity_ne": 0, "body_velocity_xy": 1, "yaw": 2, "position_ne": 3}
+KIND_ORDER = {"velocity_ne": 0, "body_velocity_xy": 1, "yaw": 2, "position_ne": 3,
+              "ground_point_ne": 4}
 _FATAL = frozenset({
     "IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE", "BIAS_LIMIT_EXCEEDED",
     "POSTERIOR_INVALID",
@@ -155,12 +156,30 @@ class MapPositionMeasurement:
 
     ci_weight: 1 — независимое измерение (стандартная коррекция);
     (0, 1) — ковариационное пересечение по всему состоянию: P/w, R/(1-w);
-    <= 0 — w выбирается на сетке 0,05..0,95 минимизацией det блока положения.
+    <= 0 — w выбирается на сетке 0,05..0,95 минимизацией det полной
+    апостериорной ковариации (``choose_ci_weight``).
     """
     timestamp_us: int
     north_m: float
     east_m: float
     covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]]
+    ci_weight: float = 1.0
+
+
+@dataclass(frozen=True)
+class MapGroundPointMeasurement:
+    """N, E точки земли на оптической оси камеры (привязка главной точки).
+
+    Не зависит от оценки ориентации. Модель:
+    z = p_NE + h (R d)_NE / (R d)_D, d — ось камеры в осях FRD,
+    h — высота над плоскостью по дальномеру. Связывает карту с наклоном.
+    """
+    timestamp_us: int
+    north_m: float
+    east_m: float
+    covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]]
+    height_agl_m: float
+    optical_axis_body: tuple[float, float, float] = (0., 0., 1.)
     ci_weight: float = 1.0
 
 
@@ -173,23 +192,31 @@ def measurement_kind(measurement: object) -> str:
         return "yaw"
     if isinstance(measurement, MapPositionMeasurement):
         return "position_ne"
+    if isinstance(measurement, MapGroundPointMeasurement):
+        return "ground_point_ne"
     raise TypeError("Неизвестный тип измерения")
 
 
-def choose_ci_weight(prior_ne: np.ndarray, measurement_ne: np.ndarray) -> float:
-    """argmax_w det(w P^-1 + (1-w) R^-1), w in {0.05, ..., 0.95}.
+def choose_ci_weight(hph: np.ndarray, measurement: np.ndarray, *,
+                     state_dimension: int = 15) -> float:
+    """Вес ковариационного пересечения по полному состоянию.
 
-    Детерминированная сетка совпадает с C++ (chooseCiWeight).
+    Минимизируется ln det P+(w) = -n ln w + ln det(R/(1-w))
+    - ln det(HPH^T/w + R/(1-w)) на сетке w = 0.05..0.95 (как в C++).
+    Критерий только по блоку положения выбирал бы w -> 0 и раздувал
+    все состояния в 1/w раз при каждой привязке к карте.
     """
-    pi_ = np.linalg.inv(prior_ne)
-    ri = np.linalg.inv(measurement_ne)
-    best_w, best = 0.5, -np.inf
+    best_w, best = 0.5, np.inf
     for step in range(5, 96):
         w = step / 100.
-        c = w * pi_ + (1. - w) * ri
-        det = float(c[0, 0] * c[1, 1] - c[0, 1] * c[1, 0])
-        if det > best:
-            best, best_w = det, w
+        a = 1. / (1. - w)
+        rd = float(np.linalg.det(measurement)) * a * a
+        sd = float(np.linalg.det(hph / w + measurement * a))
+        if rd <= 0 or sd <= 0:
+            continue
+        cost = -state_dimension * np.log(w) + np.log(rd) - np.log(sd)
+        if cost < best:
+            best, best_w = cost, w
     return best_w
 
 
@@ -300,6 +327,7 @@ class InertialErrorStateFilter:
         nis_gate_1d: float = CHI2_1_99,
         max_gyro_bias_rad_s: float = 0.3,
         max_accel_bias_m_s2: float = 3.0,
+        initial_position_ned_m: tuple[float, float, float] = (0., 0., 0.),
     ) -> None:
         if not noise.valid() or not 0.001 <= max_imu_dt_s <= 0.05:
             raise ValueError("Недопустимые характеристики шума/интервала ИИМ")
@@ -310,7 +338,7 @@ class InertialErrorStateFilter:
         sigmas = _vector(initial_error_sigma, 15, "начальные сигмы состояния")
         if np.min(sigmas) <= 0:
             raise ValueError("Начальная ковариация должна быть положительной")
-        self.p = np.zeros(3)
+        self.p = _vector(initial_position_ned_m, 3, "начальное положение")
         self.v = np.zeros(3)
         self.q = _unit_quaternion(quaternion_body_to_ned)
         self.bg = _vector(initial_bias.gyro_body_rad_s, 3, "смещение гироскопов")
@@ -401,6 +429,8 @@ class InertialErrorStateFilter:
             return self.update_body_velocity(measurement)
         if kind == "yaw":
             return self.update_yaw(measurement)
+        if kind == "ground_point_ne":
+            return self.update_map_ground_point(measurement)
         return self.update_map_position(measurement)
 
     def _admit(self, kind: str, stamp: object) -> str | None:
@@ -436,9 +466,8 @@ class InertialErrorStateFilter:
             self._rejected += 1
             return self._fail(outlier)
         w = 1.0
-        if kind == "position_ne" and ci_weight < 1.0:
-            w = ci_weight if ci_weight > 0 else choose_ci_weight(
-                self.covariance[0:2, 0:2], r)
+        if kind in ("position_ne", "ground_point_ne") and ci_weight < 1.0:
+            w = ci_weight if ci_weight > 0 else choose_ci_weight(s - r, r)
         pw = self.covariance / w
         rw = r / (1.0 - w) if w < 1.0 else r
         s_ci = h @ pw @ h.T + rw
@@ -574,6 +603,45 @@ class InertialErrorStateFilter:
             h[:, 0:2] = np.eye(2)
             return self._correct(
                 "position_ne", measurement.timestamp_us, z - self.p[:2], h, r,
+                gate=self.nis_gate, corrected="POSITION_CORRECTED",
+                outlier="POSITION_OUTLIER_REJECTED", ci_weight=w)
+        except (ValueError, np.linalg.LinAlgError):
+            self._rejected += 1
+            return self._fail("VISUAL_COVARIANCE_INVALID")
+
+    def update_map_ground_point(
+        self, measurement: MapGroundPointMeasurement,
+    ) -> EskfSnapshot:
+        refused = self._admit("ground_point_ne", measurement.timestamp_us)
+        if refused == "FATAL":
+            return self.snapshot()
+        if refused is not None:
+            return self._fail(refused)
+        try:
+            w = float(measurement.ci_weight)
+            if not isfinite(w) or w > 1. or (0. < w < 1. and not .01 <= w <= .99):
+                raise ValueError("Вес ковариационного пересечения")
+            height = float(measurement.height_agl_m)
+            axis = _vector(measurement.optical_axis_body, 3, "ось камеры")
+            norm2 = float(axis @ axis)
+            if not (isfinite(height) and 0 < height <= 500. and .81 <= norm2 <= 1.21):
+                raise ValueError("Высота или ось камеры")
+            db = axis / sqrt(norm2)
+            z = _vector((measurement.north_m, measurement.east_m), 2,
+                        "точка земли по карте")
+            r = self._covariance2(measurement.covariance_ne_m2)
+            rot = rotation_body_to_ned(self.q)
+            dn = rot @ db
+            if dn[2] <= .5:
+                raise ValueError("Ось камеры не направлена вниз")
+            jac = -rot @ skew(db)
+            predicted = self.p[:2] + height * dn[:2] / dn[2]
+            h = np.zeros((2, 15))
+            h[:, 0:2] = np.eye(2)
+            h[:, TH] = height * (jac[:2, :] / dn[2] -
+                                 np.outer(dn[:2], jac[2, :]) / dn[2] ** 2)
+            return self._correct(
+                "ground_point_ne", measurement.timestamp_us, z - predicted, h, r,
                 gate=self.nis_gate, corrected="POSITION_CORRECTED",
                 outlier="POSITION_OUTLIER_REJECTED", ci_weight=w)
         except (ValueError, np.linalg.LinAlgError):

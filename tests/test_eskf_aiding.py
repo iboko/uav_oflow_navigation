@@ -122,13 +122,21 @@ def test_map_position_covariance_intersection_is_conservative():
     far.predict(ImuReading(1_000_000, (0., 0., 0.), STILL))
     assert far.update_map_position(MapPositionMeasurement(
         1_000_000, 500., 0., ((1., 0.), (0., 1.)))).status == "POSITION_OUTLIER_REJECTED"
-    # Grid optimum against a brute-force search on the same grid.
-    p2 = np.array([[4., 1.], [1., 2.]])
+    # Grid optimum equals brute force det of the FULL 15x15 posterior.
+    base = make()
+    base.predict(ImuReading(1_000_000, (0., 0., 0.), STILL))
+    p = base.covariance
+    h = np.zeros((2, 15))
+    h[:, 0:2] = np.eye(2)
     r2 = np.array([[1., -.3], [-.3, 5.]])
-    best = max((np.linalg.det(w / 100 * np.linalg.inv(p2) +
-                              (1 - w / 100) * np.linalg.inv(r2)), w / 100)
-               for w in range(5, 96))[1]
-    assert choose_ci_weight(p2, r2) == best
+    def posterior_logdet(w):
+        pw, rw = p / w, r2 / (1 - w)
+        k = pw @ h.T @ np.linalg.inv(h @ pw @ h.T + rw)
+        a = np.eye(15) - k @ h
+        return np.linalg.slogdet(a @ pw @ a.T + k @ rw @ k.T)[1]
+    brute = min(range(5, 96), key=lambda step: posterior_logdet(step / 100)) / 100
+    assert choose_ci_weight(h @ p @ h.T, r2) == brute
+    assert brute > .5  # full-state criterion does not inflate everything by 1/w
 
 
 def test_static_alignment_recovers_tilt_and_gyro_bias():
@@ -207,3 +215,42 @@ def test_frame_duplicate_kind_and_ci_on_velocity_are_rejected():
     bad = MapPositionMeasurement(1_210_000, 0., 0., ((4., 0.), (0., 4.)), 1.5)
     assert replay.push_delayed_visual(bad).status == "INVALID_VISUAL_MEASUREMENT"
     assert replay.stored_visual_count == 1
+
+
+def test_ground_point_jacobian_matches_finite_difference():
+    from src.error_state_inertial_filter import MapGroundPointMeasurement, TH, skew
+    from src.imu_preintegration import quat_exponential, quat_product, rotation_body_to_ned
+    q = np.array((cos(.05) * cos(.3), sin(.05), sin(.04), sin(.3)))
+    q = q / np.linalg.norm(q)
+    d = np.array((.1, -.05, 1.))
+    d = d / np.linalg.norm(d)
+    height = 100.
+
+    def offset(qq):
+        dn = rotation_body_to_ned(qq) @ d
+        return height * dn[:2] / dn[2]
+
+    rot = rotation_body_to_ned(q)
+    dn = rot @ d
+    jac = -rot @ skew(d)
+    analytic = height * (jac[:2, :] / dn[2] - np.outer(dn[:2], jac[2, :]) / dn[2] ** 2)
+    numeric = np.zeros((2, 3))
+    eps = 1e-7
+    for k in range(3):
+        dv = np.zeros(3)
+        dv[k] = eps
+        numeric[:, k] = (offset(quat_product(q, quat_exponential(dv))) -
+                         offset(quat_product(q, quat_exponential(-dv)))) / (2 * eps)
+    assert np.allclose(analytic, numeric, atol=1e-5)
+    # The filter corrects a pitch error from attitude-free ground points.
+    f = make(q=(cos(.01), 0., sin(.01), 0.), sigma=default_sigma(s6=.05, s7=.05))
+    for i in range(41):
+        t = 1_000_000 + 10_000 * i
+        f.predict(ImuReading(t, (0., 0., 0.), STILL))
+        if i % 10 == 0:
+            assert f.update_map_ground_point(MapGroundPointMeasurement(
+                t, 0., 0., ((.01, 0.), (0., .01)), 100.)).status.startswith("POSITION")
+            assert f.update_map_position(MapPositionMeasurement(
+                t, 0., 0., ((.01, 0.), (0., .01)))).status.startswith("POSITION")
+    w_, x_, y_, z_ = f.q
+    assert abs(np.arcsin(2 * (w_ * y_ - z_ * x_))) < .004

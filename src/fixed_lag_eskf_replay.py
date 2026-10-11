@@ -18,7 +18,8 @@ import numpy as np
 
 from .error_state_inertial_filter import (
     KIND_ORDER, BodyVelocityMeasurement, EskfSnapshot, InertialErrorStateFilter,
-    MapPositionMeasurement, YawMeasurement, measurement_kind,
+    MapGroundPointMeasurement, MapPositionMeasurement, YawMeasurement,
+    measurement_kind,
 )
 from .horizontal_visual_inertial_filter import VisualVelocityMeasurement
 from .imu_preintegration import ImuReading
@@ -72,7 +73,7 @@ def _measurement_valid(measurement: object) -> bool:
         elif isinstance(measurement, BodyVelocityMeasurement):
             values = (measurement.x_m_s, measurement.y_m_s)
             covariance = measurement.covariance_xy_m2_s2
-        elif isinstance(measurement, MapPositionMeasurement):
+        elif isinstance(measurement, (MapPositionMeasurement, MapGroundPointMeasurement)):
             w = float(measurement.ci_weight)
             if not np.isfinite(w) or w > 1. or (0. < w < 1. and not .01 <= w <= .99):
                 return False
@@ -139,6 +140,36 @@ class FixedLagEskfReplay:
     @property
     def stored_visual_count(self) -> int:
         return len(self._visual)
+
+    def attitude_at(self, timestamp_us: int) -> tuple[float, float, float, float]:
+        """Собственная ориентация РФК (FRD->NED) на момент экспозиции.
+
+        Берется сохраненное состояние на последнем отсчете ИИМ не позже
+        момента и доворачивается по угловой скорости (с оценкой смещения)
+        до этого момента. Внешняя ориентация автопилота не используется.
+        """
+        from .imu_preintegration import quat_exponential, quat_product
+        if self._checkpoint is None or self._checkpoint_imu is None:
+            raise ValueError("Нет истории ИИМ для ориентации")
+        if timestamp_us > self._latest_raw_time_us:
+            raise ValueError("Момент позже последнего отсчета ИИМ")
+        base, base_imu, after = self._checkpoint, self._checkpoint_imu, None
+        if timestamp_us < base_imu.timestamp_us:
+            raise ValueError("Момент раньше сохраненной истории")
+        for state, raw in zip(self._states, self._raw):
+            if raw.timestamp_us <= timestamp_us:
+                base, base_imu = state, raw
+            else:
+                after = raw
+                break
+        q = np.asarray(base.q, dtype=float)
+        if after is not None and timestamp_us > base_imu.timestamp_us:
+            dt = (timestamp_us - base_imu.timestamp_us) * 1e-6
+            omega = 0.5 * (np.asarray(base_imu.gyro_body_rad_s) +
+                           np.asarray(after.gyro_body_rad_s)) - base.bg
+            q = quat_product(q, quat_exponential(dt * omega))
+            q = q / np.linalg.norm(q)
+        return tuple(float(x) for x in q)
 
     def _trim(self) -> None:
         cutoff = self._latest_raw_time_us - self._lag_us

@@ -33,9 +33,13 @@ enum class MeasurementKind : std::uint8_t {
     VelocityNe = 0,      // VN, VE of the centre of mass, m/s
     BodyVelocityXy = 1,  // FRD x, y velocity of the centre of mass, m/s
     Yaw = 2,             // heading of FRD x axis from north, rad
-    PositionNe = 3       // local N, E position (orthophoto fix), m
+    PositionNe = 3,      // local N, E position (orthophoto fix), m
+    // N, E of the ground point hit by the camera optical axis (orthophoto
+    // match of the principal point). Attitude-free measurement; model
+    // z = p_NE + h (R d)_NE / (R d)_D couples it to the tilt states.
+    MapGroundPointNe = 4
 };
-constexpr std::size_t kMeasurementKinds = 4;
+constexpr std::size_t kMeasurementKinds = 5;
 
 struct Measurement {
     std::uint64_t time_us{0};
@@ -47,8 +51,11 @@ struct Measurement {
     // correlation with the filter is UNKNOWN (orthophoto fix computed
     // from the same frames as VO). 1: independent, standard update.
     // (0,1): full-state CI update with P/w and R/(1-w).
-    // <= 0: choose w on a fixed grid minimising det of the position block.
+    // <= 0: choose w on a fixed grid minimising det of the FULL posterior.
     double ci_weight{1.};
+    // MapGroundPointNe only: [height above ground plane along NED down, m;
+    // optical axis unit vector in FRD body axes x, y, z].
+    std::array<double, 4> aux{0., 0., 0., 1.};
 };
 
 [[nodiscard]] Measurement fromVisual(const Visual &visual) noexcept;
@@ -135,11 +142,18 @@ struct Workspace {
     std::array<Matrix15, 8> m{};
     std::array<double, 225> cholesky{};
     std::array<double, 180> noise_map{};
+    // Measurement update scratch (n <= 2 rows).
+    double h[2][15]{};
+    double pht[15][2]{};
+    double gain[15][2]{};
+    double dx[15]{};
 };
 
 class Filter {
 public:
     explicit Filter(const Parameters &config = Parameters{}) noexcept;
+    // Re-initialize in place (no temporary Filter on the stack).
+    void reset(const Parameters &config) noexcept;
 
     // Host convenience overloads: they place a Workspace (~16 KiB) on the
     // stack. RTOS code must use the explicit-workspace overloads.
@@ -194,13 +208,15 @@ private:
 class FixedLag {
 public:
     static constexpr std::size_t kImuCapacity = 64;
-    static constexpr std::size_t kVisualCapacity = 24;
+    static constexpr std::size_t kVisualCapacity = 32;
     static constexpr std::size_t kSnapshots = 4;
     static constexpr std::size_t kSnapshotStride = 12;
     static constexpr std::size_t kMaxFrameEvents = kMeasurementKinds;
 
     explicit FixedLag(const Parameters &parameters = Parameters{},
                       std::uint64_t max_lag_us = 300000U) noexcept;
+    // Re-initialize in place: discards all history (no large temporaries).
+    void reset(const Parameters &parameters, std::uint64_t max_lag_us) noexcept;
     [[nodiscard]] Status pushImu(const Imu &sample) noexcept;
     [[nodiscard]] Status pushDelayedVelocity(const Visual &sample) noexcept;
     [[nodiscard]] Status pushDelayed(const Measurement &sample) noexcept;
@@ -247,6 +263,7 @@ private:
     std::size_t count_{0};
     std::array<Measurement, kVisualCapacity> visual_{};
     std::array<Measurement, kVisualCapacity> candidate_{};
+    std::array<Measurement, kMaxFrameEvents> batch_{};
     std::size_t visual_count_{0};
     std::array<Snapshot, kSnapshots> snapshots_{};
     std::size_t since_snapshot_{0};

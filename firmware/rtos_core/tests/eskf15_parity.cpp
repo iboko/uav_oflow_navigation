@@ -39,13 +39,15 @@ int main() {
         make(1255000U,K::Yaw,.006,0.,.0004,0.,0.,1.),
         make(1255000U,K::PositionNe,.4,-.3,4.,.5,3.,0.)
     };
-    const ofnav15::Measurement early[2]={
+    ofnav15::Measurement early[3]={
         make(1120000U,K::VelocityNe,.07,.02,.04,0.,.04,1.),
-        make(1120000U,K::PositionNe,.1,.05,9.,0.,9.,1.)
+        make(1120000U,K::PositionNe,.1,.05,9.,0.,9.,1.),
+        make(1120000U,K::MapGroundPointNe,.3,-.2,.25,.02,.36,0.)
     };
-    ofnav15::Status s_late[4]{}, s_early[2]{};
+    early[2].aux={100.,.02,-.01,1.};
+    ofnav15::Status s_late[4]{}, s_early[3]{};
     (void)replay.pushDelayedFrame(late,4,s_late);
-    (void)replay.pushDelayedFrame(early,2,s_early);
+    (void)replay.pushDelayedFrame(early,3,s_early);
     for(const auto s:s_late) {
         if (!ofnav15::measurementProcessed(s)) {
             std::fprintf(stderr,"C++ delayed replay failure %s\n",ofnav15::statusName(s));
