@@ -9,6 +9,8 @@ on:
       - 'tools/run_px4_sitl_replay_smoke.sh'
       - 'src/export_px4_sitl_replay.py'
       - 'src/synthetic_sensor_bench.py'
+      - 'src/error_state_inertial_filter.py'
+      - 'src/fixed_lag_eskf_replay.py'
       - '.github/workflows/px4-sitl-module.yml'
   workflow_dispatch:
 
@@ -64,14 +66,18 @@ jobs:
             --results-csv build/px4_sitl_replay_input/evaluation/sensor_bench_results.csv \
             --camera-csv build/px4_sitl_replay_input/sensors/camera.csv \
             --imu-csv build/px4_sitl_replay_input/sensors/imu.csv \
-            --output-csv build/px4_sitl_replay_input/ofnav_sitl_replay.csv
+            --output-csv build/px4_sitl_replay_input/ofnav_sitl_replay.csv \
+            --eskf-events-csv build/px4_sitl_replay_input/eskf_events.csv \
+            --eskf-expected-json build/px4_sitl_replay_input/eskf_expected.json
 
-      - name: Runtime PX4 SITL POSIX read-only replay and 100m height safety
+      - name: Runtime PX4 SITL replay, live module start and in-PX4 ESKF parity
         run: |
           bash tools/run_px4_sitl_replay_smoke.sh \
             PX4-Autopilot \
             build/px4_sitl_replay_input/ofnav_sitl_replay.csv \
-            build/px4_sitl_runtime_results
+            build/px4_sitl_runtime_results \
+            build/px4_sitl_replay_input/eskf_events.csv \
+            build/px4_sitl_replay_input/eskf_expected.json
 
       - name: Archive PX4 SITL diagnostic replay proof
         uses: actions/upload-artifact@v4
@@ -84,5 +90,8 @@ jobs:
             build/px4_sitl_runtime_results/px4_sitl_boot.log
             build/px4_sitl_runtime_results/ofnav_sitl_replay.log
             build/px4_sitl_runtime_results/ofnav_sitl_replay_camera.log
+            build/px4_sitl_runtime_results/ofnav_live.log
+            build/px4_sitl_runtime_results/ofnav_sitl_eskf.log
+            build/px4_sitl_replay_input/eskf_expected.json
           if-no-files-found: warn
           retention-days: 30

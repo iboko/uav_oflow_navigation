@@ -21,10 +21,12 @@
 #include <cstdio>
 
 #include "ofnav/ofnav.hpp"
+#include "ofnav/eskf_runner.hpp"
 
-// Flight builds never include the POSIX-only synthetic CSV replay command.
+// Flight builds never include the POSIX-only synthetic CSV replay commands.
 #if defined(__PX4_POSIX)
 int ofnav_sitl_csv_replay(const char *filename, ofnav::SensorProfile profile);
+int ofnav_sitl_eskf_replay(const char *filename);
 #endif
 
 namespace {
@@ -33,6 +35,17 @@ constexpr uint64_t kMainLoopTimeoutMs = 100;
 constexpr unsigned kDefaultRateHz = 100U;
 constexpr unsigned kMinRateHz = 20U;
 constexpr unsigned kMaxRateHz = 250U;
+// Task stack: measured filter call chain <= 2.1 KiB on the host
+// (tests/eskf15_benchmark.cpp, budget 3 KiB) + module loop, uORB and
+// logging. Must be re-checked on the target with 'top' / stack monitor.
+constexpr int kTaskStackBytes = 8192;
+constexpr uint64_t kEskfPublishPeriodUs = 100000U;
+constexpr uint64_t kMaxAttitudeAgeUs = 100000U;
+
+static uint64_t px4_clock()
+{
+    return hrt_absolute_time();
+}
 
 static float safe_div(float n, uint32_t dt_us) noexcept
 {
@@ -100,13 +113,20 @@ class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
     Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range,
-          ofnav::SensorProfile profile) :
+          ofnav::SensorProfile profile, bool eskf_enabled) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
         _profile(profile),
         _runtime(ofnav::makeProfileConfig(profile, min_quality))
     {
+        // The 15-state ESKF runs as a DIAGNOSTIC estimator in this task.
+        // Its output goes to debug_vect only, never to EKF2 or control.
+        _eskf.configure(ofnav::EskfRunnerConfig{}, &px4_clock);
+
+        if (!eskf_enabled) {
+            _eskf.disable();
+        }
     }
 
     ~Ofnav() override
@@ -122,7 +142,7 @@ public:
         _task_id = px4_task_spawn_cmd("ofnav",
                                       SCHED_DEFAULT,
                                       SCHED_PRIORITY_DEFAULT + 20,
-                                      4096,
+                                      kTaskStackBytes,
                                       reinterpret_cast<px4_main_t>(&run_trampoline),
                                       argv);
 
@@ -140,13 +160,14 @@ public:
         unsigned min_quality = 120U;
         bool strict_downward_range = true;
         bool publish_ev_velocity = false;
+        bool eskf_enabled = true;
         ofnav::SensorProfile profile = ofnav::SensorProfile::OpticalFlowSensor;
 
         int ch = 0;
         int myoptind = 1;
         const char *myoptarg = nullptr;
 
-        while ((ch = px4_getopt(argc, argv, "r:q:p:ne", &myoptind, &myoptarg)) != EOF) {
+        while ((ch = px4_getopt(argc, argv, "r:q:p:nde", &myoptind, &myoptarg)) != EOF) {
             switch (ch) {
             case 'r': {
                     const int value = std::atoi(myoptarg);
@@ -172,6 +193,10 @@ public:
                 strict_downward_range = false;
                 break;
 
+            case 'd':
+                eskf_enabled = false;
+                break;
+
             case 'e':
                 publish_ev_velocity = true;
                 break;
@@ -189,7 +214,8 @@ public:
             PX4_ERR("external velocity fusion unavailable: no validated vertical velocity");
             return nullptr;
         }
-        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, profile);
+        return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, profile,
+                         eskf_enabled);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -203,6 +229,10 @@ public:
             }
 
             return ofnav_sitl_csv_replay(argv[1], profile);
+        }
+
+        if (argc == 2 && std::strcmp(argv[0], "sitl-eskf") == 0) {
+            return ofnav_sitl_eskf_replay(argv[1]);
         }
 #endif
         return print_usage("unknown command");
@@ -228,6 +258,11 @@ The module subscribes to uORB topics:
 It publishes debug_vect diagnostics:
 - OFNAV_V: estimated VN, VE and mode
 - OFNAV_H: height, quality and reject/accept reason code
+- OFNAV_E: 15-state ESKF VN, VE and 100*runner_mode + filter status
+- OFNAV_T: ESKF worst frame replay us, worst IMU step us, max replay length
+
+The 15-state ESKF is aligned on the ground (static alignment, autopilot yaw)
+and aided by the body-frame flow velocity. It is a diagnostic estimator.
 
 Optional fusion-output path:
 - -e is rejected until a validated 3D velocity source is available
@@ -243,11 +278,13 @@ Fusion output is not supported. The -e option is intentionally rejected.
         PRINT_MODULE_USAGE_PARAM_INT('q', 120, 0, 255, "Minimum optical-flow quality", true);
         PRINT_MODULE_USAGE_PARAM_STRING('p', "flow", "flow|camera", "Measurement envelope: optical-flow sensor 0.2-4 m or downward camera VO 5-120 m", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
+        PRINT_MODULE_USAGE_PARAM_FLAG('d', "Disable the diagnostic 15-state ESKF", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
 #if defined(__PX4_POSIX)
         PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-replay", "<csv> [flow|camera]: read a synthetic sensor CSV through C++ diagnostics only; no uORB publish, EKF2 or control");
+        PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-eskf", "<csv>: run the 15-state fixed-lag ESKF on a synthetic IMU+VO stream inside PX4; no uORB publish");
 #endif
         return 0;
     }
@@ -264,6 +301,28 @@ Fusion output is not supported. The -e option is intentionally rejected.
                  static_cast<unsigned long>(_accepted),
                  static_cast<unsigned long>(_degraded),
                  static_cast<unsigned long>(_failsafe));
+        const auto &st = _eskf.stats();
+        const auto &f = _eskf.filter();
+        PX4_INFO("eskf mode=%u init=%u status=%s align=%s restarts=%lu",
+                 static_cast<unsigned>(_eskf.mode()), static_cast<unsigned>(_eskf.initSource()),
+                 ofnav15::statusName(st.last_status), ofnav15::alignmentStatusName(st.last_alignment),
+                 static_cast<unsigned long>(st.filter_restarts));
+        PX4_INFO("eskf imu=%lu vel=%lu processed=%lu deferred=%lu dropped=%lu clip=%lu",
+                 static_cast<unsigned long>(st.imu_samples), static_cast<unsigned long>(st.velocity_events),
+                 static_cast<unsigned long>(st.velocity_processed),
+                 static_cast<unsigned long>(st.velocity_deferred),
+                 static_cast<unsigned long>(st.velocity_dropped),
+                 static_cast<unsigned long>(st.clipping_resets));
+        PX4_INFO("eskf time imu worst/mean=%llu/%llu us frame worst/mean=%llu/%llu us replay<=%u",
+                 static_cast<unsigned long long>(st.imu_worst_us),
+                 static_cast<unsigned long long>(st.imu_samples ? st.imu_total_us / st.imu_samples : 0U),
+                 static_cast<unsigned long long>(st.frame_worst_us),
+                 static_cast<unsigned long long>(st.velocity_processed + st.velocity_dropped ?
+                         st.frame_total_us / (st.velocity_processed + st.velocity_dropped) : 0U),
+                 static_cast<unsigned>(st.max_replay_length));
+        PX4_INFO("eskf v=(%.3f %.3f %.3f) bg=(%.4f %.4f %.4f)",
+                 f.velocity()[0], f.velocity()[1], f.velocity()[2],
+                 f.gyroBias()[0], f.gyroBias()[1], f.gyroBias()[2]);
         return 0;
     }
 
@@ -323,6 +382,17 @@ Fusion output is not supported. The -e option is intentionally rejected.
             if (imu_updated) {
                 // Independent IMU prediction, regardless of optical-flow rate.
                 _runtime.predictImu(imu, attitude);
+                const bool att_fresh = att_msg.timestamp != 0U &&
+                                       now_us >= att_msg.timestamp &&
+                                       now_us - att_msg.timestamp <= kMaxAttitudeAgeUs;
+                _eskf.addImuDelta(imu_msg.timestamp_sample,
+                {imu_msg.delta_angle[0], imu_msg.delta_angle[1], imu_msg.delta_angle[2]},
+                imu_msg.delta_angle_dt,
+                {imu_msg.delta_velocity[0], imu_msg.delta_velocity[1], imu_msg.delta_velocity[2]},
+                imu_msg.delta_velocity_dt,
+                imu_msg.delta_angle_clipping != 0U || imu_msg.delta_velocity_clipping != 0U,
+                {att_msg.q[0], att_msg.q[1], att_msg.q[2], att_msg.q[3]}, att_fresh);
+                publish_eskf(now_us);
             }
             if (!flow_updated) {
                 // A watchdog must keep running when optical flow stops.
@@ -341,6 +411,13 @@ Fusion output is not supported. The -e option is intentionally rejected.
 
             const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude, now_us);
             ++_samples;
+
+            if (out.flow.accepted) {
+                // Body-frame centre-of-mass velocity of this flow interval:
+                // independent of the autopilot heading used for NE output.
+                _eskf.addBodyVelocity(flow.time_us, out.flow.velocity_body_m_s.x,
+                                      out.flow.velocity_body_m_s.y, out.flow.velocity_sigma_m_s);
+            }
 
             if (out.mode == ofnav::NavMode::FlowNav) {
                 ++_accepted;
@@ -429,6 +506,43 @@ private:
         return ofnav::AttitudeSample{msg.timestamp_sample, roll, pitch, yaw};
     }
 
+    void publish_eskf(uint64_t now_us)
+    {
+        if (_eskf.mode() == ofnav::EskfRunnerMode::Disabled ||
+            now_us - _last_eskf_pub_us < kEskfPublishPeriodUs) {
+            return;
+        }
+
+        _last_eskf_pub_us = now_us;
+        const auto &f = _eskf.filter();
+        const auto &st = _eskf.stats();
+        debug_vect_s state{};
+        state.timestamp = now_us;
+        set_debug_name(state, "OFNAV_E");
+        state.x = static_cast<float>(f.velocity()[0]);
+        state.y = static_cast<float>(f.velocity()[1]);
+        state.z = static_cast<float>(100U * static_cast<unsigned>(_eskf.mode()) +
+                                     static_cast<unsigned>(st.last_status));
+        publish_vect(state, _debug_eskf_pub, _debug_eskf_instance);
+        debug_vect_s timing{};
+        timing.timestamp = now_us;
+        set_debug_name(timing, "OFNAV_T");
+        timing.x = static_cast<float>(st.frame_worst_us);
+        timing.y = static_cast<float>(st.imu_worst_us);
+        timing.z = static_cast<float>(st.max_replay_length);
+        publish_vect(timing, _debug_timing_pub, _debug_timing_instance);
+    }
+
+    static void publish_vect(const debug_vect_s &msg, orb_advert_t &pub, int &instance)
+    {
+        if (pub == nullptr) {
+            pub = orb_advertise_multi(ORB_ID(debug_vect), &msg, &instance);
+
+        } else {
+            orb_publish(ORB_ID(debug_vect), pub, &msg);
+        }
+    }
+
     void publish_debug(const ofnav::RuntimeOutput &out, uint8_t quality)
     {
         debug_vect_s vel{};
@@ -472,6 +586,12 @@ private:
     int _imu_sub{-1};
     int _att_sub{-1};
 
+    orb_advert_t _debug_eskf_pub{nullptr};
+    orb_advert_t _debug_timing_pub{nullptr};
+    int _debug_eskf_instance{-1};
+    int _debug_timing_instance{-1};
+    uint64_t _last_eskf_pub_us{0U};
+    ofnav::EskfRunner _eskf{};
     orb_advert_t _debug_vel_pub{nullptr};
     orb_advert_t _debug_health_pub{nullptr};
     int _debug_vel_instance{-1};
