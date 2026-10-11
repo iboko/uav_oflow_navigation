@@ -3,6 +3,7 @@ import importlib.util
 import struct
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytest.importorskip("cv2")
@@ -141,3 +142,27 @@ def test_importer_rejects_invalid_cli_parameters_before_file_access(tmp_path, mo
         bag.main()
     assert exc.value.code == 2
     assert not (tmp_path / "output").exists()
+
+
+def test_imu_sample_times_follow_sequence_clock_not_receive_bursts():
+    rng = np.random.default_rng(3)
+    seq = np.arange(1000, 1400)
+    seq = np.delete(seq, [50, 51, 200])  # dropped packets
+    true_t = 100.0 + (seq - 1000) * 0.0025
+    receive = true_t + 0.004 + rng.uniform(0.0, 0.03, len(seq))  # bursts, >= 4 ms lag
+    imu = [(float(t), (0., 0., 0., 1.), (0., 0., 0.), (0., 0., -9.8), int(s))
+           for t, s in zip(receive, seq)][::-1]
+    out, info = bag.sample_times_from_seq(imu)
+    fitted = np.array([r[0] for r in out])
+    assert [r[4] for r in out] == sorted(seq.tolist())
+    assert info["dropped_samples"] == 3
+    assert info["rate_hz"] == pytest.approx(400.0, rel=1e-3)
+    # Uniform grid; the lower envelope keeps only the minimum transport lag.
+    assert np.allclose(np.diff(fitted) / np.diff(seq), 0.0025, rtol=1e-3)
+    assert np.max(np.abs(fitted - (true_t + 0.004))) < 0.002
+
+
+def test_imu_with_implausible_rate_is_refused():
+    imu = [(float(k), (0., 0., 0., 1.), (0., 0., 0.), (0., 0., -9.8), k) for k in range(200)]
+    with pytest.raises(SystemExit, match="period"):
+        bag.sample_times_from_seq(imu)
