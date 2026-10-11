@@ -7,11 +7,15 @@
 #include <drivers/drv_hrt.h>
 
 #include <uORB/uORB.h>
+#include <uORB/Publication.hpp>
 #include <uORB/topics/sensor_optical_flow.h>
 #include <uORB/topics/distance_sensor.h>
 #include <uORB/topics/vehicle_imu.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/debug_vect.h>
+#include <uORB/topics/vehicle_command.h>
+#include <uORB/topics/vehicle_status.h>
+#include <commander/px4_custom_mode.h>
 
 #include <poll.h>
 #include <unistd.h>
@@ -113,7 +117,7 @@ class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
     Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range,
-          ofnav::SensorProfile profile, bool eskf_enabled) :
+          ofnav::SensorProfile profile, bool eskf_enabled, bool actions_enabled) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
@@ -123,6 +127,7 @@ public:
         // The 15-state ESKF runs as a DIAGNOSTIC estimator in this task.
         // Its output goes to debug_vect only, never to EKF2 or control.
         _eskf.configure(ofnav::EskfRunnerConfig{}, &px4_clock);
+        _actions_enabled = actions_enabled;
 
         if (!eskf_enabled) {
             _eskf.disable();
@@ -135,6 +140,7 @@ public:
         if (_range_sub >= 0) { orb_unsubscribe(_range_sub); }
         if (_imu_sub >= 0) { orb_unsubscribe(_imu_sub); }
         if (_att_sub >= 0) { orb_unsubscribe(_att_sub); }
+        if (_status_sub >= 0) { orb_unsubscribe(_status_sub); }
     }
 
     static int task_spawn(int argc, char *argv[])
@@ -161,13 +167,14 @@ public:
         bool strict_downward_range = true;
         bool publish_ev_velocity = false;
         bool eskf_enabled = true;
+        bool actions_enabled = false;
         ofnav::SensorProfile profile = ofnav::SensorProfile::OpticalFlowSensor;
 
         int ch = 0;
         int myoptind = 1;
         const char *myoptarg = nullptr;
 
-        while ((ch = px4_getopt(argc, argv, "r:q:p:nde", &myoptind, &myoptarg)) != EOF) {
+        while ((ch = px4_getopt(argc, argv, "r:q:p:ndae", &myoptind, &myoptarg)) != EOF) {
             switch (ch) {
             case 'r': {
                     const int value = std::atoi(myoptarg);
@@ -197,6 +204,10 @@ public:
                 eskf_enabled = false;
                 break;
 
+            case 'a':
+                actions_enabled = true;
+                break;
+
             case 'e':
                 publish_ev_velocity = true;
                 break;
@@ -215,7 +226,7 @@ public:
             return nullptr;
         }
         return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, profile,
-                         eskf_enabled);
+                         eskf_enabled, actions_enabled);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -268,7 +279,14 @@ Optional fusion-output path:
 - -e is rejected until a validated 3D velocity source is available
 - never substitute invented vertical speed for missing measurements
 
-Safe-by-default behavior: this module does not command actuators.
+Safety reactions: a debounced, escalating SafetyActionManager maps the
+navigation mode to NONE / ALTITUDE_HOLD / LAND / MANUAL_TAKEOVER and
+publishes it as OFNAV_A. Only with -a, and only while armed, each NEW
+action is sent once as vehicle_command (DO_SET_MODE ALTCTL or
+STABILIZED, NAV_LAND). It never commands a return to position mode.
+
+Safe-by-default behavior: without -a this module does not command
+the vehicle. It never drives actuators directly.
 Fusion output is not supported. The -e option is intentionally rejected.
 )DESCR_STR");
 
@@ -279,6 +297,7 @@ Fusion output is not supported. The -e option is intentionally rejected.
         PRINT_MODULE_USAGE_PARAM_STRING('p', "flow", "flow|camera", "Measurement envelope: optical-flow sensor 0.2-4 m or downward camera VO 5-120 m", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('d', "Disable the diagnostic 15-state ESKF", true);
+        PRINT_MODULE_USAGE_PARAM_FLAG('a', "Send safety actions as vehicle_command while armed (SITL/bench first)", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND("status");
@@ -301,6 +320,9 @@ Fusion output is not supported. The -e option is intentionally rejected.
                  static_cast<unsigned long>(_accepted),
                  static_cast<unsigned long>(_degraded),
                  static_cast<unsigned long>(_failsafe));
+        PX4_INFO("safety action=%s reason=%s commands=%s sent=%lu",
+                 ofnav::toString(_last_decision.action), ofnav::toString(_last_decision.reason),
+                 _actions_enabled ? "armed-only" : "advisory", static_cast<unsigned long>(_commands_sent));
         const auto &st = _eskf.stats();
         const auto &f = _eskf.filter();
         PX4_INFO("eskf mode=%u init=%u status=%s align=%s restarts=%lu",
@@ -332,6 +354,7 @@ Fusion output is not supported. The -e option is intentionally rejected.
         _range_sub = orb_subscribe(ORB_ID(distance_sensor));
         _imu_sub = orb_subscribe(ORB_ID(vehicle_imu));
         _att_sub = orb_subscribe(ORB_ID(vehicle_attitude));
+        _status_sub = orb_subscribe(ORB_ID(vehicle_status));
 
         if (_flow_sub < 0 || _range_sub < 0 || _imu_sub < 0 || _att_sub < 0) {
             PX4_ERR("failed to subscribe to required uORB topics");
@@ -376,6 +399,11 @@ Fusion output is not supported. The -e option is intentionally rejected.
             if (imu_updated) { orb_copy(ORB_ID(vehicle_imu), _imu_sub, &imu_msg); }
             if (att_updated) { orb_copy(ORB_ID(vehicle_attitude), _att_sub, &att_msg); }
 
+            bool status_updated = false;
+            orb_check(_status_sub, &status_updated);
+
+            if (status_updated) { orb_copy(ORB_ID(vehicle_status), _status_sub, &_status_msg); }
+
             const uint64_t now_us = hrt_absolute_time();
             const auto imu = make_imu(imu_msg);
             const auto attitude = make_attitude(att_msg);
@@ -401,6 +429,7 @@ Fusion output is not supported. The -e option is intentionally rejected.
                                         make_range(flow_msg, range_msg), make_flow(flow_msg),
                                         attitude);
                     publish_debug(health, flow_msg.quality);
+                    handle_safety(health, now_us);
                     _last_health_pub_us = now_us;
                 }
                 continue;
@@ -430,6 +459,7 @@ Fusion output is not supported. The -e option is intentionally rejected.
             }
 
             publish_debug(out, flow_msg.quality);
+            handle_safety(out, now_us);
             _last_health_pub_us = now_us;
 
         }
@@ -543,6 +573,64 @@ private:
         }
     }
 
+    void handle_safety(const ofnav::RuntimeOutput &out, uint64_t now_us)
+    {
+        _last_decision = _safety.update(out.mode, now_us);
+        debug_vect_s action{};
+        action.timestamp = now_us;
+        set_debug_name(action, "OFNAV_A");
+        action.x = static_cast<float>(_last_decision.action);
+        action.y = static_cast<float>(out.mode);
+        action.z = static_cast<float>(_commands_sent);
+        publish_vect(action, _debug_action_pub, _debug_action_instance);
+
+        const bool armed = _status_msg.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+
+        if (!_last_decision.changed || !_actions_enabled || !armed) {
+            return;
+        }
+
+        vehicle_command_s cmd{};
+        cmd.timestamp = now_us;
+        cmd.target_system = _status_msg.system_id;
+        cmd.target_component = _status_msg.component_id;
+        cmd.source_system = _status_msg.system_id;
+        cmd.source_component = _status_msg.component_id;
+        cmd.confirmation = 0;
+        cmd.from_external = false;
+
+        switch (_last_decision.action) {
+        case ofnav::SafetyAction::AltitudeHold:
+            cmd.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+            cmd.param1 = 1.0f;  // MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+            cmd.param2 = static_cast<float>(PX4_CUSTOM_MAIN_MODE_ALTCTL);
+            break;
+
+        case ofnav::SafetyAction::ManualTakeover:
+            cmd.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+            cmd.param1 = 1.0f;
+            cmd.param2 = static_cast<float>(PX4_CUSTOM_MAIN_MODE_STABILIZED);
+            break;
+
+        case ofnav::SafetyAction::Land:
+            cmd.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
+            // Land in place: no latitude/longitude/altitude given.
+            cmd.param5 = static_cast<double>(NAN);
+            cmd.param6 = static_cast<double>(NAN);
+            cmd.param7 = NAN;
+            break;
+
+        case ofnav::SafetyAction::None:
+            return;  // never command a return to a position mode
+        }
+
+        // Queued topic (ORB_QUEUE_LENGTH from the message definition).
+        _command_pub.publish(cmd);
+        ++_commands_sent;
+        PX4_WARN("ofnav safety action %s (%s)", ofnav::toString(_last_decision.action),
+                 ofnav::toString(_last_decision.reason));
+    }
+
     void publish_debug(const ofnav::RuntimeOutput &out, uint8_t quality)
     {
         debug_vect_s vel{};
@@ -586,6 +674,15 @@ private:
     int _imu_sub{-1};
     int _att_sub{-1};
 
+    bool _actions_enabled{false};
+    int _status_sub{-1};
+    vehicle_status_s _status_msg{};
+    ofnav::SafetyActionManager _safety{};
+    ofnav::SafetyDecision _last_decision{};
+    uORB::Publication<vehicle_command_s> _command_pub{ORB_ID(vehicle_command)};
+    orb_advert_t _debug_action_pub{nullptr};
+    int _debug_action_instance{-1};
+    uint32_t _commands_sent{0U};
     orb_advert_t _debug_eskf_pub{nullptr};
     orb_advert_t _debug_timing_pub{nullptr};
     int _debug_eskf_instance{-1};

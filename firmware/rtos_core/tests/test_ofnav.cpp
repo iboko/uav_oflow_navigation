@@ -377,6 +377,66 @@ void test_camera_profile_ekf_uses_estimator_sigma() {
     assert(out.state.vn_m_s > 0.0F && out.state.vn_m_s < 0.3F);
 }
 
+void test_safety_failsafe_is_debounced_then_latched_land() {
+    ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    assert(m.update(NavMode::FlowNav, 1000000U).action == SafetyAction::None);
+    // A single 100 ms FAILSAFE glitch does not land the vehicle.
+    assert(m.update(NavMode::FailsafeLand, 1100000U).action == SafetyAction::None);
+    assert(m.update(NavMode::FailsafeLand, 1200000U).action == SafetyAction::None);
+    assert(m.update(NavMode::FlowNav, 1210000U).action == SafetyAction::None);
+    // Persisting failsafe lands; land is latched against later recovery.
+    (void)m.update(NavMode::FailsafeLand, 2000000U);
+    const auto land = m.update(NavMode::FailsafeLand, 2200000U);
+    assert(land.action == SafetyAction::Land && land.changed && land.latched);
+    assert(land.reason == ofnav::SafetyReason::FailsafeConfirmed);
+    assert(m.update(NavMode::FlowNav, 9000000U).action == SafetyAction::Land);
+    assert(!m.update(NavMode::FlowNav, 9100000U).changed);
+    m.reset();
+    assert(m.update(NavMode::FlowNav, 9200000U).action == SafetyAction::None);
+}
+
+void test_safety_degraded_hold_escalates_and_recovers_with_hysteresis() {
+    ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    (void)m.update(NavMode::FlowNav, 1000000U);
+    (void)m.update(NavMode::DegradedHold, 1100000U);
+    assert(m.update(NavMode::DegradedHold, 1300000U).action == SafetyAction::None);
+    const auto hold = m.update(NavMode::DegradedHold, 1400000U);
+    assert(hold.action == SafetyAction::AltitudeHold && hold.changed);
+    // Short healthy interval keeps the hold (hysteresis).
+    (void)m.update(NavMode::FlowNav, 1500000U);
+    assert(m.update(NavMode::FlowNav, 2000000U).action == SafetyAction::AltitudeHold);
+    const auto rec = m.update(NavMode::FlowNav, 2500000U);
+    assert(rec.action == SafetyAction::None && rec.reason == ofnav::SafetyReason::Recovered);
+    // Intermittent degradation without 1 s of recovery escalates to land.
+    uint64_t t = 3000000U;
+    ofnav::SafetyDecision d{};
+    for (int i = 0; i < 12; ++i) {
+        d = m.update(NavMode::DegradedHold, t);
+        t += 400000U;
+        d = m.update(NavMode::FlowNav, t);
+        t += 200000U;
+    }
+    assert(d.action == SafetyAction::Land && d.latched);
+}
+
+void test_safety_manual_request_and_time_reversal() {
+    ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    (void)m.update(NavMode::FlowNav, 1000000U);
+    const auto manual = m.update(NavMode::ManualRequired, 1010000U);
+    assert(manual.action == SafetyAction::ManualTakeover && manual.latched);
+    ofnav::SafetyActionManager clock{};
+    (void)clock.update(NavMode::FlowNav, 2000000U);
+    const auto back = clock.update(NavMode::FlowNav, 1000000U);
+    assert(back.action == SafetyAction::Land);
+    assert(back.reason == ofnav::SafetyReason::NonMonotonicTime);
+}
+
 } // namespace
 
 int main() {
@@ -403,6 +463,9 @@ int main() {
     test_camera_profile_accepts_100m_with_height_scaled_sigma();
     test_camera_profile_rejects_coarse_measurement_by_uncertainty();
     test_camera_profile_ekf_uses_estimator_sigma();
+    test_safety_failsafe_is_debounced_then_latched_land();
+    test_safety_degraded_hold_escalates_and_recovers_with_hysteresis();
+    test_safety_manual_request_and_time_reversal();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }

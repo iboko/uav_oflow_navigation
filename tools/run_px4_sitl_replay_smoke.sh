@@ -75,14 +75,16 @@ if ! grep -Eq 'OFNAV_SITL_REPLAY_OK profile=DOWNWARD_CAMERA_VO rows=[1-9][0-9]* 
   exit 1
 fi
 
-# 3) The live module starts with the camera profile and the diagnostic
-# 15-state ESKF (no sensors in the shell model: it must stay aligning).
-"$OFNAV_CLIENT" start -p camera > "$OUT/ofnav_live.log" 2>&1
+# 3) The live module starts with the camera profile, the diagnostic
+# 15-state ESKF (no sensors in the shell model: it must stay aligning) and
+# opt-in safety actions, which must never be sent while DISARMED.
+"$OFNAV_CLIENT" start -p camera -a > "$OUT/ofnav_live.log" 2>&1
 sleep 1
 "$OFNAV_CLIENT" status >> "$OUT/ofnav_live.log" 2>&1
 "$OFNAV_CLIENT" stop >> "$OUT/ofnav_live.log" 2>&1 || true
 if ! grep -q 'profile=DOWNWARD_CAMERA_VO' "$OUT/ofnav_live.log" ||
-   ! grep -q 'eskf mode=1' "$OUT/ofnav_live.log"; then
+   ! grep -q 'eskf mode=1' "$OUT/ofnav_live.log" ||
+   ! grep -q 'commands=armed-only sent=0' "$OUT/ofnav_live.log"; then
   echo "Live ofnav module with ESKF diagnostics did not start" >&2
   cat "$OUT/ofnav_live.log" >&2
   exit 1

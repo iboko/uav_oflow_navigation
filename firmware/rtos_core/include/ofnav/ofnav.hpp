@@ -98,6 +98,40 @@ enum class NavMode : uint8_t {
     ManualRequired
 };
 
+// Reaction requested from the autopilot for the current navigation health.
+// The autopilot integration decides whether it is executed (opt-in).
+enum class SafetyAction : uint8_t {
+    None = 0,          // no request; never commands a return to position mode
+    AltitudeHold = 1,  // stop relying on horizontal navigation: altitude mode
+    Land = 2,          // latched: land in place
+    ManualTakeover = 3 // latched: hand over to the pilot (stabilized mode)
+};
+
+struct SafetyActionConfig {
+    uint64_t failsafe_confirm_us{200000U};   // FAILSAFE_LAND must persist
+    uint64_t degraded_confirm_us{300000U};   // DEGRADED_HOLD must persist
+    uint64_t degraded_to_land_us{5000000U};  // unrecovered degradation -> land
+    uint64_t recovery_us{1000000U};          // healthy FLOW_NAV clears hold
+};
+
+enum class SafetyReason : uint8_t {
+    Nominal = 0,
+    DegradedConfirmed,
+    DegradedTooLong,
+    FailsafeConfirmed,
+    ManualRequested,
+    Recovered,
+    NonMonotonicTime
+};
+
+struct SafetyDecision {
+    SafetyAction action{SafetyAction::None};
+    SafetyReason reason{SafetyReason::Nominal};
+    bool changed{false};
+    bool latched{false};
+    uint64_t action_since_us{0U};
+};
+
 struct HealthFlags {
     bool imu_valid{false};
     bool range_valid{false};
@@ -248,6 +282,36 @@ public:
 private:
     Config cfg_{};
 };
+
+// Debounced, escalating and latching mapping NavMode -> SafetyAction.
+// Land and ManualTakeover are latched until reset() (pilot / ground crew).
+// AltitudeHold clears to None only after recovery_us of healthy FLOW_NAV;
+// the manager never requests a return to a horizontal-position mode.
+class SafetyActionManager final {
+public:
+    explicit SafetyActionManager(SafetyActionConfig cfg = SafetyActionConfig{}) noexcept
+        : cfg_(cfg) {}
+
+    [[nodiscard]] SafetyDecision update(NavMode mode, uint64_t now_us) noexcept;
+    void reset() noexcept;
+    [[nodiscard]] SafetyAction action() const noexcept { return action_; }
+
+private:
+    SafetyDecision decide(SafetyAction action, SafetyReason reason, uint64_t now_us) noexcept;
+
+    SafetyActionConfig cfg_{};
+    SafetyAction action_{SafetyAction::None};
+    NavMode last_mode_{NavMode::Standby};
+    uint64_t mode_since_us_{0U};
+    uint64_t degraded_since_us_{0U};
+    uint64_t action_since_us_{0U};
+    uint64_t last_us_{0U};
+    bool started_{false};
+    bool degraded_episode_{false};
+};
+
+[[nodiscard]] const char* toString(SafetyAction action) noexcept;
+[[nodiscard]] const char* toString(SafetyReason reason) noexcept;
 
 class OfNavRuntime final {
 public:

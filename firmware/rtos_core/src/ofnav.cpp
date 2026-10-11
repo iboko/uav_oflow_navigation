@@ -621,4 +621,95 @@ RuntimeOutput OfNavRuntime::monitor(uint64_t now_us,
     return status;
 }
 
+const char* toString(SafetyAction action) noexcept {
+    switch (action) {
+    case SafetyAction::None: return "NONE";
+    case SafetyAction::AltitudeHold: return "ALTITUDE_HOLD";
+    case SafetyAction::Land: return "LAND";
+    case SafetyAction::ManualTakeover: return "MANUAL_TAKEOVER";
+    }
+    return "UNKNOWN";
+}
+
+const char* toString(SafetyReason reason) noexcept {
+    switch (reason) {
+    case SafetyReason::Nominal: return "NOMINAL";
+    case SafetyReason::DegradedConfirmed: return "DEGRADED_CONFIRMED";
+    case SafetyReason::DegradedTooLong: return "DEGRADED_TOO_LONG";
+    case SafetyReason::FailsafeConfirmed: return "FAILSAFE_CONFIRMED";
+    case SafetyReason::ManualRequested: return "MANUAL_REQUESTED";
+    case SafetyReason::Recovered: return "RECOVERED";
+    case SafetyReason::NonMonotonicTime: return "NON_MONOTONIC_TIME";
+    }
+    return "UNKNOWN";
+}
+
+void SafetyActionManager::reset() noexcept {
+    action_ = SafetyAction::None;
+    last_mode_ = NavMode::Standby;
+    mode_since_us_ = degraded_since_us_ = action_since_us_ = last_us_ = 0U;
+    started_ = false;
+    degraded_episode_ = false;
+}
+
+SafetyDecision SafetyActionManager::decide(SafetyAction action, SafetyReason reason,
+                                           uint64_t now_us) noexcept {
+    SafetyDecision d{};
+    d.changed = action != action_;
+    if (d.changed) {
+        action_ = action;
+        action_since_us_ = now_us;
+    }
+    d.action = action_;
+    d.reason = reason;
+    d.latched = action_ == SafetyAction::Land || action_ == SafetyAction::ManualTakeover;
+    d.action_since_us = action_since_us_;
+    return d;
+}
+
+SafetyDecision SafetyActionManager::update(NavMode mode, uint64_t now_us) noexcept {
+    if (started_ && now_us < last_us_) {
+        // A clock running backwards invalidates every timeout: fail safe.
+        return decide(action_ == SafetyAction::ManualTakeover ? action_ : SafetyAction::Land,
+                      SafetyReason::NonMonotonicTime, now_us);
+    }
+    if (!started_ || mode != last_mode_) {
+        mode_since_us_ = now_us;
+        last_mode_ = mode;
+        started_ = true;
+    }
+    last_us_ = now_us;
+    const uint64_t in_mode = now_us - mode_since_us_;
+    if (mode == NavMode::DegradedHold || mode == NavMode::FailsafeLand) {
+        if (!degraded_episode_) {
+            degraded_episode_ = true;
+            degraded_since_us_ = now_us;
+        }
+    } else if (mode == NavMode::FlowNav && in_mode >= cfg_.recovery_us) {
+        degraded_episode_ = false;
+    }
+    const SafetyAction current = action_;
+    if (current == SafetyAction::Land || current == SafetyAction::ManualTakeover) {
+        return decide(current, SafetyReason::Nominal, now_us);  // latched
+    }
+    if (mode == NavMode::ManualRequired) {
+        return decide(SafetyAction::ManualTakeover, SafetyReason::ManualRequested, now_us);
+    }
+    if (mode == NavMode::FailsafeLand && in_mode >= cfg_.failsafe_confirm_us) {
+        return decide(SafetyAction::Land, SafetyReason::FailsafeConfirmed, now_us);
+    }
+    if (degraded_episode_ && now_us - degraded_since_us_ >= cfg_.degraded_to_land_us) {
+        return decide(SafetyAction::Land, SafetyReason::DegradedTooLong, now_us);
+    }
+    if ((mode == NavMode::DegradedHold || mode == NavMode::FailsafeLand) &&
+        in_mode >= cfg_.degraded_confirm_us) {
+        return decide(SafetyAction::AltitudeHold, SafetyReason::DegradedConfirmed, now_us);
+    }
+    if (current == SafetyAction::AltitudeHold && mode == NavMode::FlowNav &&
+        in_mode >= cfg_.recovery_us) {
+        return decide(SafetyAction::None, SafetyReason::Recovered, now_us);
+    }
+    return decide(current, SafetyReason::Nominal, now_us);
+}
+
 } // namespace ofnav
