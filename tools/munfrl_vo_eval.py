@@ -212,7 +212,7 @@ def evaluate(rows: list[dict], split_s: float, holdout_gap_s: float = 0.0) -> di
         "calibration": {
             "heading_offset_deg": heading,
             "speed_scale_vo_over_ref": scale,
-            "fitted_noise_model": fitted,
+            "fitted_noise_model": fitted if identifiable else None,
             "noise_model_design_rank": rank,
             "noise_model_normalized_condition_number": condition if math.isfinite(condition) else None,
             "noise_model_identifiable": bool(identifiable),
@@ -221,13 +221,13 @@ def evaluate(rows: list[dict], split_s: float, holdout_gap_s: float = 0.0) -> di
                 "Три вклада дисперсии неразличимы по данным обучающей части: "
                 "значения отдельных коэффициентов NNLS не интерпретировать физически"),
             "raw_before_heading_and_scale": metrics(cal, 0.0, 1.0, None),
-            "after": metrics(cal, heading, scale, fitted),
+            "after": metrics(cal, heading, scale, fitted if identifiable else None),
         },
         "validation": {
             "profile_constants": PROFILE,
             "with_profile_constants": metrics(val, heading, scale, PROFILE),
-            "with_fitted_model": metrics(val, heading, scale, fitted),
-            "without_scale_correction": metrics(val, heading, 1.0, fitted),
+            "with_fitted_model": metrics(val, heading, scale, fitted if identifiable else None),
+            "without_scale_correction": metrics(val, heading, 1.0, fitted if identifiable else None),
         },
     }
 
