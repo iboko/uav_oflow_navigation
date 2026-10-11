@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -83,8 +84,11 @@ class Px4:
         env = dict(os.environ, HEADLESS="1", PX4_SIM_MODEL="gz_x500_flow", GZ_IP="127.0.0.1",
                    PX4_GZ_WORLD=world)
         self.log = log.open("w")
+        # Isolate the SITL/Gazebo process tree. Never terminate unrelated
+        # Gazebo simulations running on the same development machine.
         self.proc = subprocess.Popen([str(self.build / "bin" / "px4"), "-d"], cwd=self.rootfs,
-                                     env=env, stdout=self.log, stderr=subprocess.STDOUT)
+                                     env=env, stdout=self.log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
 
     def cmd(self, *args: str, timeout: float = 120.) -> str:
         r = subprocess.run([str(self.build / "bin" / f"px4-{args[0]}"), *args[1:]],
@@ -96,13 +100,22 @@ class Px4:
             self.cmd("shutdown", timeout=10)
         except Exception:
             pass
-        self.proc.terminate()
+        # Own session = own process group, including Gazebo children which
+        # may outlive the PX4 parent. A global 'pkill gz sim' is unsafe.
         try:
-            self.proc.wait(10)
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-        subprocess.run(["pkill", "-f", "[g]z sim"], check=False)
-        self.log.close()
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.proc.wait(timeout=10)
+        finally:
+            self.log.close()
 
 
 class Link:
@@ -204,6 +217,22 @@ def ofnav_status(px4: Px4) -> dict:
     return out
 
 
+def new_report(world: str) -> dict:
+    """Provenance and explicit non-claims for safety-only SITL tests."""
+    return {
+        "type": "PX4_SITL_GAZEBO_X500_FLOW_FAILURE_SCENARIOS",
+        "world": world,
+        "scenarios": {},
+        "validation_scope": "PX4_SITL_SAFETY_MODE_TRANSITIONS_ONLY",
+        "gnss_denied_navigation_verified": False,
+        "ekf2_ofnav_fusion_verified": False,
+        "ofnav_position_hold_verified": False,
+        "real_aircraft_tested": False,
+        "caveat": ("POSCTL is provided by PX4; scenario success proves the safety "
+                   "mode-transition chain, not GNSS-denied ofnav position estimation."),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("px4_dir", type=Path)
@@ -215,8 +244,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     if args.world == TEXTURED_WORLD:
         install_textured_world(args.px4_dir.resolve())
-    report: dict = {"type": "PX4_SITL_GAZEBO_X500_FLOW_FAILURE_SCENARIOS", "world": args.world,
-              "scenarios": {}}
+    report: dict = new_report(args.world)
     px4 = Px4(args.px4_dir.resolve(), args.out / "px4_gz.log", args.world)
     link = Link()
     global SIM_CLOCK

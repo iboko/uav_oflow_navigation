@@ -134,17 +134,64 @@ def _gga(text: str):
     return hh * 3600 + mm * 60 + ss, lat, lon, int(p[6]), float(p[9])
 
 
-def read_ppk(path: Path):
+def read_ppk(path: Path) -> np.ndarray:
+    """Читать RTKLIB .pos: UTC, широта, долгота, высота, категориальное Q.
+
+    Строгая монотонность обязательна: np.interp не проверяет порядок эпох
+    и может дать правдоподобную, но неверную траекторию.
+    """
     rows = []
-    for line in path.read_text().splitlines():
-        if line.startswith("%") or not line.strip():
+    for lineno, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        if line.lstrip().startswith("%") or not line.strip():
             continue
-        f = line.split()
-        y, mo, d = (int(v) for v in f[0].split("/"))
-        hh, mm, ss = f[1].split(":")
-        gpst = calendar.timegm((y, mo, d, int(hh), int(mm), 0)) + float(ss)
-        rows.append((gpst - GPST_MINUS_UTC_S, float(f[2]), float(f[3]), float(f[4]), int(f[5])))
-    return np.array(rows)
+        try:
+            f = line.split()
+            if len(f) < 6:
+                raise ValueError("ожидаются дата, время, широта, долгота, высота и Q")
+            y, mo, d = (int(v) for v in f[0].split("/"))
+            hh, mm, ss = f[1].split(":")
+            sec = float(ss)
+            if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59 and 0 <= sec < 60):
+                raise ValueError("недопустимое время")
+            gpst = calendar.timegm((y, mo, d, int(hh), int(mm), 0)) + sec
+            lat, lon, height, quality = float(f[2]), float(f[3]), float(f[4]), int(f[5])
+            if (not all(math.isfinite(x) for x in (gpst, lat, lon, height))
+                    or not -90 <= lat <= 90 or not -180 <= lon <= 180
+                    or quality not in (1, 2, 3, 4, 5, 6)):
+                raise ValueError("неверные координаты, высота или код качества RTKLIB")
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"Некорректная строка PPK {path}:{lineno}: {exc}") from exc
+        rows.append((gpst - GPST_MINUS_UTC_S, lat, lon, height, quality))
+    if len(rows) < 2:
+        raise ValueError("В файле PPK должно быть не менее двух эпох")
+    ppk = np.asarray(rows, dtype=float)
+    if not np.all(np.diff(ppk[:, 0]) > 0):
+        raise ValueError("Эпохи PPK дублируются или расположены не по возрастанию")
+    return ppk
+
+
+def sample_ppk(ppk: np.ndarray, utc_s: float, *, max_gap_s: float = 1.0) -> tuple[float, float, float, int]:
+    """Интерполировать координаты внутри двух соседних эпох RTKLIB.
+
+    Качество не интерполируется: Q=1 только при фиксированных обоих концах.
+    Выход за границы эталона или большой разрыв запрещены.
+    """
+    if (ppk.ndim != 2 or ppk.shape[1] != 5 or len(ppk) < 2
+            or not math.isfinite(utc_s) or not math.isfinite(max_gap_s)
+            or max_gap_s <= 0):
+        raise ValueError("Некорректные данные или параметры выборки PPK")
+    if utc_s < ppk[0, 0] or utc_s > ppk[-1, 0]:
+        raise ValueError("Время кадра вне диапазона эталонной траектории PPK")
+    j = int(np.searchsorted(ppk[:, 0], utc_s, side="left"))
+    j = min(max(j, 1), len(ppk) - 1)
+    a, b = ppk[j - 1], ppk[j]
+    dt = float(b[0] - a[0])
+    if dt <= 0 or dt > max_gap_s:
+        raise ValueError(f"Разрыв между соседними эпохами PPK: {dt:.3f} с")
+    alpha = (utc_s - a[0]) / dt
+    coords = (1.0 - alpha) * a[1:4] + alpha * b[1:4]
+    quality = 1 if int(a[4]) == int(b[4]) == 1 else 0
+    return float(coords[0]), float(coords[1]), float(coords[2]), quality
 
 
 def main() -> None:
@@ -161,6 +208,12 @@ def main() -> None:
     ap.add_argument("--takeoff-height", type=float, default=None,
                     help="PPK height of the ground at takeoff; default: first PPK epochs")
     args = ap.parse_args()
+    if not math.isfinite(args.scale) or not (0 < args.scale <= 2.0):
+        ap.error("--scale должен быть конечным числом в диапазоне (0, 2]")
+    if args.frame_step < 1:
+        ap.error("--frame-step должен быть не меньше 1")
+    if args.takeoff_height is not None and not math.isfinite(args.takeoff_height):
+        ap.error("--takeoff-height должен быть конечным числом")
     frames_dir = args.out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -230,21 +283,13 @@ def main() -> None:
     takeoff_h = args.takeoff_height if args.takeoff_height is not None else float(np.median(ppk[:25, 3]))
 
     t0 = images[0][0]
-    lat0, lon0 = (np.interp(t0 - bag_minus_utc, ppk[:, 0], ppk[:, i]) for i in (1, 2))
+    lat0, lon0, _, _ = sample_ppk(ppk, t0 - bag_minus_utc)
     r_m = 6378137.0 * (1 - 0.00669438) / (1 - 0.00669438 * math.sin(math.radians(lat0)) ** 2) ** 1.5
     r_n = 6378137.0 / math.sqrt(1 - 0.00669438 * math.sin(math.radians(lat0)) ** 2)
 
     def ref(t_bag: float):
         tu = t_bag - bag_minus_utc
-        lat, lon, hh = (np.interp(tu, ppk[:, 0], ppk[:, i]) for i in (1, 2, 3))
-        # RTKLIB Q is categorical: only bracketed fixed solutions count.
-        j = int(np.searchsorted(ppk[:, 0], tu, side="left"))
-        if j == 0 or j >= len(ppk):
-            q = 0
-        else:
-            a, b = ppk[j - 1], ppk[j]
-            q = (1 if int(a[4]) == 1 and int(b[4]) == 1
-                 and b[0] - a[0] <= 1.0 else 0)
+        lat, lon, hh, q = sample_ppk(ppk, tu)
         return (math.radians(lat - lat0) * r_m, math.radians(lon - lon0) * r_n * math.cos(math.radians(lat0)),
                 hh - takeoff_h, q)
 

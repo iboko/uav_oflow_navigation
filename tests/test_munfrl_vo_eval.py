@@ -76,3 +76,27 @@ def test_nnls_matches_global_optimum_from_nonnegative_candidates():
     ]
     best_grid = min(float(np.sum((matrix @ x - target) ** 2)) for x in alternatives)
     assert np.sum((matrix @ fit - target) ** 2) <= best_grid + 1e-9
+
+
+def test_fitted_noise_model_not_identifiable_with_constant_height_and_speed(tmp_path):
+    rows = load(*make_rows(tmp_path))
+    report = evaluate(rows, 1.5)
+    assert report["calibration"]["noise_model_design_rank"] == 1
+    assert report["calibration"]["noise_model_identifiable"] is False
+    assert report["calibration"]["fitted_noise_model"] is None
+    assert "mean_nees" not in report["validation"]["with_fitted_model"]
+    assert report["calibration"]["noise_model_warning"]
+    assert report["calibration"]["fitted_noise_model_validated_for_flight"] is False
+
+
+def test_noise_model_identifiability_with_distinct_height_and_speed_excitation(tmp_path):
+    rows = load(*make_rows(tmp_path))
+    for k, row in enumerate(rows):
+        row["h"] = 32.0 + .3 * k + 2.0 * np.sin(k / 3.)
+        row["ref"] = np.array([3.0 + .1 * k, np.sin(.4 * k)])
+        row["vo"] = row["ref"] * 1.1 + np.array([.01 * np.sin(k), .02 * np.cos(k)])
+    report = evaluate(rows, 1.5)
+    assert report["calibration"]["noise_model_design_rank"] == 3
+    assert report["calibration"]["noise_model_identifiable"] is True
+    assert report["calibration"]["noise_model_normalized_condition_number"] < 1e4
+    assert report["calibration"]["fitted_noise_model_validated_for_flight"] is False
