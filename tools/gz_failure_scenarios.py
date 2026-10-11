@@ -133,6 +133,7 @@ class Link:
         self.boot_s = 0.  # PX4 (lockstep = simulation) time from MAVLink
         self.throttle = 500
         self.pitch = 0  # MANUAL_CONTROL x: + forward
+        self.roll = 0   # MANUAL_CONTROL y: + right
         self._stop = False
         threading.Thread(target=self._tx, daemon=True).start()
         threading.Thread(target=self._rx, daemon=True).start()
@@ -146,7 +147,7 @@ class Link:
                     self.m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
                                               mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
                     last_hb = now
-                self.m.mav.manual_control_send(self.m.target_system, self.pitch, 0, self.throttle, 0, 0)
+                self.m.mav.manual_control_send(self.m.target_system, self.pitch, self.roll, self.throttle, 0, 0)
             time.sleep(0.05)
 
     def _rx(self) -> None:

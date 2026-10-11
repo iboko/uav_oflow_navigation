@@ -95,6 +95,7 @@ class BodyVelocityMeasurement:
     variance_frd: tuple[float, float, float]
     vo: VisualOdomResult
     vd_m_s: float
+    height_mid_m: float = float("nan")   # над ровной землей, середина интервала
 
 
 class CompanionVo:
@@ -123,6 +124,12 @@ class CompanionVo:
             return False
         t = companion_t_us + self.clock.offset_us
         return self.attitude.latest_us >= t and self.distance.latest_us >= t
+
+    def state_at_camera_time(self, companion_t_us: int):
+        """(roll, pitch, yaw, height) на момент кадра или None."""
+        if not self.clock.valid:
+            return None
+        return self._state_at(companion_t_us + self.clock.offset_us)
 
     def _state_at(self, autopilot_t_us: int):
         att = self.attitude.bracket(autopilot_t_us)
@@ -183,4 +190,5 @@ class CompanionVo:
             return None
         self.count("PUBLISHED")
         return BodyVelocityMeasurement((t0 + t1) // 2, tuple(float(v) for v in v_body),
-                                       tuple(float(cov_body[i, i]) for i in range(3)), result, vd)
+                                       tuple(float(cov_body[i, i]) for i in range(3)), result, vd,
+                                       float(mid[3]))
