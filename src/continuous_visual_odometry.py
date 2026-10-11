@@ -52,6 +52,9 @@ class VisualOdomResult:
     velocity_cov_nn: float = float("nan")
     velocity_cov_ne: float = float("nan")
     velocity_cov_ee: float = float("nan")
+    # Exposure-centre time of the PREVIOUS frame of the accepted pair: the
+    # velocity is the mean over [interval_start_us, timestamp_us].
+    interval_start_us: int = 0
 
 
 class ContinuousPlanarOdometry:
@@ -140,7 +143,8 @@ class ContinuousPlanarOdometry:
     def _out(self, timestamp: int, status: str, accepted: bool = False,
              motion: GroundMotionEstimate | None = None,
              vn: float = float("nan"), ve: float = float("nan"),
-             covariance: np.ndarray | None = None) -> VisualOdomResult:
+             covariance: np.ndarray | None = None,
+             interval_start_us: int = 0) -> VisualOdomResult:
         return VisualOdomResult(
             timestamp, self._segment_id, status, accepted,
             self._north, self._east, vn, ve,
@@ -150,6 +154,7 @@ class ContinuousPlanarOdometry:
             float(covariance[0, 0]) if covariance is not None else float("nan"),
             float(covariance[0, 1]) if covariance is not None else float("nan"),
             float(covariance[1, 1]) if covariance is not None else float("nan"),
+            interval_start_us,
         )
 
     @staticmethod
@@ -308,4 +313,5 @@ class ContinuousPlanarOdometry:
         self._resolution += sqrt(du_floor * du_floor + dv_floor * dv_floor)
         self._previous = current
         return self._out(current.timestamp_us, "VALID", accepted=True,
-                         motion=motion, vn=vn, ve=ve, covariance=covariance)
+                         motion=motion, vn=vn, ve=ve, covariance=covariance,
+                         interval_start_us=previous.timestamp_us)

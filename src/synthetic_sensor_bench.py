@@ -23,11 +23,16 @@ import numpy as np
 
 from .camera_rotation_compensation import CameraMountCalibration, body_to_ned
 from .continuous_visual_odometry import ContinuousPlanarOdometry, VisualFrame
-from .error_state_inertial_filter import InertialErrorStateFilter, ImuNoiseDensity
+from .error_state_inertial_filter import (
+    BodyVelocityMeasurement, ImuNoiseDensity, InertialErrorStateFilter,
+    MapGroundPointMeasurement, YawMeasurement,
+)
 from .fixed_lag_eskf_replay import FixedLagEskfReplay
 from .ground_visual_motion import CameraCalibration
 from .horizontal_visual_inertial_filter import VisualVelocityMeasurement
-from .imu_preintegration import ImuBias, ImuReading
+from .imu_preintegration import (
+    ImuBias, ImuReading, quat_exponential, quat_product, rotation_body_to_ned,
+)
 from .orthophoto_localization import MapGeoReference, OrthophotoLocalizer, OrthophotoTile
 from .velocity_uncertainty import VelocityErrorAssumptions
 
@@ -181,7 +186,7 @@ def generate_dataset(output_dir: str | Path,
         force_body += rng.normal(0., .012, 3)
         gyro += rng.normal(0., .00015, 3)
         time_us=1_000_000+int(round(t*1e6))
-        truth_imu_rows.append([time_us,*velocity.tolist()])
+        truth_imu_rows.append([time_us,*velocity.tolist(),*position.tolist(),yaw])
         if config.scenario=="imu_gap" and .42 <= t <= .56:
             continue
         imu_data.append([time_us,*gyro.tolist(),*force_body.tolist()])
@@ -193,7 +198,7 @@ def generate_dataset(output_dir: str | Path,
         writer.writerows(imu_data)
     with (dest/"truth_imu.csv").open("w",newline="",encoding="utf-8") as f:
         writer=csv.writer(f)
-        writer.writerow(["timestamp_us","vn_m_s","ve_m_s"])
+        writer.writerow(["timestamp_us","vn_m_s","ve_m_s","north_m","east_m","yaw_rad"])
         writer.writerows(truth_imu_rows)
 
     camera_rows=[]
@@ -259,12 +264,73 @@ def _imu_rows(path: Path) -> list[ImuReading]:
     ]
 
 
-def run_sensor_bench(data_dir: str | Path,
-                     output_dir: str | Path) -> dict:
-    """Exercise VO, orthophoto and delayed ESKF with shared frame/IMU timeline.
+def _rpy(q: tuple[float, float, float, float]) -> tuple[float, float, float]:
+    w, x, y, z = q
+    roll = float(np.arctan2(2*(w*x+y*z), 1-2*(x*x+y*y)))
+    pitch = float(np.arcsin(np.clip(2*(w*y-z*x), -1., 1.)))
+    yaw = float(np.arctan2(2*(w*z+x*y), 1-2*(y*y+z*z)))
+    return roll, pitch, yaw
 
-    Reference truth is read only AFTER all state estimates were produced.
-    This function is intentionally not a command-and-control loop.
+
+def _wrap(angle: float) -> float:
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+
+def _gyro_delta(imu: list[ImuReading], t0: int, t1: int,
+                bias: np.ndarray) -> np.ndarray:
+    """Body rotation quaternion from t0 to t1 by bias-corrected gyro only.
+
+    Trapezoidal rates between samples, linear interpolation at the ends.
+    This is the PHYSICAL relative rotation; differences of corrected
+    filter attitudes also contain estimation jumps and must not be used
+    to derotate image pairs.
+    """
+    if t1 < t0:
+        raise ValueError("Обратный интервал интегрирования гироскопа")
+    stamps = [r.timestamp_us for r in imu]
+    if not stamps or t0 < stamps[0] or t1 > stamps[-1]:
+        raise ValueError("Интервал вне журнала ИИМ")
+    def rate(t: int) -> np.ndarray:
+        j = int(np.searchsorted(stamps, t))
+        if j < len(stamps) and stamps[j] == t:
+            return np.asarray(imu[j].gyro_body_rad_s) - bias
+        a, b = imu[j-1], imu[j]
+        alpha = (t - a.timestamp_us) / (b.timestamp_us - a.timestamp_us)
+        return ((1-alpha) * np.asarray(a.gyro_body_rad_s) +
+                alpha * np.asarray(b.gyro_body_rad_s)) - bias
+    knots = [t0] + [t for t in stamps if t0 < t < t1] + [t1]
+    q = np.array([1., 0., 0., 0.])
+    for a, b in zip(knots, knots[1:]):
+        omega = 0.5 * (rate(a) + rate(b))
+        q = quat_product(q, quat_exponential((b - a) * 1e-6 * omega))
+    return q / np.linalg.norm(q)
+
+
+def load_bench_calibration(path: str | Path, *, evaluation_seed: int) -> dict:
+    """Calibration from SEPARATE synthetic flights (src.synthetic_bench_calibration)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("kind") != "SYNTHETIC_BENCH_ERROR_CALIBRATION" or data.get("synthetic_only") is not True:
+        raise ValueError("Калибровка не является калибровкой синтетического стенда")
+    seeds = set(data["seeds"]["fit"]) | set(data["seeds"]["holdout"])
+    if evaluation_seed in seeds:
+        raise ValueError("Оцениваемый прогон использован при калибровке")
+    if not data["vo_body_velocity"]["consistent_on_holdout"]:
+        raise ValueError("Калибровка ковариации VO не подтверждена на отложенных полетах")
+    return data
+
+
+def run_sensor_bench(data_dir: str | Path,
+                     output_dir: str | Path,
+                     *, calibration: dict | None = None) -> dict:
+    """Exercise VO, orthophoto and delayed ESKF as a loosely coupled VIO.
+
+    The ESKF's OWN attitude (FixedLagEskfReplay.attitude_at) drives VO
+    derotation and orthophoto matching; the autopilot attitude columns of
+    camera.csv are ignored. VO aids the filter by body-frame velocity at
+    the midpoint of the frame interval. With a calibration from separate
+    flights the orthophoto heading and position (covariance intersection,
+    unknown VO correlation) are fused too. Reference truth is read only
+    AFTER all estimates were produced. Never a command-and-control loop.
     """
     base=Path(data_dir)
     metadata=json.loads((base/"bench_metadata.json").read_text(encoding="utf-8"))
@@ -305,12 +371,43 @@ def run_sensor_bench(data_dir: str | Path,
             .55,.35,.001,.003,.001,.02,.12
         )
     )
+    map_cal=calibration["map_ground_point"] if calibration else None
+    yaw_cal=calibration["map_yaw"] if calibration else None
+    vo_cal=calibration["vo_body_velocity"] if calibration else None
+    initial_q=(1.,0.,0.,0.)
+    # Initial horizontal position: first unambiguous orthophoto fix of the
+    # first exposure (coincident with the first IMU sample), otherwise the
+    # relative origin. Uncalibrated fixes start with a 10 m sigma.
+    initial_ne=(0.,0.)
+    anchored=False
+    first=camera_rows[0]
+    if int(first["available"])==1 and int(first["timestamp_us"])==imu[0].timestamp_us:
+        image=cv2.imread(str(base/first["image_path"]),cv2.IMREAD_GRAYSCALE)
+        if image is not None:
+            seed_fix=localizer.localize(image,height_agl_m=float(first["range_height_m"]),
+                                        roll_rad=0.,pitch_rad=0.,yaw_rad=0.)
+            if seed_fix.accepted:
+                # Level-attitude assumption at start: optical-axis ground
+                # point is directly below the vehicle.
+                initial_ne=(seed_fix.ground_north_m,seed_fix.ground_east_m)
+                anchored=True
+                if map_cal:
+                    initial_ne=(initial_ne[0]-map_cal["bias_ne_m"][0],
+                                initial_ne[1]-map_cal["bias_ne_m"][1])
+    position_sigma=10.
+    if map_cal:
+        position_sigma=float(np.sqrt(np.max(np.linalg.eigvalsh(
+            np.asarray(map_cal["covariance_ne_m2"])))))
+    sigma=(position_sigma,position_sigma,10.,1.,1.,1.,.05,.05,.05,
+           .02,.02,.02,.2,.2,.2)
     def factory():
         return InertialErrorStateFilter(
-            quaternion_body_to_ned=(1.,0.,0.,0.),
+            quaternion_body_to_ned=initial_q,
             initial_bias=ImuBias(),
             noise=ImuNoiseDensity(.003,.03,.00005,.0003),
+            initial_error_sigma=sigma,
             max_imu_dt_s=.05,
+            initial_position_ned_m=(initial_ne[0],initial_ne[1],0.),
         )
     fusion=FixedLagEskfReplay(factory,max_lag_us=300_000,
                               max_imu_samples=100)
@@ -322,6 +419,17 @@ def run_sensor_bench(data_dir: str | Path,
     results=[]
     imu_failed=False
     last_camera_time=0
+    nan=float("nan")
+    # Attitude chain handed to VO: identity at segment start, then
+    # propagated by gyro only, so pair derotation is physical and the
+    # body-frame velocity never contains the filter's attitude estimate.
+    vo_q=None
+    vo_time=0
+    vo_previous_q=None
+    # FIXED gyro bias of the initial alignment/calibration for derotation.
+    # The running filter estimate is not used: the body-velocity model has
+    # no bias Jacobian, so feeding it back would be an unmodelled loop.
+    vo_gyro_bias=np.asarray(ImuBias().gyro_body_rad_s)
     for event_time,_,kind,payload in timeline:
         if kind=="imu":
             if not imu_failed:
@@ -335,10 +443,35 @@ def run_sensor_bench(data_dir: str | Path,
         if stamp<=last_camera_time:
             raise ValueError("Неверный порядок экспозиций камеры")
         last_camera_time=stamp
+        body=(nan,nan,nan,nan,nan,0)
+        vo_ne=None
+        map_status="CAMERA_UNAVAILABLE"
+        map_ne=(nan,nan)
+        ground_ne=(nan,nan)
+        map_yaw=nan
+        rpy=(nan,nan,nan)
+        vo_rpy=(nan,nan,nan)
+        try:
+            if not imu_failed:
+                q_now=fusion.attitude_at(stamp)
+                rpy=_rpy(q_now)
+                bias=vo_gyro_bias
+                if vo_q is None:
+                    # Segment-local frame: the first frame of a segment
+                    # defines the VO reference axes. Anchoring to the filter
+                    # attitude would feed the filter's own tilt error back
+                    # into the "measurement" and destabilize the loop.
+                    vo_q=np.array([1.,0.,0.,0.])
+                else:
+                    vo_q=quat_product(vo_q,_gyro_delta(imu,vo_time,stamp,bias))
+                vo_rpy=_rpy(tuple(vo_q))
+        except ValueError:
+            vo_q=None
         if int(row["available"])==0:
             observation=vo.reject_frame(stamp,"SYNTHETIC_CAMERA_UNAVAILABLE")
-            map_status="CAMERA_UNAVAILABLE"
-            map_ne=(float("nan"),float("nan"))
+        elif not np.all(np.isfinite(rpy)):
+            observation=vo.reject_frame(stamp,"ESKF_ATTITUDE_UNAVAILABLE")
+            map_status="ESKF_ATTITUDE_UNAVAILABLE"
         else:
             image=cv2.imread(str(base/row["image_path"]),cv2.IMREAD_GRAYSCALE)
             if image is None:
@@ -350,59 +483,137 @@ def run_sensor_bench(data_dir: str | Path,
                 raise ValueError("Дальномер и высота геометрической модели не согласованы")
             observation=vo.process(VisualFrame(
                 stamp,image,float(row["range_height_m"]),
-                float(row["yaw_rad"]),float(row["roll_rad"]),
-                float(row["pitch_rad"])
+                vo_rpy[2],vo_rpy[0],vo_rpy[1]
             ))
             fix=localizer.localize(
-                image,height_agl_m=float(row["height_agl_m"]),
-                roll_rad=float(row["roll_rad"]),
-                pitch_rad=float(row["pitch_rad"]),
-                yaw_rad=float(row["yaw_rad"]),
+                image,height_agl_m=float(row["range_height_m"]),
+                roll_rad=rpy[0],pitch_rad=rpy[1],yaw_rad=rpy[2],
             )
             map_status=fix.status
             map_ne=(fix.north_m,fix.east_m)
-        fusion_status="IMU_FAILURE_LATCHED" if imu_failed else "VO_NOT_ACCEPTED"
+            ground_ne=(fix.ground_north_m,fix.ground_east_m)
+            map_yaw=fix.yaw_rad
+        chain_previous=vo_previous_q if observation.accepted else None
+        if vo_q is not None:
+            if observation.status in ("VALID","INITIALIZED"):
+                vo_previous_q=np.asarray(vo_q)
+                vo_time=stamp
+            else:
+                # Segment restarted: next pair re-anchors to the filter.
+                vo_q=None
+                vo_previous_q=None
+        vo_status="IMU_FAILURE_LATCHED" if imu_failed else "VO_NOT_ACCEPTED"
         if not imu_failed and observation.accepted:
             if not np.all(np.isfinite([
                 observation.vn_m_s,observation.ve_m_s,
                 observation.velocity_cov_nn,observation.velocity_cov_ne,
                 observation.velocity_cov_ee
-            ])):
-                fusion_status="VO_NO_VALID_COVARIANCE"
+            ])) or observation.interval_start_us<=0:
+                vo_status="VO_NO_VALID_COVARIANCE"
             else:
-                measured=VisualVelocityMeasurement(
-                    stamp,observation.vn_m_s,observation.ve_m_s,
-                    ((observation.velocity_cov_nn,observation.velocity_cov_ne),
-                     (observation.velocity_cov_ne,observation.velocity_cov_ee))
-                )
-                fusion_status=fusion.push_delayed_visual(measured).status
+                # Mean velocity over the pair -> body axes at the interval
+                # midpoint with the ESKF's own attitude there. The absolute
+                # heading cancels: VO used the same filter attitude to form NE.
+                t_mid=(observation.interval_start_us+stamp)//2
+                # Same chained attitude VO used, at the midpoint: the
+                # result depends on image and gyro only, not on the
+                # absolute filter heading.
+                q_mid=quat_product(np.asarray(chain_previous),_gyro_delta(
+                    imu,observation.interval_start_us,t_mid,vo_gyro_bias))
+                r_mid=rotation_body_to_ned(q_mid)
+                r2=r_mid[:2,:2]
+                v_body=r2.T@np.array([observation.vn_m_s,observation.ve_m_s])
+                c_ne=np.array([[observation.velocity_cov_nn,observation.velocity_cov_ne],
+                               [observation.velocity_cov_ne,observation.velocity_cov_ee]])
+                c_body=r2.T@c_ne@r2
+                if vo_cal:
+                    v_body=v_body-np.asarray(vo_cal["bias_m_s"])
+                    c_body=vo_cal["scale"]*c_body+np.eye(2)*vo_cal["floor_variance_m2_s2"]
+                c_body=0.5*(c_body+c_body.T)
+                body=(float(v_body[0]),float(v_body[1]),float(c_body[0,0]),
+                      float(c_body[0,1]),float(c_body[1,1]),t_mid)
+                # NE velocity reported for diagnostics/export only, rotated
+                # with the filter attitude at the midpoint (not fused).
+                r_eskf=rotation_body_to_ned(fusion.attitude_at(t_mid))
+                vo_ne=r_eskf[:2,:2]@np.array(body[:2])
+                vo_status=fusion.push_delayed_frame([BodyVelocityMeasurement(
+                    t_mid,body[0],body[1],((body[2],body[3]),(body[3],body[4]))
+                )])[0].status
+        map_fusion_status="MAP_COVARIANCE_UNVALIDATED"
+        yaw_fusion_status="MAP_YAW_UNVALIDATED"
+        if map_status!="GEOMETRICALLY_ACCEPTED_UNVALIDATED":
+            map_fusion_status=yaw_fusion_status=map_status
+        elif imu_failed:
+            map_fusion_status=yaw_fusion_status="IMU_FAILURE_LATCHED"
+        elif map_cal and yaw_cal:
+            # Attitude-free ground point of the optical axis; the filter
+            # model p + h (R d)_NE/(R d)_D couples it to the tilt states.
+            optical_axis=tuple(float(x) for x in
+                               np.asarray(mount.body_from_camera)@np.array([0.,0.,1.]))
+            measurements=[
+                YawMeasurement(stamp,_wrap(map_yaw-yaw_cal["bias_rad"]),
+                               yaw_cal["variance_rad2"]),
+                MapGroundPointMeasurement(
+                    stamp,ground_ne[0]-map_cal["bias_ne_m"][0],
+                    ground_ne[1]-map_cal["bias_ne_m"][1],
+                    tuple(tuple(x) for x in map_cal["covariance_ne_m2"]),
+                    float(row["range_height_m"]),optical_axis,0.0),
+            ]
+            yaw_feedback,map_feedback=fusion.push_delayed_frame(measurements)
+            yaw_fusion_status,map_fusion_status=yaw_feedback.status,map_feedback.status
         state=fusion.state
         results.append({
             "timestamp_us":stamp,
             "arrival_timestamp_imu_us":event_time,
             "camera_available":row["available"],
+            "eskf_attitude_roll_rad":rpy[0],
+            "eskf_attitude_pitch_rad":rpy[1],
+            "eskf_attitude_yaw_rad":rpy[2],
             "visual_status":observation.status,
             "visual_segment_id":observation.segment_id,
             "visual_velocity_accepted":int(observation.accepted),
-            "vn_vo_m_s":observation.vn_m_s,
-            "ve_vo_m_s":observation.ve_m_s,
+            "vn_vo_m_s":float(vo_ne[0]) if vo_ne is not None else observation.vn_m_s,
+            "ve_vo_m_s":float(vo_ne[1]) if vo_ne is not None else observation.ve_m_s,
+            "body_time_us":body[5],
+            "body_vx_vo_m_s":body[0],
+            "body_vy_vo_m_s":body[1],
+            "body_cov_xx":body[2],
+            "body_cov_xy":body[3],
+            "body_cov_yy":body[4],
             "map_status":map_status,
             "map_n_m":map_ne[0],
             "map_e_m":map_ne[1],
-            "eskf_status":fusion_status,
+            "map_yaw_rad":map_yaw,
+            "map_ground_n_m":ground_ne[0],
+            "map_ground_e_m":ground_ne[1],
+            "eskf_status":vo_status,
+            "eskf_yaw_update_status":yaw_fusion_status,
+            "eskf_map_update_status":map_fusion_status,
             "eskf_vn_m_s":state.velocity_ned_m_s[0],
             "eskf_ve_m_s":state.velocity_ned_m_s[1],
+            "eskf_n_m":state.position_ned_m[0],
+            "eskf_e_m":state.position_ned_m[1],
+            "eskf_yaw_rad":_rpy(state.quaternion_body_to_ned)[2],
             "eskf_state_timestamp_us":state.timestamp_us,
-            "applied_map_correction":0,
+            "applied_map_correction":int(map_fusion_status=="POSITION_CORRECTED"),
         })
     # Independent synthetic truth opened only for scoring, after estimating.
     with (base/"truth.csv").open(newline="",encoding="utf-8") as f:
         truth={int(r["timestamp_us"]):r for r in csv.DictReader(f)}
     with (base/"truth_imu.csv").open(newline="",encoding="utf-8") as f:
         truth_imu={int(r["timestamp_us"]):r for r in csv.DictReader(f)}
+    start_truth=truth_imu[min(truth_imu)]
+    start_n,start_e=float(start_truth["north_m"]),float(start_truth["east_m"])
+    def truth_at(t_us: int):
+        position,velocity,_,yaw,_=_kinematics((t_us-1_000_000)*1e-6,config.scenario)
+        return position,velocity,yaw
     map_errors=[]
+    map_yaw_errors=[]
     vo_errors=[]
+    body_errors=[]
     fusion_errors=[]
+    position_errors=[]
+    yaw_errors=[]
     for row in results:
         ref=truth[row["timestamp_us"]]
         if row["map_status"]=="GEOMETRICALLY_ACCEPTED_UNVALIDATED":
@@ -410,11 +621,18 @@ def run_sensor_bench(data_dir: str | Path,
                 row["map_n_m"]-float(ref["north_m"]),
                 row["map_e_m"]-float(ref["east_m"])
             )))
+            map_yaw_errors.append(abs(_wrap(row["map_yaw_rad"]-float(ref["yaw_rad"]))))
         if row["visual_velocity_accepted"]:
             vo_errors.append(float(np.hypot(
                 row["vn_vo_m_s"]-float(ref["vn_m_s"]),
                 row["ve_vo_m_s"]-float(ref["ve_m_s"])
             )))
+        if np.isfinite(row["body_vx_vo_m_s"]):
+            _,v_true,yaw_true=truth_at(int(row["body_time_us"]))
+            c,s_=np.cos(yaw_true),np.sin(yaw_true)
+            body_true=np.array([c*v_true[0]+s_*v_true[1],-s_*v_true[0]+c*v_true[1]])
+            body_errors.append(float(np.hypot(row["body_vx_vo_m_s"]-body_true[0],
+                                              row["body_vy_vo_m_s"]-body_true[1])))
         if row["eskf_status"]=="VISUAL_CORRECTED":
             # Delayed correction is applied at exposure time, but the
             # replayed filter snapshot is at the latest received IMU time.
@@ -426,8 +644,17 @@ def run_sensor_bench(data_dir: str | Path,
                 row["eskf_vn_m_s"]-float(at_state["vn_m_s"]),
                 row["eskf_ve_m_s"]-float(at_state["ve_m_s"])
             )))
+            # Without a map anchor the filter frame starts at the origin:
+            # score displacement from the start instead of absolute position.
+            ref_n=float(at_state["north_m"])-(0. if anchored else start_n)
+            ref_e=float(at_state["east_m"])-(0. if anchored else start_e)
+            position_errors.append(float(np.hypot(
+                row["eskf_n_m"]-ref_n,row["eskf_e_m"]-ref_e
+            )))
+            yaw_errors.append(abs(_wrap(row["eskf_yaw_rad"]-float(at_state["yaw_rad"]))))
     def rmse(errors):
         return float(np.sqrt(np.mean(np.square(errors)))) if errors else None
+    applied=sum(r["applied_map_correction"] for r in results)
     summary={
         "scenario":config.scenario,
         "frames":len(results),
@@ -437,18 +664,31 @@ def run_sensor_bench(data_dir: str | Path,
         "visual_updates_fused":sum(r["eskf_status"]=="VISUAL_CORRECTED" for r in results),
         "map_rejected_ambiguity":sum(r["map_status"]=="AMBIGUOUS_MAP_MATCH" for r in results),
         "imu_failure_latched":imu_failed,
+        "attitude_source":"ESKF_INTERNAL",
+        "vo_aiding":"BODY_FRAME_VELOCITY_AT_INTERVAL_MIDPOINT",
+        "map_calibration_used":calibration is not None,
+        "map_yaw_updates_fused":sum(r["eskf_yaw_update_status"]=="YAW_CORRECTED" for r in results),
+        "map_position_updates_fused":applied,
+        "map_position_fusion":("GROUND_POINT_FULL_STATE_COVARIANCE_INTERSECTION"
+                               if calibration else "NOT_APPLIED_UNCALIBRATED"),
+        "position_reference":"MAP" if anchored else "RELATIVE_TO_START",
         "map_position_rmse_m":rmse(map_errors),
+        "map_yaw_error_max_rad":max(map_yaw_errors) if map_yaw_errors else None,
         "visual_speed_rmse_m_s":rmse(vo_errors),
+        "vo_body_velocity_rmse_m_s":rmse(body_errors),
         "eskf_speed_rmse_m_s":rmse(fusion_errors),
-        "applied_map_correction":False,
+        "eskf_position_rmse_m":rmse(position_errors),
+        "eskf_yaw_error_max_rad":max(yaw_errors) if yaw_errors else None,
+        "applied_map_correction":applied>0,
         "flight_accuracy_validated":False,
         "kind":"IDEAL_PINHOLE_SYNTHETIC_SENSOR_BENCH",
         "limitations":[
             "Идеальная плоская местность и проектная камера; не моделируются реальные аберрации, рельеф и скользящий затвор",
             "ИИМ, диапазон высоты, курс и геопривязка созданы по одной модельной траектории",
             "Эталон прочитан только для оценки результата, после завершения работы навигационных компонентов",
-            "Ковариация VO основана на заданных предположениях, а не на метрологической проверке",
-            "Коррекция карты не применяется к ESKF и PX4, контур управления отсутствует",
+            "Ковариации VO и карты откалиброваны только на других СИНТЕТИЧЕСКИХ полетах" if calibration else "Ковариация VO основана на заданных предположениях; карта не применяется без калибровки",
+            "Слабосвязанная VIO: VO использует ориентацию самого РФК, но характерные точки не входят в состояние",
+            "Контур управления отсутствует; результаты не передаются в PX4/EKF2",
             "Нет летных записей НИИВК и нет подтверждения работы реального БВС на 100 м",
         ],
     }
@@ -471,10 +711,15 @@ def main() -> None:
     parser.add_argument("--scenario",choices=SCENARIOS,default="nominal")
     parser.add_argument("--frames",type=int,default=6)
     parser.add_argument("--seed",type=int,default=72118)
+    parser.add_argument("--calibration",
+                        help="JSON из src.synthetic_bench_calibration (другие seed)")
     args=parser.parse_args()
     config=BenchConfig(scenario=args.scenario,frames=args.frames,seed=args.seed)
+    calibration=(load_bench_calibration(args.calibration,evaluation_seed=args.seed)
+                 if args.calibration else None)
     base=generate_dataset(Path(args.output_dir)/"sensors",config)
-    result=run_sensor_bench(base,Path(args.output_dir)/"evaluation")
+    result=run_sensor_bench(base,Path(args.output_dir)/"evaluation",
+                            calibration=calibration)
     print(json.dumps(result,ensure_ascii=False,indent=2))
 
 
