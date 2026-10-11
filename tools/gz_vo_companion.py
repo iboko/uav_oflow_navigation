@@ -125,6 +125,8 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
+    ap.add_argument("--max-fix-age-s", type=float, default=10.0,
+                    help="send the anchor position only this long after the last fused map fix")
     ap.add_argument("--map-method", choices=("orb", "ncc"), default="orb",
                     help="ncc: ortho-rectified frame + correlation around a position prior "
                          "(orthophoto of another year/season)")
@@ -345,7 +347,12 @@ def main() -> None:
             # message without it, so it is sent with every velocity message.
             pos, pose_cov, quat = [nan, nan, nan], [nan] * 21, [nan, nan, nan, nan]
             st = anchor.status() if anchor is not None else None
-            if st is not None and st.locked and math.isfinite(out.height_mid_m):
+            # Only a map-backed position: without a fused fix for max_fix_age_s
+            # the anchor is VO integrated with the autopilot heading, and EKF2
+            # fusing it next to the VO velocity rotated the heading by 17 deg
+            # after GNSS loss (swiss scene). Velocity only then.
+            fresh = anchor is not None and out.vo.timestamp_us - anchor.last_fix_us <= args.max_fix_age_s * 1e6
+            if st is not None and st.locked and fresh and math.isfinite(out.height_mid_m):
                 back_s = (out.vo.timestamp_us - out.time_us) * 1e-6  # anchor is at the frame time
                 pos = [st.position_ne_m[0] - out.vo.vn_m_s * back_s,
                        st.position_ne_m[1] - out.vo.ve_m_s * back_s,
