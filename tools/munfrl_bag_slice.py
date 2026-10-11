@@ -194,6 +194,35 @@ def sample_ppk(ppk: np.ndarray, utc_s: float, *, max_gap_s: float = 1.0) -> tupl
     return float(coords[0]), float(coords[1]), float(coords[2]), quality
 
 
+def sample_times_from_seq(imu: list) -> tuple[list, dict]:
+    """Sampling times of Xsens messages from their sequence numbers.
+
+    The header stamps of /imu/data are host receive times in bursts
+    (intervals 0.05-30 ms at a mean 400 Hz): used directly they misplace
+    the attitude used for camera rotation compensation by up to ~30 ms.
+    The sensor samples on a fixed clock, so t = a + b*seq is fitted and
+    shifted to the lower envelope (transport delay is non-negative).
+    Sequence gaps (dropped packets) are handled by the seq index itself.
+    """
+    imu = sorted(imu, key=lambda r: r[4])
+    seq = np.array([r[4] for r in imu], dtype=float)
+    stamp = np.array([r[0] for r in imu], dtype=float)
+    if len(imu) < 100 or np.any(np.diff(seq) <= 0):
+        raise SystemExit("IMU: too few samples or repeated sequence numbers")
+    b, a = np.polyfit(seq, stamp, 1)
+    if not 1.0 / 1000.0 <= b <= 1.0 / 50.0:
+        raise SystemExit(f"IMU: implausible sample period {b * 1e3:.3f} ms")
+    lag = stamp - (a + b * seq)
+    a += float(np.min(lag))
+    lag -= float(np.min(lag))
+    fitted = a + b * seq
+    info = {"model": "uniform clock from header.seq, lower envelope of receive stamps",
+            "rate_hz": 1.0 / b, "dropped_samples": int(seq[-1] - seq[0] + 1 - len(seq)),
+            "receive_lag_ms_p50": float(np.median(lag) * 1e3),
+            "receive_lag_ms_p99": float(np.percentile(lag, 99) * 1e3)}
+    return [(t, *r[1:]) for t, r in zip(fitted, imu)], info
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("slice", type=Path, help="raw byte range of the .bag")
@@ -260,11 +289,12 @@ def main() -> None:
                     continue
                 images.append((stamp, msg[o + 4:o + 4 + n], height, width))
             elif topic == "/imu/data":
+                seq = struct.unpack_from("<I", msg, 0)[0]
                 stamp, o = _header(msg)
                 q = struct.unpack_from("<4d", msg, o)
                 g = struct.unpack_from("<3d", msg, o + 32 + 72)
                 a = struct.unpack_from("<3d", msg, o + 32 + 72 + 24 + 72)
-                imu.append((stamp, q, g, a))
+                imu.append((stamp, q, g, a, seq))
             elif topic == "/nmea_sentence":
                 _, o = _header(msg)
                 n = struct.unpack_from("<I", msg, o)[0]
@@ -275,7 +305,7 @@ def main() -> None:
         raise SystemExit(f"slice holds too little data: images={len(images)} imu={len(imu)} gga={len(gga)}")
 
     images.sort(key=lambda r: r[0])
-    imu.sort(key=lambda r: r[0])
+    imu, imu_time = sample_times_from_seq(imu)
     day0 = calendar.timegm(tuple(int(v) for v in args.date.split("-")) + (0, 0, 0))
     lat_rx = np.array([r[0] - (day0 + r[1]) for r in gga])
     bag_minus_utc = float(np.min(lat_rx))  # minimum NMEA receive latency
@@ -316,7 +346,7 @@ def main() -> None:
         wa, wi = csv.writer(fa), csv.writer(fi)
         wa.writerow(["timestamp_us", "qw", "qx", "qy", "qz"])
         wi.writerow(["timestamp_us", "gx", "gy", "gz", "ax", "ay", "az"])
-        for stamp, (qx, qy, qz, qw), g, a in imu:
+        for stamp, (qx, qy, qz, qw), g, a, _ in imu:
             # quaternion (x, y, z, w) -> rotation matrix
             r_enu_b = np.array([
                 [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
@@ -341,7 +371,7 @@ def main() -> None:
     info = {
         "source": "MUN-FRL VIL dataset (Thalagala et al.), DJI M600, CC BY 4.0",
         "chunks": n_chunks, "frames_total": len(images), "frames_written": len(images[::args.frame_step]),
-        "imu_samples": len(imu), "gga": len(gga),
+        "imu_samples": len(imu), "imu_time_model": imu_time, "gga": len(gga),
         "gga_fix_quality_counts": {str(q): int(sum(1 for r in gga if r[4] == q)) for q in sorted({r[4] for r in gga})},
         "bag_minus_utc_s": bag_minus_utc, "nmea_receive_latency_spread_s": float(np.ptp(lat_rx)),
         "utc_start": float(t0 - bag_minus_utc - day0), "span_s": span,

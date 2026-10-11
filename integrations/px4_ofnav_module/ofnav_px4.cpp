@@ -5,6 +5,7 @@
 #include <px4_platform_common/tasks.h>
 #include <px4_platform_common/getopt.h>
 #include <drivers/drv_hrt.h>
+#include <parameters/param.h>
 #include <drivers/drv_sensor.h>
 
 #include <uORB/uORB.h>
@@ -17,6 +18,9 @@
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_status.h>
 #include <uORB/topics/vehicle_land_detected.h>
+#if defined(__PX4_POSIX)
+#include <uORB/topics/vehicle_odometry.h>
+#endif
 #include <commander/px4_custom_mode.h>
 
 #include <poll.h>
@@ -80,6 +84,7 @@ static ofnav::EskfRunnerConfig eskf_config()
 // or 'failure distance_sensor'). Not compiled into flight builds.
 static volatile bool g_fault_flow = false;
 static volatile bool g_fault_range = false;
+static volatile bool g_fault_imu = false;
 #endif
 
 // ---- 'ofnav bench': the shared worst-case workload on THIS processor ----
@@ -263,7 +268,8 @@ class Ofnav final : public ModuleBase<Ofnav>
 {
 public:
     Ofnav(unsigned rate_hz, uint8_t min_quality, bool strict_downward_range,
-          ofnav::SensorProfile profile, bool eskf_enabled, bool actions_enabled) :
+          ofnav::SensorProfile profile, bool eskf_enabled, bool actions_enabled,
+          bool publish_ev_velocity = false) :
         _rate_hz(rate_hz),
         _min_quality(min_quality),
         _strict_downward_range(strict_downward_range),
@@ -274,6 +280,8 @@ public:
         // Its output goes to debug_vect only, never to EKF2 or control.
         _eskf.configure(eskf_config(), &px4_clock);
         _actions_enabled = actions_enabled;
+        _publish_ev = publish_ev_velocity;
+        load_safety_params();
 
         if (!eskf_enabled) {
             _eskf.disable();
@@ -368,12 +376,17 @@ public:
         if (rate_hz < kMinRateHz) { rate_hz = kMinRateHz; }
         if (rate_hz > kMaxRateHz) { rate_hz = kMaxRateHz; }
 
+#if !defined(__PX4_POSIX)
+
         if (publish_ev_velocity) {
-            PX4_ERR("external velocity fusion unavailable: no validated vertical velocity");
+            // Flight builds: no EKF2 aiding until it is validated beyond SITL.
+            PX4_ERR("external velocity fusion unavailable in flight builds (SITL only)");
             return nullptr;
         }
+
+#endif
         return new Ofnav(rate_hz, static_cast<uint8_t>(min_quality), strict_downward_range, profile,
-                         eskf_enabled, actions_enabled);
+                         eskf_enabled, actions_enabled, publish_ev_velocity);
     }
 
     static int custom_command(int argc, char *argv[])
@@ -387,8 +400,9 @@ public:
         if (argc == 2 && std::strcmp(argv[0], "fault") == 0) {
             g_fault_flow = std::strcmp(argv[1], "flow") == 0;
             g_fault_range = std::strcmp(argv[1], "range") == 0;
-            PX4_INFO("OFNAV_FAULT flow=%u range=%u", static_cast<unsigned>(g_fault_flow),
-                     static_cast<unsigned>(g_fault_range));
+            g_fault_imu = std::strcmp(argv[1], "imu") == 0;
+            PX4_INFO("OFNAV_FAULT flow=%u range=%u imu=%u", static_cast<unsigned>(g_fault_flow),
+                     static_cast<unsigned>(g_fault_range), static_cast<unsigned>(g_fault_imu));
             return 0;
         }
 
@@ -438,9 +452,11 @@ It publishes debug_vect diagnostics:
 The 15-state ESKF is aligned on the ground (static alignment, autopilot yaw)
 and aided by the body-frame flow velocity. It is a diagnostic estimator.
 
-Optional fusion-output path:
-- -e is rejected until a validated 3D velocity source is available
-- never substitute invented vertical speed for missing measurements
+Optional fusion-output path (SITL builds only):
+- -e publishes each accepted flow measurement as vehicle_visual_odometry
+  body-FRD velocity for EKF2 (EKF2_EV_CTRL bit 2); the vertical body
+  component is derived from the MEASURED rangefinder height rate and the
+  attitude, never invented. Flight (NuttX) builds reject -e.
 
 Safety reactions: a debounced, escalating SafetyActionManager maps the
 navigation mode to NONE / ALTITUDE_HOLD / LAND / MANUAL_TAKEOVER and
@@ -450,7 +466,7 @@ STABILIZED, NAV_LAND). It never commands a return to position mode.
 
 Safe-by-default behavior: without -a this module does not command
 the vehicle. It never drives actuators directly.
-Fusion output is not supported. The -e option is intentionally rejected.
+Flight builds do not support fusion output: -e is rejected there.
 )DESCR_STR");
 
         PRINT_MODULE_USAGE_NAME("ofnav", "navigation");
@@ -461,13 +477,13 @@ Fusion output is not supported. The -e option is intentionally rejected.
         PRINT_MODULE_USAGE_PARAM_FLAG('n', "Do not require downward-facing distance_sensor orientation", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('d', "Disable the diagnostic 15-state ESKF", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('a', "Send safety actions as vehicle_command while armed (SITL/bench first)", true);
-        PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
+        PRINT_MODULE_USAGE_PARAM_FLAG('e', "SITL only: publish flow velocity as EKF2 external-vision velocity (rejected in flight builds)", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
         PRINT_MODULE_USAGE_COMMAND_DESCR("bench", "Run the worst-case ESKF workload on this CPU: time, load, stack");
         PRINT_MODULE_USAGE_COMMAND("status");
 #if defined(__PX4_POSIX)
         PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-replay", "<csv> [flow|camera]: read a synthetic sensor CSV through C++ diagnostics only; no uORB publish, EKF2 or control");
-        PRINT_MODULE_USAGE_COMMAND_DESCR("fault", "flow|range|none: SITL-only input masking for failure scenarios");
+        PRINT_MODULE_USAGE_COMMAND_DESCR("fault", "flow|range|imu|none: SITL-only input masking for failure scenarios");
         PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-eskf", "<csv>: run the 15-state fixed-lag ESKF on a synthetic IMU+VO stream inside PX4; no uORB publish");
 #endif
         return 0;
@@ -503,6 +519,14 @@ Fusion output is not supported. The -e option is intentionally rejected.
                  static_cast<double>(_last_out.flow.velocity_nav_m_s.x), static_cast<double>(_last_out.flow.velocity_nav_m_s.y),
                  static_cast<double>(_last_out.state.vn_m_s), static_cast<double>(_last_out.state.ve_m_s),
                  static_cast<unsigned long>(_runtime.velocityResets()));
+        PX4_INFO("ev velocity to EKF2: %s published=%lu skipped=%lu", _publish_ev ? "on (SITL)" : "off",
+                 static_cast<unsigned long>(_ev_published), static_cast<unsigned long>(_ev_skipped));
+        PX4_INFO("safety timings ms: failsafe=%llu degraded=%llu to_land=%llu recovery=%llu (%s)",
+                 static_cast<unsigned long long>(_safety_cfg.failsafe_confirm_us / 1000U),
+                 static_cast<unsigned long long>(_safety_cfg.degraded_confirm_us / 1000U),
+                 static_cast<unsigned long long>(_safety_cfg.degraded_to_land_us / 1000U),
+                 static_cast<unsigned long long>(_safety_cfg.recovery_us / 1000U),
+                 _safety_params_valid ? "OFNAV_* params" : "defaults: params inconsistent");
         PX4_INFO("safety engaged=%u", static_cast<unsigned>(_safety.engaged()));
         PX4_INFO("safety action=%s reason=%s commands=%s sent=%lu",
                  ofnav::toString(_last_decision.action), ofnav::toString(_last_decision.reason),
@@ -582,22 +606,18 @@ Fusion output is not supported. The -e option is intentionally rejected.
 
             if (flow_updated) {
                 orb_copy(ORB_ID(sensor_optical_flow), _flow_sub, &flow_msg);
-                // Gazebo flow plugin (PX4 OpticalFlow library limitRate):
-                // a frame that is not yet published comes with quality -1
-                // (255 in uORB) and its single-frame flow, which is ALSO
-                // summed into the next published sample, whose timespan
-                // covers only its own frame. Merge the placeholder's
-                // timespan into the next sample and never fuse it.
+                // Gazebo flow plugin (PX4 OpticalFlow library limitRate): a
+                // frame that is not yet published comes with quality -1
+                // (255 in uORB). It is not a measurement and is dropped. The
+                // next published sample's flow covers ITS OWN reported
+                // timespan: adding the placeholder's timespan (an earlier
+                // version) made every velocity 2/3 of the truth (verified
+                // against Gazebo ground truth: EV/true 0.67 -> 1.00).
                 const bool sim = ((flow_msg.device_id >> 16) & 0xFFU) == DRV_FLOW_DEVTYPE_SIM;
 
                 if (sim && flow_msg.quality == 255U) {
-                    _flow_carry_us += flow_msg.integration_timespan_us;
                     ++_flow_placeholders;
                     flow_updated = false;
-
-                } else if (_flow_carry_us != 0U) {
-                    flow_msg.integration_timespan_us += _flow_carry_us;
-                    _flow_carry_us = 0U;
                 }
             }
             if (range_updated) { orb_copy(ORB_ID(distance_sensor), _range_sub, &range_msg); }
@@ -712,7 +732,13 @@ Fusion output is not supported. The -e option is intentionally rejected.
             publish_debug(out, flow_msg.quality);
             handle_safety(out, now_us);
             _last_health_pub_us = now_us;
+#if defined(__PX4_POSIX)
 
+            if (_publish_ev) {
+                publish_ev_velocity(out, flow, attitude);
+            }
+
+#endif
         }
     }
 
@@ -790,6 +816,11 @@ private:
         };
         imu.valid = msg.timestamp_sample != 0U && msg.delta_angle_dt > 0U && msg.delta_velocity_dt > 0U &&
                     msg.delta_angle_clipping == 0U && msg.delta_velocity_clipping == 0U;
+#if defined(__PX4_POSIX)
+
+        if (g_fault_imu) { imu.valid = false; }
+
+#endif
         return imu;
     }
 
@@ -800,6 +831,95 @@ private:
         float yaw = 0.0f;
         quat_to_euler(msg.q, roll, pitch, yaw);
         return ofnav::AttitudeSample{msg.timestamp_sample, roll, pitch, yaw};
+    }
+
+#if defined(__PX4_POSIX)
+    // SITL only: the accepted flow measurement as EKF2 external-vision
+    // velocity in body FRD axes. Vertical body velocity is DERIVED from
+    // the measured rangefinder height rate and the attitude, never set.
+    void publish_ev_velocity(const ofnav::RuntimeOutput &out, const ofnav::OpticalFlowRadSample &flow,
+                             const ofnav::AttitudeSample &attitude)
+    {
+        float vd = 0.0f;
+        float sigma_vd = 0.0f;
+        const bool have_rate = isFiniteHeight(out.flow.height_m) &&
+                               _range_rate.push(flow.time_us, out.flow.height_m, vd, sigma_vd);
+
+        if (!isFiniteHeight(out.flow.height_m)) { _range_rate.reset(); }
+
+        ofnav::BodyVelocity3d v{};
+
+        if (!out.flow.accepted || !have_rate ||
+            !ofnav::bodyVelocity3d(out.flow.velocity_body_m_s, out.flow.velocity_sigma_m_s, vd, sigma_vd,
+                                   attitude, 0.45f, v)) {
+            ++_ev_skipped;
+            return;
+        }
+
+        vehicle_odometry_s odom{};
+        // Mean velocity over the flow interval: stamp its midpoint.
+        odom.timestamp_sample = flow.time_us - static_cast<uint64_t>(flow.integration_time_s * 0.5e6f);
+        odom.pose_frame = vehicle_odometry_s::POSE_FRAME_UNKNOWN;
+        odom.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_BODY_FRD;
+
+        for (int i = 0; i < 3; ++i) {
+            odom.position[i] = NAN;
+            odom.angular_velocity[i] = NAN;
+            odom.position_variance[i] = NAN;
+            odom.orientation_variance[i] = NAN;
+        }
+
+        odom.q[0] = NAN;
+        odom.velocity[0] = v.velocity_m_s.x;
+        odom.velocity[1] = v.velocity_m_s.y;
+        odom.velocity[2] = v.velocity_m_s.z;
+        odom.velocity_variance[0] = v.variance_m2_s2.x;
+        odom.velocity_variance[1] = v.variance_m2_s2.y;
+        odom.velocity_variance[2] = v.variance_m2_s2.z;
+        odom.quality = 100;
+        odom.timestamp = hrt_absolute_time();
+        _ev_pub.publish(odom);
+        ++_ev_published;
+    }
+
+    static bool isFiniteHeight(float h) { return ofnav::isFiniteValue(h) && h > 0.0f; }
+#endif
+
+    // Safety timings from OFNAV_* parameters (module.yaml), read at start.
+    // An inconsistent set keeps the validated defaults and is reported.
+    void load_safety_params()
+    {
+        ofnav::SafetyActionConfig cfg{};
+        const struct {
+            const char *name;
+            uint64_t *field;
+        } items[] = {
+            {"OFNAV_FS_CONF", &cfg.failsafe_confirm_us},
+            {"OFNAV_DEG_CONF", &cfg.degraded_confirm_us},
+            {"OFNAV_DEG_LAND", &cfg.degraded_to_land_us},
+            {"OFNAV_RECOVERY", &cfg.recovery_us},
+        };
+
+        for (const auto &item : items) {
+            int32_t value_ms = 0;
+            const param_t handle = param_find(item.name);
+
+            if (handle != PARAM_INVALID && param_get(handle, &value_ms) == PX4_OK && value_ms > 0) {
+                *item.field = static_cast<uint64_t>(value_ms) * 1000U;
+            }
+        }
+
+        if (ofnav::validSafetyActionConfig(cfg)) {
+            _safety_cfg = cfg;
+            _safety_params_valid = true;
+
+        } else {
+            PX4_ERR("inconsistent OFNAV_* safety timings, defaults kept");
+            _safety_cfg = ofnav::SafetyActionConfig{};
+            _safety_params_valid = false;
+        }
+
+        _safety = ofnav::SafetyActionManager(_safety_cfg);
     }
 
     void publish_eskf(uint64_t now_us)
@@ -956,7 +1076,6 @@ private:
     static constexpr unsigned kReasonSlots = 16U;
     uint32_t _reasons[kReasonSlots] {};
     ofnav::RuntimeOutput _last_out{};
-    uint32_t _flow_carry_us{0U};
     uint32_t _flow_placeholders{0U};
     ofnav::OpticalFlowRadSample _last_flow{};
     ofnav::GyroIntegrator _gyro{};
@@ -971,8 +1090,17 @@ private:
     vehicle_land_detected_s _land_msg{};
     vehicle_status_s _status_msg{};
     ofnav::SafetyActionManager _safety{};
+    ofnav::SafetyActionConfig _safety_cfg{};
+    bool _safety_params_valid{true};
     ofnav::SafetyDecision _last_decision{};
     uORB::Publication<vehicle_command_s> _command_pub{ORB_ID(vehicle_command)};
+    bool _publish_ev{false};
+    uint32_t _ev_published{0U};
+    uint32_t _ev_skipped{0U};
+#if defined(__PX4_POSIX)
+    ofnav::RangeRateEstimator _range_rate{0.02f};
+    uORB::Publication<vehicle_odometry_s> _ev_pub{ORB_ID(vehicle_visual_odometry)};
+#endif
     orb_advert_t _debug_action_pub{nullptr};
     int _debug_action_instance{-1};
     uint32_t _commands_sent{0U};

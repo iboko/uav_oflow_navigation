@@ -5,6 +5,8 @@ px4_add_module(
     MODULE modules__ofnav
     MAIN ofnav
     STACK_MAIN 4096
+    MODULE_CONFIG
+        module.yaml
     SRCS
         ofnav_px4.cpp
         ofnav_sitl_csv_replay.cpp

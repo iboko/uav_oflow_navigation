@@ -1,0 +1,40 @@
+module_name: ofnav
+parameters:
+  - group: Optical flow navigation (ofnav)
+    definitions:
+      OFNAV_FS_CONF:
+        description:
+          short: ofnav FAILSAFE_LAND confirmation time
+          long: FAILSAFE_LAND (stale range, IMU or attitude invalid, excessive tilt) must persist this long before the LAND action is requested. Read at module start.
+        type: int32
+        default: 200
+        min: 50
+        max: 2000
+        unit: ms
+      OFNAV_DEG_CONF:
+        description:
+          short: ofnav degraded navigation confirmation time
+          long: DEGRADED_HOLD or FAILSAFE_LAND must persist this long before ALTITUDE_HOLD is requested. Read at module start.
+        type: int32
+        default: 300
+        min: 50
+        max: 5000
+        unit: ms
+      OFNAV_DEG_LAND:
+        description:
+          short: ofnav unrecovered degradation escalation to LAND
+          long: Degradation without a full recovery for this long escalates ALTITUDE_HOLD to a latched LAND. Must exceed OFNAV_DEG_CONF. Read at module start.
+        type: int32
+        default: 5000
+        min: 1000
+        max: 60000
+        unit: ms
+      OFNAV_RECOVERY:
+        description:
+          short: ofnav recovery time
+          long: Continuous FLOW_NAV needed to clear ALTITUDE_HOLD and to establish navigation (engagement). Read at module start.
+        type: int32
+        default: 1000
+        min: 200
+        max: 10000
+        unit: ms
