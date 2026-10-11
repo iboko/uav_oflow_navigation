@@ -5,15 +5,24 @@
 Номинал: p, v, q(FRD->NED), b_gyro, b_accel.
 
 δθ — ПРАВАЯ ошибка ориентации: R_true = R_nom Exp([δθ]x).
-Визуальная коррекция использует только скорость VN,VE центра масс:
-при этом полная наблюдаемость 15 состояний НЕ гарантирована.
-Географической привязки и обработки запаздывающих измерений нет.
-Результат НЕ подключен к PX4 и не является сертифицированной VIO.
+Коррекции (те же модели, что в firmware/rtos_core/src/eskf15.cpp):
+
+- VN, VE центра масс (``update_visual_velocity``);
+- скорость в осях корпуса FRD x, y (``update_body_velocity``):
+  h = [R^T v]_xy, якобиан по δθ = [R^T v]x — связывает камеру
+  и ИИМ без внешней ориентации, курс наблюдаем при маневрах;
+- курс (``update_yaw``), например по ортофотоплану;
+- положение N, E по ортофотоплану (``update_map_position``) с
+  ковариационным пересечением при неизвестной корреляции с VO.
+
+Полная наблюдаемость 15 состояний НЕ гарантирована (см.
+``src/eskf_observability.py``). Результат НЕ передается в EKF2.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
+from math import atan2, cos, isfinite, sin, sqrt
+from typing import Sequence
 
 import numpy as np
 
@@ -28,6 +37,11 @@ V = slice(3, 6)
 TH = slice(6, 9)
 BG = slice(9, 12)
 BA = slice(12, 15)
+GRAVITY = 9.80665
+EARTH_RATE_RAD_S = 7.2921159e-5
+CHI2_1_99 = 6.6348966010212145
+# Kind order == processing order for equal timestamps (same as C++).
+KIND_ORDER = {"velocity_ne": 0, "body_velocity_xy": 1, "yaw": 2, "position_ne": 3}
 _FATAL = frozenset({
     "IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE", "BIAS_LIMIT_EXCEEDED",
     "POSTERIOR_INVALID",
@@ -119,6 +133,134 @@ def discrete_process_covariance(
 
 
 @dataclass(frozen=True)
+class BodyVelocityMeasurement:
+    """Скорость центра масс в осях корпуса FRD x, y (камера + дальномер)."""
+    timestamp_us: int
+    x_m_s: float
+    y_m_s: float
+    covariance_xy_m2_s2: tuple[tuple[float, float], tuple[float, float]]
+
+
+@dataclass(frozen=True)
+class YawMeasurement:
+    """Курс оси x FRD от севера, рад (ортофотоплан, магнитометр)."""
+    timestamp_us: int
+    yaw_rad: float
+    variance_rad2: float
+
+
+@dataclass(frozen=True)
+class MapPositionMeasurement:
+    """Положение N, E по ортофотоплану в локальной СК фильтра.
+
+    ci_weight: 1 — независимое измерение (стандартная коррекция);
+    (0, 1) — ковариационное пересечение по всему состоянию: P/w, R/(1-w);
+    <= 0 — w выбирается на сетке 0,05..0,95 минимизацией det блока положения.
+    """
+    timestamp_us: int
+    north_m: float
+    east_m: float
+    covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]]
+    ci_weight: float = 1.0
+
+
+def measurement_kind(measurement: object) -> str:
+    if isinstance(measurement, VisualVelocityMeasurement):
+        return "velocity_ne"
+    if isinstance(measurement, BodyVelocityMeasurement):
+        return "body_velocity_xy"
+    if isinstance(measurement, YawMeasurement):
+        return "yaw"
+    if isinstance(measurement, MapPositionMeasurement):
+        return "position_ne"
+    raise TypeError("Неизвестный тип измерения")
+
+
+def choose_ci_weight(prior_ne: np.ndarray, measurement_ne: np.ndarray) -> float:
+    """argmax_w det(w P^-1 + (1-w) R^-1), w in {0.05, ..., 0.95}.
+
+    Детерминированная сетка совпадает с C++ (chooseCiWeight).
+    """
+    pi_ = np.linalg.inv(prior_ne)
+    ri = np.linalg.inv(measurement_ne)
+    best_w, best = 0.5, -np.inf
+    for step in range(5, 96):
+        w = step / 100.
+        c = w * pi_ + (1. - w) * ri
+        det = float(c[0, 0] * c[1, 1] - c[0, 1] * c[1, 0])
+        if det > best:
+            best, best_w = det, w
+    return best_w
+
+
+@dataclass(frozen=True)
+class AlignmentResult:
+    status: str
+    quaternion_body_to_ned: tuple[float, float, float, float] | None = None
+    gyro_bias_rad_s: tuple[float, float, float] | None = None
+    initial_error_sigma: tuple[float, ...] | None = None
+
+
+def static_alignment(
+    readings: Sequence[ImuReading], *, yaw_rad: float, yaw_sigma_rad: float,
+    prior_sigma: tuple[float, ...] = (
+        10., 10., 10., 1., 1., 1., 0.1, 0.1, 0.1,
+        0.02, 0.02, 0.02, 0.2, 0.2, 0.2,
+    ),
+    min_samples: int = 50, max_gyro_std_rad_s: float = 0.01,
+    max_accel_std_m_s2: float = 0.15, max_gravity_error_m_s2: float = 0.5,
+    max_gyro_bias_rad_s: float = 0.3,
+) -> AlignmentResult:
+    """Грубая выставка на неподвижном основании (как staticAlignment в C++).
+
+    Крен/тангаж — по средней удельной силе, смещение гироскопов — по
+    среднему. Курс по неподвижной ИИМ MEMS ненаблюдаем и задается
+    извне вместе с СКО. Смещение акселерометров неотделимо от наклона:
+    его априорная СКО добавляется к СКО крена/тангажа.
+    """
+    if not (isfinite(yaw_rad) and isfinite(yaw_sigma_rad) and yaw_sigma_rad > 0
+            and min_samples >= 2):
+        return AlignmentResult("INVALID_INPUT")
+    if len(readings) < min_samples:
+        return AlignmentResult("TOO_FEW_SAMPLES")
+    try:
+        w = np.array([_vector(r.gyro_body_rad_s, 3, "гироскоп") for r in readings])
+        f = np.array([_vector(r.specific_force_body_m_s2, 3, "акселерометр")
+                      for r in readings])
+    except ValueError:
+        return AlignmentResult("INVALID_INPUT")
+    stamps = [r.timestamp_us for r in readings]
+    if any(b <= a for a, b in zip(stamps, stamps[1:])) or stamps[0] <= 0:
+        return AlignmentResult("INVALID_INPUT")
+    n = len(readings)
+    mw, mf = w.mean(axis=0), f.mean(axis=0)
+    sw = sqrt(float(np.sum((w - mw) ** 2)) / (3. * (n - 1)))
+    sf = sqrt(float(np.sum((f - mf) ** 2)) / (3. * (n - 1)))
+    if sw > max_gyro_std_rad_s or sf > max_accel_std_m_s2 or (
+            float(np.linalg.norm(mw)) > max_gyro_bias_rad_s):
+        return AlignmentResult("NOT_STATIONARY")
+    if abs(float(np.linalg.norm(mf)) - GRAVITY) > max_gravity_error_m_s2:
+        return AlignmentResult("GRAVITY_MISMATCH")
+    roll = atan2(-mf[1], -mf[2])
+    pitch = atan2(mf[0], sqrt(mf[1] ** 2 + mf[2] ** 2))
+    cr, sr = cos(.5 * roll), sin(.5 * roll)
+    cp, sp = cos(.5 * pitch), sin(.5 * pitch)
+    cy, sy = cos(.5 * yaw_rad), sin(.5 * yaw_rad)
+    q = (cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+         cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
+    sigma = list(_vector(prior_sigma, 15, "априорные СКО"))
+    tilt = sqrt(sf * sf / n / GRAVITY ** 2 + (sigma[12] / GRAVITY) ** 2)
+    sigma[6] = sigma[7] = max(tilt, 1e-4)
+    sigma[8] = yaw_sigma_rad
+    gb = sqrt(sw * sw / n + EARTH_RATE_RAD_S ** 2)
+    for k in range(9, 12):
+        sigma[k] = max(gb, 1e-6)
+    for k in range(3, 6):
+        sigma[k] = min(sigma[k], 0.05)
+    return AlignmentResult("ALIGNED", q, tuple(float(x) for x in mw), tuple(sigma))
+
+
+@dataclass(frozen=True)
 class EskfSnapshot:
     timestamp_us: int
     status: str
@@ -155,13 +297,14 @@ class InertialErrorStateFilter:
         ),
         max_imu_dt_s: float = 0.05,
         nis_gate: float = 9.210340371976184,
+        nis_gate_1d: float = CHI2_1_99,
         max_gyro_bias_rad_s: float = 0.3,
         max_accel_bias_m_s2: float = 3.0,
     ) -> None:
         if not noise.valid() or not 0.001 <= max_imu_dt_s <= 0.05:
             raise ValueError("Недопустимые характеристики шума/интервала ИИМ")
         if not all(isfinite(v) and v > 0 for v in (
-            nis_gate, max_gyro_bias_rad_s, max_accel_bias_m_s2
+            nis_gate, nis_gate_1d, max_gyro_bias_rad_s, max_accel_bias_m_s2
         )):
             raise ValueError("Недопустимый порог инновации/смещений нуля")
         sigmas = _vector(initial_error_sigma, 15, "начальные сигмы состояния")
@@ -176,10 +319,12 @@ class InertialErrorStateFilter:
         self.noise = noise
         self.max_imu_dt_s = max_imu_dt_s
         self.nis_gate = nis_gate
+        self.nis_gate_1d = nis_gate_1d
         self.max_bg = max_gyro_bias_rad_s
         self.max_ba = max_accel_bias_m_s2
         self._last: ImuReading | None = None
-        self._last_visual_us: int | None = None
+        self._last_measurement_us: dict[str, int] = {}
+        self.last_ci_weight = 1.0
         self._accepted = 0
         self._rejected = 0
         self._nis = float("nan")
@@ -247,66 +392,190 @@ class InertialErrorStateFilter:
             return self._fail("IMU_INVALID_OR_GAP")
         return self.snapshot()
 
+    def apply(self, measurement: object) -> EskfSnapshot:
+        """Коррекция по измерению любого поддерживаемого типа."""
+        kind = measurement_kind(measurement)
+        if kind == "velocity_ne":
+            return self.update_visual_velocity(measurement)
+        if kind == "body_velocity_xy":
+            return self.update_body_velocity(measurement)
+        if kind == "yaw":
+            return self.update_yaw(measurement)
+        return self.update_map_position(measurement)
+
+    def _admit(self, kind: str, stamp: object) -> str | None:
+        if self._status in _FATAL:
+            return "FATAL"
+        if self._last is None:
+            return "NO_IMU_REFERENCE"
+        if not isinstance(stamp, int) or stamp != self._last.timestamp_us:
+            return "UNALIGNED_VISUAL_TIMESTAMP"
+        last = self._last_measurement_us.get(kind)
+        if last is not None and stamp <= last:
+            return "REPEATED_VISUAL_TIMESTAMP"
+        return None
+
+    def _correct(
+        self, kind: str, stamp: int, innovation: np.ndarray, h: np.ndarray,
+        r: np.ndarray, *, gate: float, corrected: str, outlier: str,
+        ci_weight: float = 1.0,
+    ) -> EskfSnapshot:
+        """Общая коррекция: NIS по честной S = HPH^T + R, форма Джозефа.
+
+        При ci_weight < 1: (I-KH)(P/w)(I-KH)^T + K(R/(1-w))K^T,
+        K = (P/w)H^T S_ci^-1 — ковариационное пересечение по полному
+        состоянию для оценок с неизвестной взаимной корреляцией.
+        """
+        s = h @ self.covariance @ h.T + r
+        l = np.linalg.cholesky(s)
+        normalized = np.linalg.solve(l, innovation)
+        nis = float(normalized @ normalized)
+        self._nis = nis
+        self._last_measurement_us[kind] = stamp
+        if nis > gate:
+            self._rejected += 1
+            return self._fail(outlier)
+        w = 1.0
+        if kind == "position_ne" and ci_weight < 1.0:
+            w = ci_weight if ci_weight > 0 else choose_ci_weight(
+                self.covariance[0:2, 0:2], r)
+        pw = self.covariance / w
+        rw = r / (1.0 - w) if w < 1.0 else r
+        s_ci = h @ pw @ h.T + rw
+        k = np.linalg.solve(s_ci, h @ pw).T
+        dx = k @ innovation
+        candidate_bg = self.bg + dx[BG]
+        candidate_ba = self.ba + dx[BA]
+        if (np.linalg.norm(candidate_bg) > self.max_bg or
+                np.linalg.norm(candidate_ba) > self.max_ba):
+            return self._fail("BIAS_LIMIT_EXCEEDED")
+        a = np.eye(15) - k @ h
+        cov = a @ pw @ a.T + k @ rw @ k.T  # Joseph update
+        # Reset Jacobian for right-multiplicative orientation error.
+        reset = np.eye(15)
+        reset[TH, TH] -= 0.5 * skew(dx[TH])
+        cov = reset @ cov @ reset.T
+        cov = 0.5 * (cov + cov.T)
+        q_new = _unit_quaternion(quat_product(
+            self.q, quat_exponential(dx[TH])
+        ))
+        if not np.isfinite(cov).all() or np.linalg.eigvalsh(cov)[0] <= 0:
+            return self._fail("POSTERIOR_INVALID")
+        self.p += dx[P]
+        self.v += dx[V]
+        self.q = q_new
+        self.bg = candidate_bg
+        self.ba = candidate_ba
+        self.covariance = cov
+        self.last_ci_weight = w
+        self._accepted += 1
+        return self._fail(corrected)
+
+    @staticmethod
+    def _covariance2(value: object) -> np.ndarray:
+        r = np.asarray(value, dtype=float)
+        if (r.shape != (2, 2) or not np.isfinite(r).all() or
+                not np.allclose(r, r.T, atol=1e-10) or
+                np.linalg.eigvalsh(r)[0] <= 0):
+            raise ValueError("Матрица ошибок измерения")
+        return r
+
     def update_visual_velocity(
         self, measurement: VisualVelocityMeasurement,
     ) -> EskfSnapshot:
-        if self._status in _FATAL:
+        refused = self._admit("velocity_ne", measurement.timestamp_us)
+        if refused == "FATAL":
             return self.snapshot()
-        if self._last is None:
-            return self._fail("NO_IMU_REFERENCE")
-        stamp = measurement.timestamp_us
-        if not isinstance(stamp, int) or stamp != self._last.timestamp_us:
-            return self._fail("UNALIGNED_VISUAL_TIMESTAMP")
-        if self._last_visual_us is not None and stamp <= self._last_visual_us:
-            return self._fail("REPEATED_VISUAL_TIMESTAMP")
+        if refused is not None:
+            return self._fail(refused)
         try:
             z = _vector((measurement.north_m_s, measurement.east_m_s), 2,
                         "визуальная скорость")
-            r = np.asarray(measurement.covariance_ne_m2_s2, dtype=float)
-            if (r.shape != (2, 2) or not np.isfinite(r).all() or
-                    not np.allclose(r, r.T, atol=1e-10) or
-                    np.linalg.eigvalsh(r)[0] <= 0):
-                raise ValueError("Матрица ошибок визуального измерения")
+            r = self._covariance2(measurement.covariance_ne_m2_s2)
             h = np.zeros((2, 15))
             h[:, 3:5] = np.eye(2)
-            innovation = z - self.v[:2]
-            s = h @ self.covariance @ h.T + r
-            l = np.linalg.cholesky(s)
-            normalized = np.linalg.solve(l, innovation)
-            nis = float(normalized @ normalized)
-            self._nis = nis
-            self._last_visual_us = stamp
-            if nis > self.nis_gate:
-                self._rejected += 1
-                return self._fail("VISUAL_OUTLIER_REJECTED")
-            k = np.linalg.solve(s, h @ self.covariance).T
-            dx = k @ innovation
-            candidate_bg = self.bg + dx[BG]
-            candidate_ba = self.ba + dx[BA]
-            if (np.linalg.norm(candidate_bg) > self.max_bg or
-                    np.linalg.norm(candidate_ba) > self.max_ba):
-                return self._fail("BIAS_LIMIT_EXCEEDED")
+            return self._correct(
+                "velocity_ne", measurement.timestamp_us, z - self.v[:2], h, r,
+                gate=self.nis_gate, corrected="VISUAL_CORRECTED",
+                outlier="VISUAL_OUTLIER_REJECTED")
+        except (ValueError, np.linalg.LinAlgError):
+            self._rejected += 1
+            return self._fail("VISUAL_COVARIANCE_INVALID")
 
-            a = np.eye(15) - k @ h
-            cov = a @ self.covariance @ a.T + k @ r @ k.T  # Joseph update
-            # Reset Jacobian for right-multiplicative orientation error.
-            reset = np.eye(15)
-            reset[TH, TH] -= 0.5 * skew(dx[TH])
-            cov = reset @ cov @ reset.T
-            cov = 0.5 * (cov + cov.T)
-            q_new = _unit_quaternion(quat_product(
-                self.q, quat_exponential(dx[TH])
-            ))
-            if not np.isfinite(cov).all() or np.linalg.eigvalsh(cov)[0] <= 0:
-                return self._fail("POSTERIOR_INVALID")
-            self.p += dx[P]
-            self.v += dx[V]
-            self.q = q_new
-            self.bg = candidate_bg
-            self.ba = candidate_ba
-            self.covariance = cov
-            self._accepted += 1
-            return self._fail("VISUAL_CORRECTED")
+    def update_body_velocity(
+        self, measurement: BodyVelocityMeasurement,
+    ) -> EskfSnapshot:
+        refused = self._admit("body_velocity_xy", measurement.timestamp_us)
+        if refused == "FATAL":
+            return self.snapshot()
+        if refused is not None:
+            return self._fail(refused)
+        try:
+            z = _vector((measurement.x_m_s, measurement.y_m_s), 2,
+                        "скорость в осях корпуса")
+            r = self._covariance2(measurement.covariance_xy_m2_s2)
+            rot = rotation_body_to_ned(self.q)
+            u = rot.T @ self.v
+            h = np.zeros((2, 15))
+            h[:, V] = rot.T[0:2, :]
+            h[:, TH] = skew(u)[0:2, :]
+            return self._correct(
+                "body_velocity_xy", measurement.timestamp_us, z - u[0:2], h, r,
+                gate=self.nis_gate, corrected="VISUAL_CORRECTED",
+                outlier="VISUAL_OUTLIER_REJECTED")
+        except (ValueError, np.linalg.LinAlgError):
+            self._rejected += 1
+            return self._fail("VISUAL_COVARIANCE_INVALID")
+
+    def update_yaw(self, measurement: YawMeasurement) -> EskfSnapshot:
+        refused = self._admit("yaw", measurement.timestamp_us)
+        if refused == "FATAL":
+            return self.snapshot()
+        if refused is not None:
+            return self._fail(refused)
+        try:
+            yaw = float(measurement.yaw_rad)
+            var = float(measurement.variance_rad2)
+            if not (isfinite(yaw) and isfinite(var) and 1e-12 < var < 10.):
+                raise ValueError("Дисперсия курса")
+            rot = rotation_body_to_ned(self.q)
+            den = rot[0, 0] ** 2 + rot[1, 0] ** 2
+            if den <= 1e-6:
+                raise ValueError("Курс не определен при вертикальной оси x")
+            residual = atan2(sin(yaw - atan2(rot[1, 0], rot[0, 0])),
+                             cos(yaw - atan2(rot[1, 0], rot[0, 0])))
+            h = np.zeros((1, 15))
+            h[0, 7] = (rot[1, 0] * rot[0, 2] - rot[0, 0] * rot[1, 2]) / den
+            h[0, 8] = (rot[0, 0] * rot[1, 1] - rot[1, 0] * rot[0, 1]) / den
+            return self._correct(
+                "yaw", measurement.timestamp_us, np.array([residual]), h,
+                np.array([[var]]), gate=self.nis_gate_1d,
+                corrected="YAW_CORRECTED", outlier="YAW_OUTLIER_REJECTED")
+        except (ValueError, np.linalg.LinAlgError):
+            self._rejected += 1
+            return self._fail("VISUAL_COVARIANCE_INVALID")
+
+    def update_map_position(
+        self, measurement: MapPositionMeasurement,
+    ) -> EskfSnapshot:
+        refused = self._admit("position_ne", measurement.timestamp_us)
+        if refused == "FATAL":
+            return self.snapshot()
+        if refused is not None:
+            return self._fail(refused)
+        try:
+            w = float(measurement.ci_weight)
+            if not isfinite(w) or w > 1. or (0. < w < 1. and not .01 <= w <= .99):
+                raise ValueError("Вес ковариационного пересечения")
+            z = _vector((measurement.north_m, measurement.east_m), 2,
+                        "положение по карте")
+            r = self._covariance2(measurement.covariance_ne_m2)
+            h = np.zeros((2, 15))
+            h[:, 0:2] = np.eye(2)
+            return self._correct(
+                "position_ne", measurement.timestamp_us, z - self.p[:2], h, r,
+                gate=self.nis_gate, corrected="POSITION_CORRECTED",
+                outlier="POSITION_OUTLIER_REJECTED", ci_weight=w)
         except (ValueError, np.linalg.LinAlgError):
             self._rejected += 1
             return self._fail("VISUAL_COVARIANCE_INVALID")

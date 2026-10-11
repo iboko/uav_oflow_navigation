@@ -22,16 +22,41 @@ int main() {
             return 1;
         }
     }
-    const ofnav15::Visual late{
-        1255000U,{.13,.03},{.04,0.,0.,.04}
+    // Frame 1 (exposure between IMU samples): all four aiding kinds,
+    // orthophoto fix with automatic covariance intersection. Delivered
+    // BEFORE the older frame 2 (velocity + independent map fix).
+    using K=ofnav15::MeasurementKind;
+    auto make=[](std::uint64_t t, K kind, double a, double b,
+                 double c00, double c01, double c11, double ci) {
+        ofnav15::Measurement m{};
+        m.time_us=t; m.kind=kind; m.value={a,b};
+        m.covariance={c00,c01,c01,c11}; m.ci_weight=ci;
+        return m;
     };
-    const ofnav15::Visual early{
-        1120000U,{.07,.02},{.04,0.,0.,.04}
+    const ofnav15::Measurement late[4]={
+        make(1255000U,K::VelocityNe,.13,.03,.04,0.,.04,1.),
+        make(1255000U,K::BodyVelocityXy,.128,.036,.05,.004,.05,1.),
+        make(1255000U,K::Yaw,.006,0.,.0004,0.,0.,1.),
+        make(1255000U,K::PositionNe,.4,-.3,4.,.5,3.,0.)
     };
-    if (replay.pushDelayedVelocity(late)!=ofnav15::Status::VisualCorrected ||
-        replay.pushDelayedVelocity(early)!=ofnav15::Status::VisualCorrected) {
-        std::fprintf(stderr,"C++ delayed replay failure\n");
-        return 1;
+    const ofnav15::Measurement early[2]={
+        make(1120000U,K::VelocityNe,.07,.02,.04,0.,.04,1.),
+        make(1120000U,K::PositionNe,.1,.05,9.,0.,9.,1.)
+    };
+    ofnav15::Status s_late[4]{}, s_early[2]{};
+    (void)replay.pushDelayedFrame(late,4,s_late);
+    (void)replay.pushDelayedFrame(early,2,s_early);
+    for(const auto s:s_late) {
+        if (!ofnav15::measurementProcessed(s)) {
+            std::fprintf(stderr,"C++ delayed replay failure %s\n",ofnav15::statusName(s));
+            return 1;
+        }
+    }
+    for(const auto s:s_early) {
+        if (!ofnav15::measurementProcessed(s)) {
+            std::fprintf(stderr,"C++ delayed replay failure %s\n",ofnav15::statusName(s));
+            return 1;
+        }
     }
     const auto &f=replay.current();
     std::printf("{\"timestamp_us\":%llu,\"accepted\":%u,\"rejected\":%u,",
@@ -53,6 +78,6 @@ int main() {
     print_array("gyro_bias",f.gyroBias(),true);
     print_array("accel_bias",f.accelBias(),true);
     print_array("covariance",f.covariance(),true);
-    std::printf("\"nis\":%.17g}\n",f.lastNis());
+    std::printf("\"nis\":%.17g,\"ci_weight\":%.17g}\n",f.lastNis(),f.lastCiWeight());
     return 0;
 }

@@ -13,7 +13,10 @@ from pathlib import Path
 
 import numpy as np
 
-from src.error_state_inertial_filter import InertialErrorStateFilter, ImuNoiseDensity
+from src.error_state_inertial_filter import (
+    BodyVelocityMeasurement, ImuNoiseDensity, InertialErrorStateFilter,
+    MapPositionMeasurement, YawMeasurement,
+)
 from src.fixed_lag_eskf_replay import FixedLagEskfReplay
 from src.horizontal_visual_inertial_filter import VisualVelocityMeasurement
 from src.imu_preintegration import ImuBias, ImuReading
@@ -46,16 +49,25 @@ def run_parity(executable: str | Path, *, atol: float = 1.e-6) -> dict:
                 -9.80665+.02*math.sin(.41*t),
             )
         ))
-    for timestamp,vn,ve in ((1255000,.13,.03),(1120000,.07,.02)):
-        feedback=python.push_delayed_visual(
-            VisualVelocityMeasurement(
-                timestamp,vn,ve,((.04,0.),(0.,.04))
-            )
-        )
-        if feedback.status != "VISUAL_CORRECTED":
-            raise AssertionError(
-                f"Python delayed visual failed: {feedback.status}"
-            )
+    late=[
+        VisualVelocityMeasurement(1255000,.13,.03,((.04,0.),(0.,.04))),
+        BodyVelocityMeasurement(1255000,.128,.036,((.05,.004),(.004,.05))),
+        YawMeasurement(1255000,.006,.0004),
+        MapPositionMeasurement(1255000,.4,-.3,((4.,.5),(.5,3.)),0.),
+    ]
+    early=[
+        VisualVelocityMeasurement(1120000,.07,.02,((.04,0.),(0.,.04))),
+        MapPositionMeasurement(1120000,.1,.05,((9.,0.),(0.,9.)),1.),
+    ]
+    processed={"VISUAL_CORRECTED","VISUAL_OUTLIER_REJECTED","YAW_CORRECTED",
+               "YAW_OUTLIER_REJECTED","POSITION_CORRECTED",
+               "POSITION_OUTLIER_REJECTED"}
+    for frame in (late,early):
+        for feedback in python.push_delayed_frame(frame):
+            if feedback.status not in processed:
+                raise AssertionError(
+                    f"Python delayed measurement failed: {feedback.status}"
+                )
     reference=python.state
     expected={
         "position":np.asarray(reference.position_ned_m,dtype=float),
@@ -86,14 +98,22 @@ def run_parity(executable: str | Path, *, atol: float = 1.e-6) -> dict:
     nis_error=abs(cpp["nis"]-reference.last_nis)
     if nis_error>atol:
         raise AssertionError("C++ and Python NIS disagree")
+    # The last committed state was produced by replaying both frames; the
+    # most recent CI weight belongs to the late frame's map fix.
+    python_filter=python._filter
+    ci_error=abs(cpp["ci_weight"]-python_filter.last_ci_weight)
+    if ci_error>1e-12:
+        raise AssertionError("C++ and Python covariance-intersection weights disagree")
     return {
         "type":"DETERMINISTIC_SYNTHETIC_CPP_PYTHON_ESKF_PARITY",
         "passed":True,
         "state_dimensions":15,
         "covariance_entries_compared":225,
         "imu_samples":50,
-        "out_of_order_visual_measurements":2,
-        "one_visual_time_interpolated_between_imu_samples":True,
+        "out_of_order_frames":2,
+        "measurement_kinds":["velocity_ne","body_velocity_xy","yaw","position_ne"],
+        "automatic_covariance_intersection_weight":cpp["ci_weight"],
+        "one_frame_time_interpolated_between_imu_samples":True,
         "timestamp_us":cpp["timestamp_us"],
         "max_absolute_error_by_field":tolerances,
         "last_nis_absolute_error":nis_error,

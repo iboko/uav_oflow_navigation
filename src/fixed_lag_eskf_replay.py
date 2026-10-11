@@ -16,9 +16,17 @@ from typing import Callable
 
 import numpy as np
 
-from .error_state_inertial_filter import InertialErrorStateFilter, EskfSnapshot
+from .error_state_inertial_filter import (
+    KIND_ORDER, BodyVelocityMeasurement, EskfSnapshot, InertialErrorStateFilter,
+    MapPositionMeasurement, YawMeasurement, measurement_kind,
+)
 from .horizontal_visual_inertial_filter import VisualVelocityMeasurement
 from .imu_preintegration import ImuReading
+
+_PROCESSED = frozenset({
+    "VISUAL_CORRECTED", "VISUAL_OUTLIER_REJECTED", "YAW_CORRECTED",
+    "YAW_OUTLIER_REJECTED", "POSITION_CORRECTED", "POSITION_OUTLIER_REJECTED",
+})
 
 
 @dataclass(frozen=True)
@@ -44,19 +52,46 @@ def _interpolate(before: ImuReading, after: ImuReading, t: int) -> ImuReading:
     return ImuReading(t, tuple(float(x) for x in omega), tuple(float(x) for x in force))
 
 
-def _measurement_valid(measurement: VisualVelocityMeasurement) -> bool:
+def _covariance_valid(value: object) -> bool:
+    covariance = np.asarray(value, dtype=float)
+    return bool(
+        covariance.shape == (2, 2) and np.isfinite(covariance).all()
+        and np.allclose(covariance, covariance.T, rtol=0, atol=1e-10)
+        and np.linalg.eigvalsh(covariance)[0] > 0
+    )
+
+
+def _measurement_valid(measurement: object) -> bool:
     try:
-        velocity = np.asarray((measurement.north_m_s, measurement.east_m_s), dtype=float)
-        covariance = np.asarray(measurement.covariance_ne_m2_s2, dtype=float)
-        return bool(
-            isinstance(measurement.timestamp_us, int) and measurement.timestamp_us > 0
-            and velocity.shape == (2,) and np.isfinite(velocity).all()
-            and covariance.shape == (2, 2) and np.isfinite(covariance).all()
-            and np.allclose(covariance, covariance.T, rtol=0, atol=1e-10)
-            and np.linalg.eigvalsh(covariance)[0] > 0
-        )
-    except (TypeError, ValueError, np.linalg.LinAlgError):
+        if not (isinstance(measurement.timestamp_us, int)
+                and measurement.timestamp_us > 0):
+            return False
+        if isinstance(measurement, VisualVelocityMeasurement):
+            values = (measurement.north_m_s, measurement.east_m_s)
+            covariance = measurement.covariance_ne_m2_s2
+        elif isinstance(measurement, BodyVelocityMeasurement):
+            values = (measurement.x_m_s, measurement.y_m_s)
+            covariance = measurement.covariance_xy_m2_s2
+        elif isinstance(measurement, MapPositionMeasurement):
+            w = float(measurement.ci_weight)
+            if not np.isfinite(w) or w > 1. or (0. < w < 1. and not .01 <= w <= .99):
+                return False
+            values = (measurement.north_m, measurement.east_m)
+            covariance = measurement.covariance_ne_m2
+        elif isinstance(measurement, YawMeasurement):
+            yaw, var = float(measurement.yaw_rad), float(measurement.variance_rad2)
+            return bool(np.isfinite(yaw) and np.isfinite(var) and 1e-12 < var < 10.)
+        else:
+            return False
+        velocity = np.asarray(values, dtype=float)
+        return bool(velocity.shape == (2,) and np.isfinite(velocity).all()
+                    and _covariance_valid(covariance))
+    except (AttributeError, TypeError, ValueError, np.linalg.LinAlgError):
         return False
+
+
+def _key(measurement: object) -> tuple[int, int]:
+    return measurement.timestamp_us, KIND_ORDER[measurement_kind(measurement)]
 
 
 class FixedLagEskfReplay:
@@ -87,11 +122,11 @@ class FixedLagEskfReplay:
         self._checkpoint_imu: ImuReading | None = None
         self._raw: list[ImuReading] = []
         self._states: list[InertialErrorStateFilter] = []
-        self._visual: dict[int, VisualVelocityMeasurement] = {}
+        self._visual: dict[tuple[int, int], object] = {}
         self._latest_raw_time_us = 0
         self._failed = False
-        self._per_measurement_status: dict[int, str] = {}
-        self._per_measurement_nis: dict[int, float] = {}
+        self._per_measurement_status: dict[tuple[int, int], str] = {}
+        self._per_measurement_nis: dict[tuple[int, int], float] = {}
 
     @property
     def state(self) -> EskfSnapshot:
@@ -110,15 +145,15 @@ class FixedLagEskfReplay:
         while self._raw and self._raw[0].timestamp_us <= cutoff:
             self._checkpoint = self._states.pop(0)
             self._checkpoint_imu = self._raw.pop(0)
-            self._visual = {t: m for t, m in self._visual.items()
-                            if t > self._checkpoint_imu.timestamp_us}
+            limit = self._checkpoint_imu.timestamp_us
+            self._visual = {k: m for k, m in self._visual.items() if k[0] > limit}
             self._per_measurement_status = {
-                t: status for t, status in self._per_measurement_status.items()
-                if t > self._checkpoint_imu.timestamp_us
+                k: status for k, status in self._per_measurement_status.items()
+                if k[0] > limit
             }
             self._per_measurement_nis = {
-                t: value for t, value in self._per_measurement_nis.items()
-                if t > self._checkpoint_imu.timestamp_us
+                k: value for k, value in self._per_measurement_nis.items()
+                if k[0] > limit
             }
 
     def push_imu(self, reading: ImuReading) -> EskfSnapshot:
@@ -152,44 +187,77 @@ class FixedLagEskfReplay:
         self._trim()
         return result
 
-    def push_delayed_visual(
-        self, measurement: VisualVelocityMeasurement,
-    ) -> ReplayResult:
-        t = measurement.timestamp_us
-        def rejected(status: str) -> ReplayResult:
+    def push_delayed_visual(self, measurement: object) -> ReplayResult:
+        """Одно запаздывающее измерение любого поддерживаемого типа."""
+        return self.push_delayed_frame([measurement])[0]
+
+    def push_delayed_frame(self, measurements: list) -> list[ReplayResult]:
+        """Все измерения одного кадра (одна экспозиция) — один пересчет.
+
+        Каждое измерение проверяется отдельно; отклоненные не попадают в
+        историю. При неудаче пересчета не сохраняется ни одно измерение.
+        """
+        if not measurements:
+            raise ValueError("Пустой кадр")
+        stamp = getattr(measurements[0], "timestamp_us", None)
+
+        def rejected(measurement: object, status: str) -> ReplayResult:
             state = self._filter.snapshot()
-            return ReplayResult(status, t, self._latest_raw_time_us, 0,
+            return ReplayResult(status, getattr(measurement, "timestamp_us", 0),
+                                self._latest_raw_time_us, 0,
                                 state.accepted_visual_count,
                                 state.rejected_visual_count, state)
 
-        if self._failed:
-            return rejected("IMU_INVALID_OR_GAP")
-        if not _measurement_valid(measurement):
-            return rejected("INVALID_VISUAL_MEASUREMENT")
-        if self._checkpoint is None or self._checkpoint_imu is None:
-            return rejected("NO_IMU_REFERENCE")
-        if t > self._latest_raw_time_us:
-            return rejected("FUTURE_VISUAL_MEASUREMENT")
-        if self._latest_raw_time_us - t > self._lag_us:
-            return rejected("VISUAL_DELAY_EXCEEDED")
-        if t <= self._checkpoint_imu.timestamp_us:
-            return rejected("OUTSIDE_BUFFERED_HISTORY")
-        if t in self._visual:
-            return rejected("REPEATED_VISUAL_MEASUREMENT")
-        if not self._raw:
-            return rejected("INSUFFICIENT_IMU_HISTORY")
+        results: list[ReplayResult | None] = [None] * len(measurements)
+        admitted: list[tuple[int, object]] = []
+        seen: set[int] = set()
+        for index, measurement in enumerate(measurements):
+            t = getattr(measurement, "timestamp_us", None)
+            status = None
+            if self._failed:
+                status = "IMU_INVALID_OR_GAP"
+            elif t != stamp or not _measurement_valid(measurement):
+                status = "INVALID_VISUAL_MEASUREMENT"
+            elif _key(measurement)[1] in seen:
+                status = "INVALID_VISUAL_MEASUREMENT"
+            elif self._checkpoint is None or self._checkpoint_imu is None:
+                status = "NO_IMU_REFERENCE"
+            elif t > self._latest_raw_time_us:
+                status = "FUTURE_VISUAL_MEASUREMENT"
+            elif self._latest_raw_time_us - t > self._lag_us:
+                status = "VISUAL_DELAY_EXCEEDED"
+            elif t <= self._checkpoint_imu.timestamp_us:
+                status = "OUTSIDE_BUFFERED_HISTORY"
+            elif _key(measurement) in self._visual:
+                status = "REPEATED_VISUAL_MEASUREMENT"
+            elif not self._raw:
+                status = "INSUFFICIENT_IMU_HISTORY"
+            if status is not None:
+                results[index] = rejected(measurement, status)
+                continue
+            seen.add(_key(measurement)[1])
+            admitted.append((index, measurement))
+        if not admitted:
+            return results  # type: ignore[return-value]
 
         candidate = dict(self._visual)
-        candidate[t] = measurement
+        for _, measurement in admitted:
+            candidate[_key(measurement)] = measurement
         try:
             future_filter, future_states, statuses, niss = self._replay(candidate)
         except (ValueError, np.linalg.LinAlgError):
-            return rejected("REPLAY_FAILED")
+            for index, measurement in admitted:
+                results[index] = rejected(measurement, "REPLAY_FAILED")
+            return results  # type: ignore[return-value]
         # Do not persist a candidate which caused an internal correction
         # failure. NIS-based outliers are valid rejections and remain in
         # the chronological event history for reproducible diagnostics.
-        if statuses[t] not in ("VISUAL_CORRECTED", "VISUAL_OUTLIER_REJECTED"):
-            return rejected(statuses[t])
+        if any(statuses[_key(m)] not in _PROCESSED for _, m in admitted):
+            for index, measurement in admitted:
+                status = statuses[_key(measurement)]
+                results[index] = rejected(
+                    measurement, status if status not in _PROCESSED else "REPLAY_FAILED")
+            return results  # type: ignore[return-value]
         # Commit atomically only when replay has completed.
         self._visual = candidate
         self._filter = future_filter
@@ -198,50 +266,54 @@ class FixedLagEskfReplay:
         self._per_measurement_nis = niss
         self._trim()
         state = self._filter.snapshot()
-        return ReplayResult(
-            statuses[t], t, self._latest_raw_time_us, len(self._raw),
-            state.accepted_visual_count, state.rejected_visual_count, state,
-            niss[t],
-        )
+        for index, measurement in admitted:
+            key = _key(measurement)
+            results[index] = ReplayResult(
+                statuses[key], key[0], self._latest_raw_time_us, len(self._raw),
+                state.accepted_visual_count, state.rejected_visual_count, state,
+                niss[key],
+            )
+        return results  # type: ignore[return-value]
 
     def _replay(
-        self, measurements: dict[int, VisualVelocityMeasurement],
+        self, measurements: dict[tuple[int, int], object],
     ) -> tuple[
         InertialErrorStateFilter,
         list[InertialErrorStateFilter],
-        dict[int, str],
-        dict[int, float],
+        dict[tuple[int, int], str],
+        dict[tuple[int, int], float],
     ]:
         assert self._checkpoint is not None and self._checkpoint_imu is not None
         f = deepcopy(self._checkpoint)
         preceding = self._checkpoint_imu
-        ordered = sorted(measurements.values(), key=lambda x: x.timestamp_us)
+        ordered = sorted(measurements.items())
         i = 0
         states: list[InertialErrorStateFilter] = []
-        statuses: dict[int, str] = {}
-        niss: dict[int, float] = {}
+        statuses: dict[tuple[int, int], str] = {}
+        niss: dict[tuple[int, int], float] = {}
+
+        def apply_all_at(stamp: int) -> None:
+            nonlocal i
+            while i < len(ordered) and ordered[i][0][0] == stamp:
+                key, measurement = ordered[i]
+                result = f.apply(measurement)
+                statuses[key] = result.status
+                niss[key] = result.last_nis
+                i += 1
+
         for raw in self._raw:
-            while i < len(ordered) and ordered[i].timestamp_us < raw.timestamp_us:
-                visual = ordered[i]
-                stamp = visual.timestamp_us
+            while i < len(ordered) and ordered[i][0][0] < raw.timestamp_us:
+                stamp = ordered[i][0][0]
                 if stamp <= preceding.timestamp_us:
                     raise ValueError("Визуальное измерение до начала истории")
                 f.predict(_interpolate(preceding, raw, stamp))
                 if f.snapshot().status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE"):
                     raise ValueError("Прогноз завершился отказом")
-                result = f.update_visual_velocity(visual)
-                statuses[stamp] = result.status
-                niss[stamp] = result.last_nis
-                i += 1
+                apply_all_at(stamp)
             f.predict(raw)
             if f.snapshot().status in ("IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE"):
                 raise ValueError("Повторный прогноз завершился отказом")
-            while i < len(ordered) and ordered[i].timestamp_us == raw.timestamp_us:
-                visual = ordered[i]
-                result = f.update_visual_velocity(visual)
-                statuses[visual.timestamp_us] = result.status
-                niss[visual.timestamp_us] = result.last_nis
-                i += 1
+            apply_all_at(raw.timestamp_us)
             states.append(deepcopy(f))
             preceding = raw
         if i != len(ordered):
