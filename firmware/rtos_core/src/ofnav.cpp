@@ -1,6 +1,5 @@
 #include "ofnav/ofnav.hpp"
 
-#include <algorithm>
 #include <cmath>
 
 namespace ofnav {
@@ -10,7 +9,7 @@ namespace {
 constexpr float kEps = 1.0e-6F;
 
 [[nodiscard]] float clampf(float v, float lo, float hi) noexcept {
-    return std::max(lo, std::min(v, hi));
+    return maxOf(lo, minOf(v, hi));
 }
 
 [[nodiscard]] bool timestampFresh(uint64_t now_us, uint64_t sample_us, uint64_t max_age_us) noexcept {
@@ -23,22 +22,22 @@ constexpr float kEps = 1.0e-6F;
 
 [[nodiscard]] bool tiltExceeded(float roll, float pitch, float max_tilt) noexcept {
     // Combined inclination of the down-facing optical axis from vertical.
-    return !std::isfinite(roll) || !std::isfinite(pitch) ||
-        std::fabs(roll) > max_tilt || std::fabs(pitch) > max_tilt ||
-        std::cos(roll) * std::cos(pitch) < std::cos(max_tilt);
+    return !isFiniteValue(roll) || !isFiniteValue(pitch) ||
+        fabsf(roll) > max_tilt || fabsf(pitch) > max_tilt ||
+        cosf(roll) * cosf(pitch) < cosf(max_tilt);
 }
 
 [[nodiscard]] bool imuFinite(const ImuSample& imu) noexcept {
     return imu.valid &&
-        std::isfinite(imu.gyro_rad_s.x) && std::isfinite(imu.gyro_rad_s.y) &&
-        std::isfinite(imu.gyro_rad_s.z) && std::isfinite(imu.accel_m_s2.x) &&
-        std::isfinite(imu.accel_m_s2.y) && std::isfinite(imu.accel_m_s2.z);
+        isFiniteValue(imu.gyro_rad_s.x) && isFiniteValue(imu.gyro_rad_s.y) &&
+        isFiniteValue(imu.gyro_rad_s.z) && isFiniteValue(imu.accel_m_s2.x) &&
+        isFiniteValue(imu.accel_m_s2.y) && isFiniteValue(imu.accel_m_s2.z);
 }
 
 } // namespace
 
 bool isFinite(float v) noexcept {
-    return std::isfinite(v);
+    return isFiniteValue(v);
 }
 
 Vector3f cross(Vector3f a, Vector3f b) noexcept {
@@ -54,14 +53,14 @@ Vector3f matVec(Matrix3f m, Vector3f v) noexcept {
 }
 
 Vector2f rotateBodyToNav(float vx_body, float vy_body, float yaw_rad) noexcept {
-    const float c = std::cos(yaw_rad);
-    const float s = std::sin(yaw_rad);
+    const float c = cosf(yaw_rad);
+    const float s = sinf(yaw_rad);
     return Vector2f{c * vx_body - s * vy_body, s * vx_body + c * vy_body};
 }
 
 Vector2f rotateNavToBody(float vn, float ve, float yaw_rad) noexcept {
-    const float c = std::cos(yaw_rad);
-    const float s = std::sin(yaw_rad);
+    const float c = cosf(yaw_rad);
+    const float s = sinf(yaw_rad);
     return Vector2f{c * vn + s * ve, -s * vn + c * ve};
 }
 
@@ -69,7 +68,7 @@ float heightFromRange(float range_m, float roll_rad, float pitch_rad) noexcept {
     if (!isFinite(range_m) || !isFinite(roll_rad) || !isFinite(pitch_rad)) {
         return kNaN;
     }
-    return range_m * std::cos(roll_rad) * std::cos(pitch_rad);
+    return range_m * cosf(roll_rad) * cosf(pitch_rad);
 }
 
 const char* toString(RejectReason reason) noexcept {
@@ -152,10 +151,10 @@ float flowVelocitySigma(const Config& cfg, float height_m, float speed_m_s,
     const float quality_term = cfg.flow_vel_sigma_quality_gain_m_s * (1.0F - q / 255.0F);
     if (cfg.flow_rate_sigma_rad_s <= 0.0F) {
         float sigma = cfg.flow_vel_sigma_min_m_s + quality_term;
-        sigma += cfg.flow_vel_sigma_height_gain_m_s * std::max(height_m - 1.0F, 0.0F);
+        sigma += cfg.flow_vel_sigma_height_gain_m_s * maxOf(height_m - 1.0F, 0.0F);
         return clampf(sigma, cfg.flow_vel_sigma_min_m_s, 0.35F);
     }
-    const float sigma = std::sqrt(sq(cfg.flow_vel_sigma_min_m_s) +
+    const float sigma = sqrtf(sq(cfg.flow_vel_sigma_min_m_s) +
                                   sq(height_m * cfg.flow_rate_sigma_rad_s) +
                                   sq(speed_m_s * cfg.height_rel_sigma));
     return sigma + quality_term;
@@ -230,8 +229,8 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
     out.flow_x_rate_rad_s = flow_x_rate;
     out.flow_y_rate_rad_s = flow_y_rate;
 
-    if (std::fabs(flow_x_rate) > cfg_.max_abs_flow_rate_rad_s ||
-        std::fabs(flow_y_rate) > cfg_.max_abs_flow_rate_rad_s) {
+    if (fabsf(flow_x_rate) > cfg_.max_abs_flow_rate_rad_s ||
+        fabsf(flow_y_rate) > cfg_.max_abs_flow_rate_rad_s) {
         out.reason = RejectReason::FlowRateLimit;
         return out;
     }
@@ -245,7 +244,7 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
         velocity_body_at_sensor.z - lever_velocity.z,
     };
 
-    const float speed = std::sqrt(sq(velocity_body_at_cg.x) + sq(velocity_body_at_cg.y));
+    const float speed = sqrtf(sq(velocity_body_at_cg.x) + sq(velocity_body_at_cg.y));
     if (!isFinite(speed) || speed > cfg_.max_horizontal_speed_m_s * 2.5F) {
         out.reason = RejectReason::VelocityLimit;
         return out;
@@ -261,9 +260,9 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
     out.velocity_body_m_s = Vector2f{velocity_body_at_cg.x, velocity_body_at_cg.y};
     // Full body FRD -> local NED rotation. A yaw-only projection produces
     // biased horizontal velocity whenever roll/pitch or lever-arm Z is nonzero.
-    const float cr = std::cos(attitude.roll_rad), sr = std::sin(attitude.roll_rad);
-    const float cp = std::cos(attitude.pitch_rad), sp = std::sin(attitude.pitch_rad);
-    const float cy = std::cos(attitude.yaw_rad), sy = std::sin(attitude.yaw_rad);
+    const float cr = cosf(attitude.roll_rad), sr = sinf(attitude.roll_rad);
+    const float cp = cosf(attitude.pitch_rad), sp = sinf(attitude.pitch_rad);
+    const float cy = cosf(attitude.yaw_rad), sy = sinf(attitude.yaw_rad);
     const float vn =
         cy * cp * velocity_body_at_cg.x +
         (cy * sp * sr - sy * cr) * velocity_body_at_cg.y +
@@ -357,9 +356,9 @@ void HorizontalEkf::predict(const ImuSample& imu, const AttitudeSample& attitude
         !isFinite(attitude.yaw_rad)) {
         return;
     }
-    const float cr = std::cos(attitude.roll_rad), sr = std::sin(attitude.roll_rad);
-    const float cp = std::cos(attitude.pitch_rad), sp = std::sin(attitude.pitch_rad);
-    const float c = std::cos(attitude.yaw_rad), s = std::sin(attitude.yaw_rad);
+    const float cr = cosf(attitude.roll_rad), sr = sinf(attitude.roll_rad);
+    const float cp = cosf(attitude.pitch_rad), sp = sinf(attitude.pitch_rad);
+    const float c = cosf(attitude.yaw_rad), s = sinf(attitude.yaw_rad);
     const float ax_level = cp * ax + sp * sr * ay + sp * cr * az;
     const float ay_level = cr * ay - sr * az;
     const Vector2f accel_nav{c * ax_level - s * ay_level, s * ax_level + c * ay_level};
@@ -445,7 +444,7 @@ bool HorizontalEkf::updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t
     const float s10 = p_[3][2];
     const float s11 = p_[3][3] + r;
     const float det = s00 * s11 - s01 * s10;
-    if (std::fabs(det) < kEps) {
+    if (fabsf(det) < kEps) {
         return false;
     }
 
@@ -549,6 +548,7 @@ void OfNavRuntime::reset(uint64_t time_us) noexcept {
     ekf_.reset(time_us);
     last_flow_estimate_ = {};
     last_innovation_ok_ = false;
+    last_fusion_us_ = 0U;
 }
 
 void OfNavRuntime::predictImu(const ImuSample& imu,
@@ -558,6 +558,26 @@ void OfNavRuntime::predictImu(const ImuSample& imu,
         return;
     }
     ekf_.predict(imu, attitude);
+}
+
+bool HorizontalEkf::resetVelocity(const FlowVelocityEstimate& flow) noexcept {
+    const float sigma = flow.velocity_sigma_m_s;
+    if (!flow.accepted || !initialized_ || !prediction_healthy_ || !isFinite(sigma) || sigma <= 0.0F ||
+        !isFinite(flow.velocity_nav_m_s.x) || !isFinite(flow.velocity_nav_m_s.y)) {
+        return false;
+    }
+    x_.vn_m_s = flow.velocity_nav_m_s.x;
+    x_.ve_m_s = flow.velocity_nav_m_s.y;
+    for (uint8_t i = 0; i < 6U; ++i) {
+        for (uint8_t v = 2; v < 4U; ++v) {
+            p_[i][v] = 0.0F;
+            p_[v][i] = 0.0F;
+        }
+    }
+    p_[2][2] = sq(sigma);
+    p_[3][3] = sq(sigma);
+    last_innovation_d2_ = 0.0F;
+    return true;
 }
 
 RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
@@ -589,6 +609,17 @@ RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
     if (fresh_imu && fresh_att && fresh_flow && fresh_range && aligned) {
         last_flow_estimate_ = flow_estimator_.update(flow, range, imu, attitude);
         last_innovation_ok_ = ekf_.updateFlowVelocity(last_flow_estimate_, flow.quality);
+        if (last_flow_estimate_.accepted && !last_innovation_ok_ && cfg_.velocity_reset_timeout_us > 0U &&
+            (last_fusion_us_ == 0U || flow.time_us > last_fusion_us_ + cfg_.velocity_reset_timeout_us) &&
+            ekf_.resetVelocity(last_flow_estimate_)) {
+            // A single outlier during continuous aiding is still gated; only
+            // after an aiding outage the inertial velocity is not trusted.
+            last_innovation_ok_ = true;
+            ++velocity_resets_;
+        }
+        if (last_innovation_ok_) {
+            last_fusion_us_ = flow.time_us;
+        }
         if (last_flow_estimate_.accepted && !last_innovation_ok_) {
             last_flow_estimate_.accepted = false;
             last_flow_estimate_.reason = RejectReason::InnovationGate;
@@ -621,6 +652,42 @@ RuntimeOutput OfNavRuntime::monitor(uint64_t now_us,
     return status;
 }
 
+void GyroIntegrator::push(uint64_t end_us, const Vector3f& a, uint32_t dt_us) noexcept {
+    if (dt_us == 0U || dt_us > 100000U || !isFinite(a.x) || !isFinite(a.y) || !isFinite(a.z)) {
+        reset();  // a hole in the gyro record invalidates older coverage
+        return;
+    }
+    if (count_ > 0U) {
+        const Packet& last = packets_[(head_ + kCapacity - 1U) % kCapacity];
+        if (end_us <= last.end_us || end_us - dt_us > last.end_us + 1000U) {
+            reset();  // non-monotonic or gap > 1 ms between packets
+        }
+    }
+    packets_[head_] = Packet{end_us, dt_us, a};
+    head_ = (head_ + 1U) % kCapacity;
+    if (count_ < kCapacity) { ++count_; }
+}
+
+bool GyroIntegrator::integrate(uint64_t t0, uint64_t t1, Vector3f& out) const noexcept {
+    out = Vector3f{};
+    if (count_ == 0U || t1 <= t0) { return false; }
+    const Packet& oldest = packets_[(head_ + kCapacity - count_) % kCapacity];
+    const Packet& newest = packets_[(head_ + kCapacity - 1U) % kCapacity];
+    if (oldest.end_us - oldest.dt_us > t0 || newest.end_us < t1) { return false; }
+    for (uint32_t k = 0U; k < count_; ++k) {
+        const Packet& p = packets_[(head_ + kCapacity - count_ + k) % kCapacity];
+        const uint64_t a = p.end_us - p.dt_us;
+        const uint64_t lo = maxOf(a, t0);
+        const uint64_t hi = minOf(p.end_us, t1);
+        if (hi <= lo) { continue; }
+        const float w = static_cast<float>(hi - lo) / static_cast<float>(p.dt_us);
+        out.x += w * p.angle.x;
+        out.y += w * p.angle.y;
+        out.z += w * p.angle.z;
+    }
+    return true;
+}
+
 const char* toString(SafetyAction action) noexcept {
     switch (action) {
     case SafetyAction::None: return "NONE";
@@ -640,6 +707,8 @@ const char* toString(SafetyReason reason) noexcept {
     case SafetyReason::ManualRequested: return "MANUAL_REQUESTED";
     case SafetyReason::Recovered: return "RECOVERED";
     case SafetyReason::NonMonotonicTime: return "NON_MONOTONIC_TIME";
+    case SafetyReason::OnGround: return "ON_GROUND";
+    case SafetyReason::NotEngaged: return "NOT_ENGAGED";
     }
     return "UNKNOWN";
 }
@@ -650,6 +719,7 @@ void SafetyActionManager::reset() noexcept {
     mode_since_us_ = degraded_since_us_ = action_since_us_ = last_us_ = 0U;
     started_ = false;
     degraded_episode_ = false;
+    engaged_ = false;
 }
 
 SafetyDecision SafetyActionManager::decide(SafetyAction action, SafetyReason reason,
@@ -667,7 +737,14 @@ SafetyDecision SafetyActionManager::decide(SafetyAction action, SafetyReason rea
     return d;
 }
 
-SafetyDecision SafetyActionManager::update(NavMode mode, uint64_t now_us) noexcept {
+SafetyDecision SafetyActionManager::update(NavMode mode, uint64_t now_us,
+                                           bool in_air) noexcept {
+    if (!in_air && action_ != SafetyAction::Land && action_ != SafetyAction::ManualTakeover) {
+        reset();
+        SafetyDecision d{};
+        d.reason = SafetyReason::OnGround;
+        return d;
+    }
     if (started_ && now_us < last_us_) {
         // A clock running backwards invalidates every timeout: fail safe.
         return decide(action_ == SafetyAction::ManualTakeover ? action_ : SafetyAction::Land,
@@ -680,6 +757,14 @@ SafetyDecision SafetyActionManager::update(NavMode mode, uint64_t now_us) noexce
     }
     last_us_ = now_us;
     const uint64_t in_mode = now_us - mode_since_us_;
+    if (!engaged_) {
+        if (!cfg_.require_engagement ||
+            (mode == NavMode::FlowNav && in_mode >= cfg_.recovery_us)) {
+            engaged_ = true;
+        } else {
+            return decide(SafetyAction::None, SafetyReason::NotEngaged, now_us);
+        }
+    }
     if (mode == NavMode::DegradedHold || mode == NavMode::FailsafeLand) {
         if (!degraded_episode_) {
             degraded_episode_ = true;

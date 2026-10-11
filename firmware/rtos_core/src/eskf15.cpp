@@ -1,14 +1,19 @@
 #include "ofnav/eskf15.hpp"
 
-#include <algorithm>
 #include <cmath>
 
 namespace ofnav15 {
 namespace {
 
+using ofnav::absValue;
+using ofnav::isFiniteValue;
+using ofnav::kInfinity;
+using ofnav::maxOf;
+using ofnav::minOf;
+
 constexpr double kGravity = 9.80665;
 constexpr double kPiD = 3.14159265358979323846;
-using Mat3 = std::array<double, 9>;
+using Mat3 = Array<double, 9>;
 
 double &at(Matrix15 &a, int i, int j) noexcept { return a[15 * i + j]; }
 double at(const Matrix15 &a, int i, int j) noexcept { return a[15 * i + j]; }
@@ -28,13 +33,16 @@ void multiplyInto(const Matrix15 &a, const Matrix15 &b, Matrix15 &r) noexcept {
         }
     }
 }
-// r = a * b^T; r must not alias a or b.
-void multiplyTransposeInto(const Matrix15 &a, const Matrix15 &b, Matrix15 &r) noexcept {
+// r = a * b^T where the result is KNOWN to be symmetric (congruence
+// transforms of a covariance): lower triangle computed, upper mirrored.
+void multiplyTransposeSymmetricInto(const Matrix15 &a, const Matrix15 &b,
+                                    Matrix15 &r) noexcept {
     for (int i = 0; i < 15; ++i) {
-        for (int j = 0; j < 15; ++j) {
+        for (int j = 0; j <= i; ++j) {
             double sum = 0.;
             for (int k = 0; k < 15; ++k) { sum += at(a, i, k) * at(b, j, k); }
             at(r, i, j) = sum;
+            at(r, j, i) = sum;
         }
     }
 }
@@ -47,12 +55,12 @@ void symmetric(Matrix15 &p) noexcept {
         }
     }
 }
-bool positiveDefinite(const Matrix15 &p, std::array<double, 225> &l) noexcept {
+bool positiveDefinite(const Matrix15 &p, Array<double, 225> &l) noexcept {
     l.fill(0.);
     for (int i = 0; i < 15; ++i) {
         for (int j = 0; j <= i; ++j) {
             double x = at(p, i, j);
-            if (!std::isfinite(x)) { return false; }
+            if (!isFiniteValue(x)) { return false; }
             for (int k = 0; k < j; ++k) { x -= l[15 * i + k] * l[15 * j + k]; }
             if (i == j) {
                 if (!(x > 1.e-20)) { return false; }
@@ -65,7 +73,7 @@ bool positiveDefinite(const Matrix15 &p, std::array<double, 225> &l) noexcept {
     return true;
 }
 bool finite3(const Vec3 &v) noexcept {
-    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+    return isFiniteValue(v[0]) && isFiniteValue(v[1]) && isFiniteValue(v[2]);
 }
 bool finiteImu(const Imu &v) noexcept {
     return v.time_us > 0 && finite3(v.gyro_rad_s) && finite3(v.specific_force_m_s2);
@@ -88,8 +96,8 @@ Quat product(const Quat &a, const Quat &b) noexcept {
 Quat unit(Quat q) noexcept {
     double ss = 0;
     for (double x:q) { ss += x*x; }
-    if (!std::isfinite(ss) || ss < .64 || ss > 1.44) {
-        return {std::numeric_limits<double>::quiet_NaN(),0.,0.,0.};
+    if (!isFiniteValue(ss) || ss < .64 || ss > 1.44) {
+        return {kQuietNaN,0.,0.,0.};
     }
     for (double &x:q) { x /= std::sqrt(ss); }
     return q;
@@ -145,7 +153,8 @@ void transitionInto(const Matrix15 &f, double dt, Matrix15 &phi,
     for (std::size_t i = 0; i < a.size(); ++i) { a[i] = f[i] * dt; }
     for (std::size_t i = 0; i < phi.size(); ++i) { phi[i] = a[i] / 4.; }
     for (int i = 0; i < 15; ++i) { at(phi, i, i) += 1.; }
-    for (const double k : {3., 2., 1.}) {
+    const double divisors[3] = {3., 2., 1.};
+    for (const double k : divisors) {
         multiplyInto(a, phi, tmp);
         for (std::size_t i = 0; i < phi.size(); ++i) { phi[i] = tmp[i] / k; }
         for (int i = 0; i < 15; ++i) { at(phi, i, i) += 1.; }
@@ -154,7 +163,7 @@ void transitionInto(const Matrix15 &f, double dt, Matrix15 &phi,
 void processCovInto(const Matrix15 &f, const Mat3 &r, double dt,
                     const Parameters &cfg, Matrix15 &q, Matrix15 &phi,
                     Matrix15 &a, Matrix15 &tmp,
-                    std::array<double, 180> &z) noexcept {
+                    Array<double, 180> &z) noexcept {
     const double sigma[4] = {
         cfg.accel_noise, cfg.gyro_noise,
         cfg.gyro_bias_random_walk, cfg.accel_bias_random_walk
@@ -178,10 +187,11 @@ void processCovInto(const Matrix15 &f, const Mat3 &r, double dt,
             }
         }
         for(int i=0;i<15;++i) {
-            for(int j=0;j<15;++j) {
+            for(int j=0;j<=i;++j) {  // Z Z^T is symmetric
                 double value=0.;
                 for(int col=0;col<12;++col) {value+=z[i*12+col]*z[j*12+col];}
                 at(q,i,j)+=weight*value;
+                if (j!=i) {at(q,j,i)+=weight*value;}
             }
         }
     }
@@ -196,7 +206,7 @@ bool validParameters(const Parameters &c) noexcept {
     const auto &q=c.initial_quaternion_body_to_ned;
     double qnorm2=0.;
     for(double x:q) {
-        if (!std::isfinite(x)) {return false;}
+        if (!isFiniteValue(x)) {return false;}
         qnorm2+=x*x;
     }
     if (qnorm2<.64 || qnorm2>1.44 ||
@@ -207,17 +217,18 @@ bool validParameters(const Parameters &c) noexcept {
         return false;
     }
     for (double x:c.initial_sigma) {
-        if (!std::isfinite(x) || x<=0.) {return false;}
+        if (!isFiniteValue(x) || x<=0.) {return false;}
     }
-    for (double x : {c.gyro_noise,c.accel_noise,
-                     c.gyro_bias_random_walk,c.accel_bias_random_walk}) {
-        if (!std::isfinite(x) || !(x>0 && x<100.)) {return false;}
+    const double noises[4] = {c.gyro_noise,c.accel_noise,
+                              c.gyro_bias_random_walk,c.accel_bias_random_walk};
+    for (double x : noises) {
+        if (!isFiniteValue(x) || !(x>0 && x<100.)) {return false;}
     }
     return true;
 }
 bool measurementValid(const Measurement &m) noexcept {
     if (m.time_us==0 || static_cast<std::size_t>(m.kind)>=kMeasurementKinds ||
-        !std::isfinite(m.ci_weight) || m.ci_weight>1.) {
+        !isFiniteValue(m.ci_weight) || m.ci_weight>1.) {
         return false;
     }
     const bool position_like=m.kind==MeasurementKind::PositionNe ||
@@ -225,8 +236,8 @@ bool measurementValid(const Measurement &m) noexcept {
     if (m.ci_weight<1. && !position_like) {return false;}
     if (m.kind==MeasurementKind::MapGroundPointNe) {
         const double n2=m.aux[1]*m.aux[1]+m.aux[2]*m.aux[2]+m.aux[3]*m.aux[3];
-        if (!std::isfinite(m.aux[0]) || !(m.aux[0]>0.) || m.aux[0]>500. ||
-            !std::isfinite(n2) || n2<.81 || n2>1.21) {
+        if (!isFiniteValue(m.aux[0]) || !(m.aux[0]>0.) || m.aux[0]>500. ||
+            !isFiniteValue(n2) || n2<.81 || n2>1.21) {
             return false;
         }
     }
@@ -235,13 +246,13 @@ bool measurementValid(const Measurement &m) noexcept {
     }
     const auto &r=m.covariance;
     if (m.kind==MeasurementKind::Yaw) {
-        return std::isfinite(m.value[0]) && std::isfinite(r[0]) && r[0]>1.e-12 &&
+        return isFiniteValue(m.value[0]) && isFiniteValue(r[0]) && r[0]>1.e-12 &&
                r[0]<10.;
     }
-    if (!std::isfinite(m.value[0]) || !std::isfinite(m.value[1])) {return false;}
-    return std::isfinite(r[0]) && std::isfinite(r[1]) &&
-        std::isfinite(r[2]) && std::isfinite(r[3]) &&
-        std::abs(r[1]-r[2])<=1.e-10 && r[0]>0 && r[3]>0 &&
+    if (!isFiniteValue(m.value[0]) || !isFiniteValue(m.value[1])) {return false;}
+    return isFiniteValue(r[0]) && isFiniteValue(r[1]) &&
+        isFiniteValue(r[2]) && isFiniteValue(r[3]) &&
+        absValue(r[1]-r[2])<=1.e-10 && r[0]>0 && r[3]>0 &&
         r[0]*r[3]-r[1]*r[2]>1.e-16;
 }
 Imu interpolated(const Imu &a, const Imu &b, std::uint64_t t) noexcept {
@@ -268,7 +279,7 @@ bool sameEvent(const Measurement &a, const Measurement &b) noexcept {
 // block would choose w -> 0 and inflate EVERY state by 1/w on every map
 // fix. The SAME grid and criterion are used by error_state_inertial_filter.py.
 double chooseCiWeight(const double hph[4], const double r[4]) noexcept {
-    double best_w=.5, best=std::numeric_limits<double>::infinity();
+    double best_w=.5, best=kInfinity;
     for(int step=5;step<=95;++step) {
         const double w=static_cast<double>(step)/100.;
         const double a=1./(1.-w);
@@ -337,7 +348,7 @@ const char *alignmentStatusName(AlignmentStatus s) noexcept {
 AlignmentStatus staticAlignment(const Imu *samples, std::size_t n, double yaw,
                                 double yaw_sigma, const AlignmentLimits &limits,
                                 Parameters &out) noexcept {
-    if (samples==nullptr || !std::isfinite(yaw) || !std::isfinite(yaw_sigma) ||
+    if (samples==nullptr || !isFiniteValue(yaw) || !isFiniteValue(yaw_sigma) ||
         !(yaw_sigma>0.) || limits.min_samples<2) {
         return AlignmentStatus::InvalidInput;
     }
@@ -368,7 +379,7 @@ AlignmentStatus staticAlignment(const Imu *samples, std::size_t n, double yaw,
         length(mw)>out.max_gyro_bias) {
         return AlignmentStatus::NotStationary;
     }
-    if (std::abs(length(mf)-kGravity)>limits.max_gravity_error_m_s2) {
+    if (absValue(length(mf)-kGravity)>limits.max_gravity_error_m_s2) {
         return AlignmentStatus::GravityMismatch;
     }
     // At rest f_b = -R^T g_n: f = (g sin(pitch), -g sin(roll)cos(pitch), -g cos(roll)cos(pitch)).
@@ -388,14 +399,14 @@ AlignmentStatus staticAlignment(const Imu *samples, std::size_t n, double yaw,
     // accelerometer bias prior divided by gravity.
     const double tilt=std::sqrt(sf*sf/count/(kGravity*kGravity) +
         std::pow(out.initial_sigma[12]/kGravity,2.));
-    out.initial_sigma[6]=std::max(tilt,1.e-4);
-    out.initial_sigma[7]=std::max(tilt,1.e-4);
+    out.initial_sigma[6]=maxOf(tilt,1.e-4);
+    out.initial_sigma[7]=maxOf(tilt,1.e-4);
     out.initial_sigma[8]=yaw_sigma;
     // Gyro-bias sigma: standard error of the mean plus Earth rate (7.29e-5),
     // which a MEMS stationary alignment does not separate from the bias.
     const double gb=std::sqrt(sw*sw/count+7.2921159e-5*7.2921159e-5);
-    for(int k=9;k<12;++k) {out.initial_sigma[k]=std::max(gb,1.e-6);}
-    for(int k=3;k<6;++k) {out.initial_sigma[k]=std::min(out.initial_sigma[k],.05);}
+    for(int k=9;k<12;++k) {out.initial_sigma[k]=maxOf(gb,1.e-6);}
+    for(int k=3;k<6;++k) {out.initial_sigma[k]=minOf(out.initial_sigma[k],.05);}
     return AlignmentStatus::Aligned;
 }
 
@@ -412,7 +423,7 @@ void Filter::reset(const Parameters &c) noexcept {
     for(int i=0;i<15;++i) {at(p_cov_,i,i)=c.initial_sigma[i]*c.initial_sigma[i];}
     last_=Imu{};
     last_measurement_us_.fill(0U);
-    nis_=std::numeric_limits<double>::quiet_NaN();
+    nis_=kQuietNaN;
     ci_weight_=1.;
     accepted_=rejected_=0;
     has_imu_=false;
@@ -423,6 +434,7 @@ bool Filter::healthy() const noexcept {
     return status_!=Status::ImuGap && status_!=Status::NumericalFailure &&
            status_!=Status::BiasLimit && status_!=Status::PosteriorInvalid;
 }
+#if !defined(__PX4_NUTTX)
 Status Filter::predict(const Imu &m) noexcept {
     Workspace ws{};
     return predict(m, ws);
@@ -434,6 +446,7 @@ Status Filter::update(const Measurement &m) noexcept {
     Workspace ws{};
     return update(m, ws);
 }
+#endif
 Status Filter::predict(const Imu &m, Workspace &ws) noexcept {
     if (!healthy()) {return status_;}
     if (!finiteImu(m) || (has_imu_ && (m.time_us<=last_.time_us ||
@@ -458,12 +471,12 @@ Status Filter::predict(const Imu &m, Workspace &ws) noexcept {
     transitionInto(f,dt,phi,sa,st);
     processCovInto(f,rmid,dt,config_,q,phitau,sa,st,ws.noise_map);
     multiplyInto(phi,p_cov_,fp);
-    multiplyTransposeInto(fp,phi,pnew);
+    multiplyTransposeSymmetricInto(fp,phi,pnew);
     for(std::size_t i=0;i<pnew.size();++i) {pnew[i]+=q[i];}
     symmetric(pnew);
     const Vec3 angle={dt*omega[0],dt*omega[1],dt*omega[2]};
     const Quat qnext=unit(product(q_,expQuat(angle)));
-    if (!positiveDefinite(pnew,ws.cholesky) || !std::isfinite(qnext[0]) ||
+    if (!positiveDefinite(pnew,ws.cholesky) || !isFiniteValue(qnext[0]) ||
         !finite3(a)) {
         status_=Status::NumericalFailure;
         return status_;
@@ -573,18 +586,18 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
     }
     double nis=0.;
     if (n==1) {
-        if (!(s[0]>0.) || !std::isfinite(s[0])) {++rejected_;return Status::InvalidVisual;}
+        if (!(s[0]>0.) || !isFiniteValue(s[0])) {++rejected_;return Status::InvalidVisual;}
         nis=y[0]*y[0]/s[0];
     } else {
         const double det=s[0]*s[3]-s[1]*s[2];
-        if (!(s[0]>0 && s[3]>0 && det>1.e-16) || !std::isfinite(det)) {
+        if (!(s[0]>0 && s[3]>0 && det>1.e-16) || !isFiniteValue(det)) {
             ++rejected_;return Status::InvalidVisual;
         }
         nis=(y[0]*(s[3]*y[0]-s[1]*y[1])+y[1]*(-s[2]*y[0]+s[0]*y[1]))/det;
     }
     nis_=nis;
     last_measurement_us_[kind]=m.time_us;
-    if (!std::isfinite(nis_)) {++rejected_;return Status::InvalidVisual;}
+    if (!isFiniteValue(nis_)) {++rejected_;return Status::InvalidVisual;}
     if (nis_>(n==1?config_.nis_gate_1d:config_.nis_gate)) {
         ++rejected_;status_=outlier;
         return status_;
@@ -650,7 +663,7 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
     }
     for(std::size_t i=0;i<pw.size();++i) {pw[i]=p_cov_[i]*pscale;}
     multiplyInto(ikh,pw,tmp);
-    multiplyTransposeInto(tmp,ikh,pnew);
+    multiplyTransposeSymmetricInto(tmp,ikh,pnew);
     for(int i=0;i<15;++i) {
         for(int j=0;j<15;++j) {
             double sum=0.;
@@ -669,10 +682,10 @@ Status Filter::update(const Measurement &m, Workspace &ws) noexcept {
         }
     }
     multiplyInto(reset,pnew,tmp2);
-    multiplyTransposeInto(tmp2,reset,pnew);
+    multiplyTransposeSymmetricInto(tmp2,reset,pnew);
     symmetric(pnew);
     const Quat qnew=unit(product(q_,expQuat(dth)));
-    if (!positiveDefinite(pnew,ws.cholesky) || !std::isfinite(qnew[0])) {
+    if (!positiveDefinite(pnew,ws.cholesky) || !isFiniteValue(qnew[0])) {
         status_=Status::PosteriorInvalid;
         return status_;
     }
@@ -791,27 +804,58 @@ bool FixedLag::replayRange(const Filter &start, const Imu &start_imu,
     result=f;
     return true;
 }
+void FixedLag::dropBefore(std::size_t samples) noexcept {
+    // imu_[samples-1] became the checkpoint sample.
+    checkpoint_imu_=imu_[samples-1];
+    for(std::size_t i=samples;i<count_;++i) {imu_[i-samples]=imu_[i];}
+    count_-=samples;
+    std::size_t kept=0;
+    for(std::size_t i=0;i<visual_count_;++i) {
+        if(visual_[i].time_us>checkpoint_imu_.time_us) {
+            visual_[kept++]=visual_[i];
+        }
+    }
+    visual_count_=kept;
+    for (auto &snap:snapshots_) {
+        if (snap.valid && snap.time_us<=checkpoint_imu_.time_us) {snap.valid=false;}
+    }
+}
 void FixedLag::trim() noexcept {
     if (!initialized_) {return;}
-    while(count_>1 && latest_-checkpoint_imu_.time_us>max_lag_us_) {
+    // Preferred: move the checkpoint to the newest valid snapshot that is
+    // still at least max_lag old. No replay is needed: a snapshot holds
+    // the state with every committed event up to its time. The window then
+    // spans max_lag .. max_lag + kSnapshotStride samples.
+    if (count_>1 && latest_-checkpoint_imu_.time_us>max_lag_us_) {
+        const Snapshot *best=nullptr;
+        for (const auto &snap:snapshots_) {
+            if (snap.valid && latest_-snap.time_us>=max_lag_us_ &&
+                snap.time_us>checkpoint_imu_.time_us &&
+                (best==nullptr || snap.time_us>best->time_us)) {
+                best=&snap;
+            }
+        }
+        if (best!=nullptr) {
+            for(std::size_t k=0;k<count_;++k) {
+                if (imu_[k].time_us==best->time_us) {
+                    checkpoint_=best->state;
+                    dropBefore(k+1);
+                    break;
+                }
+            }
+        }
+    }
+    // Fallback (no usable snapshot, e.g. invalidated by a failed replay):
+    // advance one sample at a time by replay, only when the IMU history is
+    // about to overflow.
+    while(count_>1 && latest_-checkpoint_imu_.time_us>max_lag_us_ &&
+          count_+kSnapshotStride>=kImuCapacity) {
         if (!replayRange(checkpoint_,checkpoint_imu_,0,1,visual_.data(),
                          visual_count_,scratch_,0,nullptr,false)) {
             failed_=true;return;
         }
         checkpoint_=scratch_;
-        checkpoint_imu_=imu_[0];
-        for(std::size_t i=1;i<count_;++i) {imu_[i-1]=imu_[i];}
-        --count_;
-        std::size_t kept=0;
-        for(std::size_t i=0;i<visual_count_;++i) {
-            if(visual_[i].time_us>checkpoint_imu_.time_us) {
-                visual_[kept++]=visual_[i];
-            }
-        }
-        visual_count_=kept;
-        for (auto &snap:snapshots_) {
-            if (snap.valid && snap.time_us<=checkpoint_imu_.time_us) {snap.valid=false;}
-        }
+        dropBefore(1);
     }
 }
 Status FixedLag::pushDelayedVelocity(const Visual &m) noexcept {
@@ -829,7 +873,7 @@ Status FixedLag::pushDelayedFrame(const Measurement *events, std::size_t n,
     }
     const std::uint64_t t=events[0].time_us;
     // Per-event admission; rejected events never enter the history.
-    std::array<bool,kMaxFrameEvents> admit{};
+    Array<bool,kMaxFrameEvents> admit{};
     std::size_t admitted=0;
     for(std::size_t e=0;e<n;++e) {
         const Measurement &m=events[e];
@@ -888,7 +932,7 @@ Status FixedLag::pushDelayedFrame(const Measurement *events, std::size_t n,
             }
         }
     }
-    std::array<Status,kMeasurementKinds> observed{};
+    Array<Status,kMeasurementKinds> observed{};
     observed.fill(Status::ReplayFailed);
     last_replay_length_=count_-first;
     // Refreshed snapshots are strictly newer than the start state, so the

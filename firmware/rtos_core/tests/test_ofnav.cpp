@@ -103,6 +103,34 @@ void test_ekf_innovation_gate_rejects_outlier() {
     assert(ekf.lastInnovationD2() > cfg.innovation_gate_2d);
 }
 
+void test_velocity_reset_after_aiding_outage_but_not_during_aiding() {
+    auto cfg = baseConfig();
+    ofnav::OfNavRuntime runtime(cfg);
+    runtime.reset(1000000U);
+    // 3 s unaided with a 1 m/s^2 accelerometer error: ~3 m/s velocity drift.
+    uint64_t t = 1000000U;
+    for (int i = 0; i < 300; ++i) {
+        t += 10000U;
+        runtime.predictImu({t, {}, {1.0F, 0.0F, -9.81F}, true}, {t, 0.0F, 0.0F, 0.0F});
+    }
+    const ofnav::RangeSample range{t, 1.0F, true};
+    const ofnav::OpticalFlowRadSample still{t, 0.04F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 220U, true};
+    const auto first = runtime.step({t, {}, {0.0F, 0.0F, -9.81F}, true}, range, still,
+                                    {t, 0.0F, 0.0F, 0.0F}, t);
+    assert(first.flow.accepted);
+    assert(runtime.velocityResets() == 1U);
+    assert(near(first.state.vn_m_s, 0.0F, 1.0e-3F));
+    // Continuous aiding: an outlier right after a fusion stays gated.
+    t += 40000U;
+    runtime.predictImu({t, {}, {0.0F, 0.0F, -9.81F}, true}, {t, 0.0F, 0.0F, 0.0F});
+    const ofnav::OpticalFlowRadSample jump{t, 0.04F, 0.04F, 0.0F, 0.0F, 0.0F, 0.0F, 220U, true};
+    const auto second = runtime.step({t, {}, {0.0F, 0.0F, -9.81F}, true}, {t, 1.0F, true}, jump,
+                                     {t, 0.0F, 0.0F, 0.0F}, t);
+    assert(!second.flow.accepted);
+    assert(second.flow.reason == ofnav::RejectReason::InnovationGate);
+    assert(runtime.velocityResets() == 1U);
+}
+
 void test_covariance_joseph_update() {
     auto cfg = baseConfig();
     ofnav::HorizontalEkf ekf(cfg);
@@ -377,8 +405,40 @@ void test_camera_profile_ekf_uses_estimator_sigma() {
     assert(out.state.vn_m_s > 0.0F && out.state.vn_m_s < 0.3F);
 }
 
-void test_safety_failsafe_is_debounced_then_latched_land() {
+ofnav::SafetyActionConfig unengaged() {
+    ofnav::SafetyActionConfig cfg{};
+    cfg.require_engagement = false;  // these tests start mid-flight
+    return cfg;
+}
+
+void test_safety_requires_air_and_established_flow_navigation() {
     ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    // On the ground after arming (range below the envelope): nothing.
+    for (uint64_t t = 1000000U; t < 8000000U; t += 100000U) {
+        const auto d = m.update(NavMode::DegradedHold, t, false);
+        assert(d.action == SafetyAction::None && d.reason == ofnav::SafetyReason::OnGround);
+    }
+    // Takeoff below the envelope: in air but not engaged yet.
+    for (uint64_t t = 8000000U; t < 15000000U; t += 100000U) {
+        const auto d = m.update(NavMode::DegradedHold, t, true);
+        assert(d.action == SafetyAction::None && d.reason == ofnav::SafetyReason::NotEngaged);
+    }
+    // 1 s of healthy flow engages; a later loss acts.
+    for (uint64_t t = 15000000U; t <= 16000000U; t += 100000U) {
+        (void)m.update(NavMode::FlowNav, t, true);
+    }
+    assert(m.engaged());
+    (void)m.update(NavMode::DegradedHold, 16100000U, true);
+    assert(m.update(NavMode::DegradedHold, 16500000U, true).action == SafetyAction::AltitudeHold);
+    // Landing resets the non-latched hold.
+    assert(m.update(NavMode::FlowNav, 20000000U, false).action == SafetyAction::None);
+    assert(!m.engaged());
+}
+
+void test_safety_failsafe_is_debounced_then_latched_land() {
+    ofnav::SafetyActionManager m{unengaged()};
     using ofnav::NavMode;
     using ofnav::SafetyAction;
     assert(m.update(NavMode::FlowNav, 1000000U).action == SafetyAction::None);
@@ -398,7 +458,7 @@ void test_safety_failsafe_is_debounced_then_latched_land() {
 }
 
 void test_safety_degraded_hold_escalates_and_recovers_with_hysteresis() {
-    ofnav::SafetyActionManager m{};
+    ofnav::SafetyActionManager m{unengaged()};
     using ofnav::NavMode;
     using ofnav::SafetyAction;
     (void)m.update(NavMode::FlowNav, 1000000U);
@@ -424,17 +484,38 @@ void test_safety_degraded_hold_escalates_and_recovers_with_hysteresis() {
 }
 
 void test_safety_manual_request_and_time_reversal() {
-    ofnav::SafetyActionManager m{};
+    ofnav::SafetyActionManager m{unengaged()};
     using ofnav::NavMode;
     using ofnav::SafetyAction;
     (void)m.update(NavMode::FlowNav, 1000000U);
     const auto manual = m.update(NavMode::ManualRequired, 1010000U);
     assert(manual.action == SafetyAction::ManualTakeover && manual.latched);
-    ofnav::SafetyActionManager clock{};
+    ofnav::SafetyActionManager clock{unengaged()};
     (void)clock.update(NavMode::FlowNav, 2000000U);
     const auto back = clock.update(NavMode::FlowNav, 1000000U);
     assert(back.action == SafetyAction::Land);
     assert(back.reason == ofnav::SafetyReason::NonMonotonicTime);
+}
+
+void test_gyro_integrator_prorates_and_requires_full_coverage() {
+    ofnav::GyroIntegrator g{};
+    // 250 Hz packets of a constant 0.5 rad/s rate about body x.
+    for (uint64_t t = 1004000U; t <= 1200000U; t += 4000U) {
+        g.push(t, ofnav::Vector3f{0.5F * 0.004F, 0.0F, -0.1F * 0.004F}, 4000U);
+    }
+    ofnav::Vector3f a{};
+    assert(g.integrate(1050000U, 1150000U, a));
+    assert(near(a.x, 0.05F, 1.0e-5F));
+    assert(near(a.z, -0.01F, 1.0e-5F));
+    // Interval with a partial first and last packet.
+    assert(g.integrate(1051000U, 1149000U, a));
+    assert(near(a.x, 0.5F * 0.098F, 1.0e-5F));
+    // Not yet covered by gyro data -> refused.
+    assert(!g.integrate(1150000U, 1210000U, a));
+    assert(!g.integrate(900000U, 1010000U, a));
+    // A 20 ms hole resets coverage.
+    g.push(1220000U, ofnav::Vector3f{0.002F, 0.0F, 0.0F}, 4000U);
+    assert(!g.integrate(1100000U, 1150000U, a));
 }
 
 } // namespace
@@ -446,6 +527,7 @@ int main() {
     test_quality_rejection();
     test_runtime_failsafe_without_range();
     test_ekf_innovation_gate_rejects_outlier();
+    test_velocity_reset_after_aiding_outage_but_not_during_aiding();
     test_covariance_joseph_update();
     test_gravity_projection_does_not_create_horizontal_velocity();
     test_stale_flow_is_never_fused();
@@ -463,9 +545,11 @@ int main() {
     test_camera_profile_accepts_100m_with_height_scaled_sigma();
     test_camera_profile_rejects_coarse_measurement_by_uncertainty();
     test_camera_profile_ekf_uses_estimator_sigma();
+    test_safety_requires_air_and_established_flow_navigation();
     test_safety_failsafe_is_debounced_then_latched_land();
     test_safety_degraded_hold_escalates_and_recovers_with_hysteresis();
     test_safety_manual_request_and_time_reversal();
+    test_gyro_integrator_prorates_and_requires_full_coverage();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }

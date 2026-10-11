@@ -7,6 +7,7 @@ add_library(ofnav_rtos_core STATIC
     src/ofnav.cpp
     src/eskf15.cpp
     src/eskf_runner.cpp
+    src/eskf15_workload.cpp
 )
 
 target_include_directories(ofnav_rtos_core

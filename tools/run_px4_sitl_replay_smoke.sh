@@ -121,6 +121,17 @@ print("PX4_SITL_ESKF_MATCHES_PYTHON")
 PY
 fi
 
+# 5) Worst-case ESKF workload inside the PX4 process ('ofnav bench'):
+# host timing in SITL; on a flight controller the same command reports
+# hrt timing, CPU load and the colored-stack high-water mark.
+"$OFNAV_CLIENT" bench > "$OUT/ofnav_bench.log" 2>&1
+if [[ "$(grep -c 'OFNAV_BENCH imu_hz=.*healthy=1' "$OUT/ofnav_bench.log")" -ne 2 ]]; then
+  echo "ofnav bench failed" >&2
+  cat "$OUT/ofnav_bench.log" >&2
+  exit 1
+fi
+
 echo "PX4_SITL_READ_ONLY_REPLAY_PASS"
 cat "$OUT/ofnav_sitl_replay.log" "$OUT/ofnav_sitl_replay_camera.log" "$OUT/ofnav_live.log"
 if [[ $# -eq 5 ]]; then cat "$OUT/ofnav_sitl_eskf.log"; fi
+cat "$OUT/ofnav_bench.log"

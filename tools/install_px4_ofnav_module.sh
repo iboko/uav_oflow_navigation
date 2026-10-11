@@ -58,6 +58,7 @@ cp -R "$CORE_SRC/include/ofnav" "$MODULE_DST/ofnav_core/include/"
 cp "$CORE_SRC/src/ofnav.cpp" "$MODULE_DST/ofnav_core/src/ofnav.cpp"
 cp "$CORE_SRC/src/eskf15.cpp" "$MODULE_DST/ofnav_core/src/eskf15.cpp"
 cp "$CORE_SRC/src/eskf_runner.cpp" "$MODULE_DST/ofnav_core/src/eskf_runner.cpp"
+cp "$CORE_SRC/src/eskf15_workload.cpp" "$MODULE_DST/ofnav_core/src/eskf15_workload.cpp"
 
 MODULES_CMAKE="$PX4_DIR/src/modules/CMakeLists.txt"
 if [[ -f "$MODULES_CMAKE" ]] && ! grep -q "add_subdirectory(ofnav)" "$MODULES_CMAKE"; then

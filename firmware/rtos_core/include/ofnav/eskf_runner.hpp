@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -97,7 +96,7 @@ private:
     EskfInitSource init_source_{EskfInitSource::None};
     EskfRunnerStats stats_{};
     ofnav15::FixedLag lag_{};
-    std::array<ofnav15::Imu, kMaxAlignmentSamples> alignment_{};
+    Array<ofnav15::Imu, kMaxAlignmentSamples> alignment_{};
     std::size_t alignment_count_{0U};
     ofnav15::Vec3 sum_angle_{}, sum_velocity_{};
     uint64_t sum_dt_us_{0U};

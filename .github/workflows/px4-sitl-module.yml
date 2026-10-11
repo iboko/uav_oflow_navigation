@@ -12,6 +12,9 @@ on:
       - 'src/error_state_inertial_filter.py'
       - 'src/fixed_lag_eskf_replay.py'
       - '.github/workflows/px4-sitl-module.yml'
+      - 'tools/qemu_m7_timing.sh'
+      - 'tools/px4_v6x_stack_report.sh'
+      - 'tools/stack_callgraph.py'
   workflow_dispatch:
 
 jobs:
@@ -78,6 +81,7 @@ jobs:
             build/px4_sitl_runtime_results \
             build/px4_sitl_replay_input/eskf_events.csv \
             build/px4_sitl_replay_input/eskf_expected.json
+            build/px4_sitl_runtime_results/ofnav_bench.log
 
       - name: Archive PX4 SITL diagnostic replay proof
         uses: actions/upload-artifact@v4
@@ -95,3 +99,55 @@ jobs:
             build/px4_sitl_replay_input/eskf_expected.json
           if-no-files-found: warn
           retention-days: 30
+
+  build-fmu-v6x:
+    # NuttX flight target: catches what SITL cannot (no C++ standard
+    # library, -Wframe-larger-than=4096, flash budget) and measures the
+    # ESKF stack and instruction count for Cortex-M7.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout ofnav source
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned PX4 v1.16.2
+        uses: actions/checkout@v4
+        with:
+          repository: PX4/PX4-Autopilot
+          ref: v1.16.2
+          path: PX4-Autopilot
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Fetch NuttX version tags required by PX4
+        run: git -C PX4-Autopilot/platforms/nuttx/NuttX/nuttx fetch --tags --force
+
+      - name: Install PX4 NuttX build dependencies and QEMU
+        run: |
+          bash PX4-Autopilot/Tools/setup/ubuntu.sh --no-sim-tools
+          sudo apt-get install -y --no-install-recommends qemu-system-arm
+
+      - name: Build px4_fmu-v6x_default with ofnav
+        run: |
+          bash tools/install_px4_ofnav_module.sh PX4-Autopilot boards/px4/fmu-v6x/default.px4board
+          make -C PX4-Autopilot px4_fmu-v6x_default
+
+      - name: Static worst-case stack of the ofnav task (target flags)
+        run: bash tools/px4_v6x_stack_report.sh PX4-Autopilot px4_fmu-v6x_default build/px4_v6x_stack
+
+      - name: Cortex-M7 instruction count of the ESKF workload (QEMU mps2-an500)
+        run: bash tools/qemu_m7_timing.sh build/qemu_m7
+
+      - name: Archive fmu-v6x firmware and resource reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: px4-fmu-v6x-ofnav
+          path: |
+            PX4-Autopilot/build/px4_fmu-v6x_default/px4_fmu-v6x_default.px4
+            build/px4_v6x_stack/stack_report.txt
+            build/px4_v6x_stack/stack_report.json
+            build/qemu_m7/qemu_m7_result.json
+          if-no-files-found: warn
+          retention-days: 30
+
