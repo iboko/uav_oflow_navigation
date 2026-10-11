@@ -65,3 +65,65 @@ def test_quaternion_from_matrix_is_normalised_and_round_trips():
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
     ])
     assert np.allclose(back, r, atol=1e-9)
+
+
+def _ppk_file(tmp_path, rows):
+    path = tmp_path / "track.pos"
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return path
+
+
+def test_ppk_interpolation_inside_two_fixed_epochs(tmp_path):
+    path = _ppk_file(tmp_path, [
+        "% GPST latitude longitude height quality",
+        "2022/02/22 19:11:16.000 47.0 -53.0 100.0 1",
+        "2022/02/22 19:11:16.200 47.2 -52.8 100.4 1",
+    ])
+    ppk = bag.read_ppk(path)
+    lat, lon, h, q = bag.sample_ppk(ppk, 0.5 * (ppk[0, 0] + ppk[1, 0]))
+    assert (lat, lon, h, q) == pytest.approx((47.1, -52.9, 100.2, 1))
+    assert bag.sample_ppk(ppk, ppk[0, 0])[-1] == 1
+    assert bag.sample_ppk(ppk, ppk[-1, 0])[-1] == 1
+
+
+def test_ppk_categorical_quality_never_interpolates_a_fix(tmp_path):
+    ppk = bag.read_ppk(_ppk_file(tmp_path, [
+        "2022/02/22 19:11:16.000 47.0 -53.0 100.0 1",
+        "2022/02/22 19:11:16.200 47.2 -52.8 100.4 2",
+    ]))
+    assert bag.sample_ppk(ppk, (ppk[0, 0] + ppk[1, 0]) / 2)[-1] == 0
+
+
+def test_ppk_extrapolation_and_unsupported_gaps_are_rejected(tmp_path):
+    ppk = bag.read_ppk(_ppk_file(tmp_path, [
+        "2022/02/22 19:11:16.000 47.0 -53.0 100.0 1",
+        "2022/02/22 19:11:16.200 47.2 -52.8 100.4 1",
+    ]))
+    with pytest.raises(ValueError, match="вне диапазона"):
+        bag.sample_ppk(ppk, ppk[0, 0] - .1)
+    with pytest.raises(ValueError, match="вне диапазона"):
+        bag.sample_ppk(ppk, ppk[-1, 0] + .1)
+    ppk[1, 0] += 10.
+    with pytest.raises(ValueError, match="Разрыв"):
+        bag.sample_ppk(ppk, ppk[0, 0] + .2)
+
+
+@pytest.mark.parametrize("rows", [
+    ["2022/02/22 19:11:16.200 47.0 -53.0 100.0 1",
+     "2022/02/22 19:11:16.000 47.2 -52.8 100.4 1"],
+    ["2022/02/22 19:11:16.000 47.0 -53.0 100.0 1",
+     "2022/02/22 19:11:16.000 47.2 -52.8 100.4 1"],
+])
+def test_ppk_out_of_order_or_duplicate_epoch_is_rejected(tmp_path, rows):
+    with pytest.raises(ValueError, match="дублируются|возрастанию"):
+        bag.read_ppk(_ppk_file(tmp_path, rows))
+
+
+@pytest.mark.parametrize("bad", ["91.0 -53.0 100.0 1", "47.0 -181.0 100.0 1",
+                                  "nan -53.0 100.0 1", "47.0 -53.0 100.0 0"])
+def test_ppk_invalid_reference_is_rejected(tmp_path, bad):
+    with pytest.raises(ValueError, match="строка PPK"):
+        bag.read_ppk(_ppk_file(tmp_path, [
+            "2022/02/22 19:11:16.000 " + bad,
+            "2022/02/22 19:11:16.200 47.2 -52.8 100.4 1",
+        ]))
