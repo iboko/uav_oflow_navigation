@@ -580,6 +580,55 @@ bool HorizontalEkf::resetVelocity(const FlowVelocityEstimate& flow) noexcept {
     return true;
 }
 
+bool validSafetyActionConfig(const SafetyActionConfig& cfg) noexcept {
+    return cfg.failsafe_confirm_us > 0U && cfg.degraded_confirm_us > 0U && cfg.recovery_us > 0U &&
+           cfg.degraded_to_land_us > cfg.degraded_confirm_us &&
+           cfg.degraded_to_land_us <= 600000000U;
+}
+
+bool RangeRateEstimator::push(uint64_t time_us, float height_m, float& vd_m_s, float& sigma_m_s) noexcept {
+    if (!isFinite(height_m) || height_m <= 0.0F) {
+        valid_ = false;
+        return false;
+    }
+    const bool have_previous = valid_ && time_us > last_us_;
+    const uint64_t dt_us = have_previous ? time_us - last_us_ : 0U;
+    const float previous_h = last_h_;
+    last_us_ = time_us;
+    last_h_ = height_m;
+    valid_ = true;
+    if (!have_previous || dt_us < 20000U || dt_us > 300000U) {
+        return false;
+    }
+    const float dt = static_cast<float>(dt_us) * 1.0e-6F;
+    vd_m_s = -(height_m - previous_h) / dt;  // height up -> velocity down negative
+    sigma_m_s = 1.41421356F * height_sigma_m_ / dt;
+    return isFinite(vd_m_s);
+}
+
+bool bodyVelocity3d(const Vector2f& body_xy_m_s, float sigma_xy_m_s,
+                    float vd_ned_m_s, float sigma_vd_m_s,
+                    const AttitudeSample& attitude, float max_tilt_rad,
+                    BodyVelocity3d& out) noexcept {
+    if (!isFinite(body_xy_m_s.x) || !isFinite(body_xy_m_s.y) || !isFinite(vd_ned_m_s) ||
+        !isFinite(sigma_xy_m_s) || !isFinite(sigma_vd_m_s) || sigma_xy_m_s <= 0.0F ||
+        sigma_vd_m_s <= 0.0F || tiltExceeded(attitude.roll_rad, attitude.pitch_rad, max_tilt_rad)) {
+        return false;
+    }
+    // Third row of R_nb (ZYX Euler): body -> NED down component.
+    const float r20 = -sinf(attitude.pitch_rad);
+    const float r21 = sinf(attitude.roll_rad) * cosf(attitude.pitch_rad);
+    const float r22 = cosf(attitude.roll_rad) * cosf(attitude.pitch_rad);
+    if (r22 < 0.5F) {
+        return false;
+    }
+    out.velocity_m_s = {body_xy_m_s.x, body_xy_m_s.y,
+                        (vd_ned_m_s - r20 * body_xy_m_s.x - r21 * body_xy_m_s.y) / r22};
+    const float sxy2 = sq(sigma_xy_m_s);
+    out.variance_m2_s2 = {sxy2, sxy2, (sq(sigma_vd_m_s) + (sq(r20) + sq(r21)) * sxy2) / sq(r22)};
+    return isFinite(out.velocity_m_s.z);
+}
+
 RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
                                   const RangeSample& range,
                                   const OpticalFlowRadSample& flow,
@@ -725,6 +774,7 @@ void SafetyActionManager::reset() noexcept {
     started_ = false;
     degraded_episode_ = false;
     engaged_ = false;
+    latched_reason_ = SafetyReason::Nominal;
 }
 
 SafetyDecision SafetyActionManager::decide(SafetyAction action, SafetyReason reason,
@@ -734,6 +784,7 @@ SafetyDecision SafetyActionManager::decide(SafetyAction action, SafetyReason rea
     if (d.changed) {
         action_ = action;
         action_since_us_ = now_us;
+        latched_reason_ = reason;  // cause of the (possibly latched) action
     }
     d.action = action_;
     d.reason = reason;
@@ -780,7 +831,7 @@ SafetyDecision SafetyActionManager::update(NavMode mode, uint64_t now_us,
     }
     const SafetyAction current = action_;
     if (current == SafetyAction::Land || current == SafetyAction::ManualTakeover) {
-        return decide(current, SafetyReason::Nominal, now_us);  // latched
+        return decide(current, latched_reason_, now_us);  // latched: keep the cause
     }
     if (mode == NavMode::ManualRequired) {
         return decide(SafetyAction::ManualTakeover, SafetyReason::ManualRequested, now_us);

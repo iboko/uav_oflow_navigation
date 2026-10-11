@@ -141,6 +141,47 @@ void test_velocity_reset_after_aiding_outage_but_not_during_aiding() {
     assert(runtime.velocityResets() == 1U);
 }
 
+void test_safety_action_config_validation() {
+    ofnav::SafetyActionConfig cfg{};
+    assert(ofnav::validSafetyActionConfig(cfg));
+    cfg.degraded_to_land_us = cfg.degraded_confirm_us;  // escalation must come later
+    assert(!ofnav::validSafetyActionConfig(cfg));
+    cfg = ofnav::SafetyActionConfig{};
+    cfg.failsafe_confirm_us = 0U;
+    assert(!ofnav::validSafetyActionConfig(cfg));
+}
+
+void test_range_rate_is_a_measured_vertical_velocity() {
+    ofnav::RangeRateEstimator rate(0.02F);
+    float vd = 0.0F;
+    float sigma = 0.0F;
+    assert(!rate.push(1000000U, 2.0F, vd, sigma));          // first sample: no rate
+    assert(rate.push(1100000U, 2.1F, vd, sigma));           // climbing 1 m/s
+    assert(near(vd, -1.0F, 1.0e-4F));
+    assert(near(sigma, 1.41421356F * 0.02F / 0.1F, 1.0e-5F));
+    assert(!rate.push(1105000U, 2.1F, vd, sigma));          // < 20 ms: refused
+    assert(!rate.push(1600000U, 2.1F, vd, sigma));          // > 300 ms gap: refused
+    assert(!rate.push(1700000U, ofnav::kNaN, vd, sigma));    // invalid height resets
+    assert(!rate.push(1800000U, 2.0F, vd, sigma));
+}
+
+void test_body_velocity_3d_from_horizontal_body_and_vertical_ned() {
+    ofnav::BodyVelocity3d out{};
+    // Level: body z equals NED down.
+    assert(ofnav::bodyVelocity3d({1.0F, -0.5F}, 0.1F, 0.3F, 0.2F, {0U, 0.0F, 0.0F, 1.0F}, 0.45F, out));
+    assert(near(out.velocity_m_s.z, 0.3F, 1.0e-6F));
+    assert(near(out.variance_m2_s2.z, 0.04F, 1.0e-6F));
+    // Pitched 0.2 rad, level forward flight: NED down velocity zero.
+    const float pitch = 0.2F;
+    assert(ofnav::bodyVelocity3d({2.0F, 0.0F}, 0.1F, 0.0F, 0.2F, {0U, 0.0F, pitch, 0.0F}, 0.45F, out));
+    // R20*vx + R22*vz = 0  ->  vz = sin(p)*vx/cos(p)
+    assert(near(out.velocity_m_s.z, 2.0F * std::tan(pitch), 1.0e-5F));
+    assert(out.variance_m2_s2.z > 0.04F);
+    // Beyond the tilt envelope and non-finite input are refused.
+    assert(!ofnav::bodyVelocity3d({1.0F, 0.0F}, 0.1F, 0.0F, 0.2F, {0U, 0.6F, 0.0F, 0.0F}, 0.45F, out));
+    assert(!ofnav::bodyVelocity3d({ofnav::kNaN, 0.0F}, 0.1F, 0.0F, 0.2F, {0U, 0.0F, 0.0F, 0.0F}, 0.45F, out));
+}
+
 void test_covariance_joseph_update() {
     auto cfg = baseConfig();
     ofnav::HorizontalEkf ekf(cfg);
@@ -461,7 +502,10 @@ void test_safety_failsafe_is_debounced_then_latched_land() {
     const auto land = m.update(NavMode::FailsafeLand, 2200000U);
     assert(land.action == SafetyAction::Land && land.changed && land.latched);
     assert(land.reason == ofnav::SafetyReason::FailsafeConfirmed);
-    assert(m.update(NavMode::FlowNav, 9000000U).action == SafetyAction::Land);
+    const auto latched = m.update(NavMode::FlowNav, 9000000U);
+    assert(latched.action == SafetyAction::Land);
+    // The latched action keeps reporting its cause, not NOMINAL.
+    assert(latched.reason == ofnav::SafetyReason::FailsafeConfirmed);
     assert(!m.update(NavMode::FlowNav, 9100000U).changed);
     m.reset();
     assert(m.update(NavMode::FlowNav, 9200000U).action == SafetyAction::None);
@@ -538,6 +582,9 @@ int main() {
     test_runtime_failsafe_without_range();
     test_ekf_innovation_gate_rejects_outlier();
     test_velocity_reset_after_aiding_outage_but_not_during_aiding();
+    test_range_rate_is_a_measured_vertical_velocity();
+    test_safety_action_config_validation();
+    test_body_velocity_3d_from_horizontal_body_and_vertical_ned();
     test_covariance_joseph_update();
     test_gravity_projection_does_not_create_horizontal_velocity();
     test_stale_flow_is_never_fused();

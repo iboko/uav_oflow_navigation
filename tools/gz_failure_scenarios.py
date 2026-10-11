@@ -14,6 +14,9 @@ commander mode change -> vehicle behaviour.
        -> HEIGHT_TOO_HIGH -> ALTITUDE_HOLD -> ALTCTL
   3  rangefinder loss (masking 'ofnav fault range')
        -> FAILSAFE_LAND -> LAND (latched) -> AUTO_LAND, landed, disarmed
+  4  second flight: IMU invalid in ofnav (masking 'ofnav fault imu')
+       -> FAILSAFE_LAND -> LAND (latched) -> AUTO_LAND, landed, disarmed;
+          the manager was reset by the new arming (no carried-over LAND)
 
 gz_bridge implements no 'failure optical_flow/distance_sensor' injection,
 hence the module-boundary masking (POSIX builds only). Manual control is
@@ -78,11 +81,14 @@ def install_textured_world(px4_dir: Path, seed: int = 7) -> None:
 
 
 class Px4:
-    def __init__(self, px4_dir: Path, log: Path, world: str = "default"):
+    def __init__(self, px4_dir: Path, log: Path, world: str = "default",
+                 params: dict[str, str] | None = None, model: str = "gz_x500_flow"):
         self.build = px4_dir / "build" / "px4_sitl_default"
         self.rootfs = self.build / "rootfs"
-        env = dict(os.environ, HEADLESS="1", PX4_SIM_MODEL="gz_x500_flow", GZ_IP="127.0.0.1",
+        env = dict(os.environ, HEADLESS="1", PX4_SIM_MODEL=model, GZ_IP="127.0.0.1",
                    PX4_GZ_WORLD=world)
+        # Boot-time parameters (rcS: PX4_PARAM_<name>), set before modules start.
+        env.update({f"PX4_PARAM_{k}": v for k, v in (params or {}).items()})
         self.log = log.open("w")
         # Isolate the SITL/Gazebo process tree. Never terminate unrelated
         # Gazebo simulations running on the same development machine.
@@ -126,6 +132,7 @@ class Link:
         self.state = {"armed": False, "main": 0, "sub": 0, "z": 0., "landed": 0}
         self.boot_s = 0.  # PX4 (lockstep = simulation) time from MAVLink
         self.throttle = 500
+        self.pitch = 0  # MANUAL_CONTROL x: + forward
         self._stop = False
         threading.Thread(target=self._tx, daemon=True).start()
         threading.Thread(target=self._rx, daemon=True).start()
@@ -139,7 +146,7 @@ class Link:
                     self.m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
                                               mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
                     last_hb = now
-                self.m.mav.manual_control_send(self.m.target_system, 0, 0, self.throttle, 0, 0)
+                self.m.mav.manual_control_send(self.m.target_system, self.pitch, 0, self.throttle, 0, 0)
             time.sleep(0.05)
 
     def _rx(self) -> None:
@@ -245,7 +252,12 @@ def main() -> None:
     if args.world == TEXTURED_WORLD:
         install_textured_world(args.px4_dir.resolve())
     report: dict = new_report(args.world)
-    px4 = Px4(args.px4_dir.resolve(), args.out / "px4_gz.log", args.world)
+    # Set at boot (PX4_PARAM_*). COM_RC_OVERRIDE=0: the harness moves the
+    # throttle stick between scenarios; commander must not read that as the
+    # pilot taking over an ofnav-commanded AUTO.LAND.
+    px4 = Px4(args.px4_dir.resolve(), args.out / "px4_gz.log", args.world,
+              {"MIS_TAKEOFF_ALT": "2.0", "NAV_DLL_ACT": "0", "COM_RC_IN_MODE": "1",
+               "NAV_RCL_ACT": "0", "COM_DISARM_LAND": "2", "COM_RC_OVERRIDE": "0"})
     link = Link()
     global SIM_CLOCK
     SIM_CLOCK = link
@@ -260,10 +272,6 @@ def main() -> None:
     try:
         if not wait(lambda: link.m.target_system != 0, 180):
             raise RuntimeError("no MAVLink heartbeat from PX4")
-        for name, value in (("MIS_TAKEOFF_ALT", "2.0"), ("NAV_DLL_ACT", "0"),
-                            ("COM_RC_IN_MODE", "1"), ("NAV_RCL_ACT", "0"),
-                            ("COM_DISARM_LAND", "2")):
-            px4.cmd("param", "set", name, value)
         print(px4.cmd("ofnav", "start", "-p", "flow", "-a", "-q", args.min_quality), flush=True)
         sim_sleep(5)
         s0 = ofnav_status(px4)
@@ -341,6 +349,32 @@ def main() -> None:
               mode_seen="AUTO.LAND" if got else link.mode(), disarmed=landed,
               latched=s3b.get("action"), sent=s3b.get("sent"))
         report["final_ofnav_status"] = s3b.get("raw")
+
+        # 4: second flight, IMU loss in ofnav -> LAND
+        if not wait(armed, 120, 1):
+            raise RuntimeError("re-arming failed: " + px4.cmd("commander", "check"))
+        link.command(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, float("nan"),
+                     float("nan"), float("nan"), float("nan"))
+        if not wait(lambda: link.state["z"] > 1.7, 60):
+            raise RuntimeError(f"second takeoff failed z={link.state['z']}")
+        sim_sleep(4)
+        link.set_mode(3)
+        wait(lambda: link.mode() == "POSCTL", 10)
+        engaged = wait(lambda: "safety engaged=1" in ofnav_status(px4).get("raw", ""), 20, 0.5)
+        s4a = ofnav_status(px4)  # the LAND of flight 1 must not carry over
+        px4.cmd("ofnav", "fault", "imu")
+        got = wait(lambda: link.mode() == "AUTO.LAND", 10)
+        s4 = ofnav_status(px4)
+        landed = wait(lambda: not link.state["armed"], 90)
+        px4.cmd("ofnav", "fault", "none")
+        sim_sleep(2)
+        s4b = ofnav_status(px4)
+        report["imu_fault_ofnav_status"] = s4.get("raw")
+        check("4_imu_loss_land", engaged and s4a.get("action") == "NONE" and got and landed
+              and s4.get("action") == "LAND" and s4b.get("action") == "LAND",
+              action_after_rearm=s4a.get("action"), engaged=engaged,
+              mode_seen="AUTO.LAND" if got else link.mode(), disarmed=landed,
+              reason=s4.get("reason"), latched=s4b.get("action"))
     except Exception as exc:  # report the failure, never hide it
         ok_all = False
         report["error"] = repr(exc)

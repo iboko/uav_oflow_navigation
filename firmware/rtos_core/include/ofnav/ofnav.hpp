@@ -117,6 +117,9 @@ struct SafetyActionConfig {
     bool require_engagement{true};
 };
 
+// Consistent timings: all positive, LAND escalation after confirmation.
+[[nodiscard]] bool validSafetyActionConfig(const SafetyActionConfig& cfg) noexcept;
+
 enum class SafetyReason : uint8_t {
     Nominal = 0,
     DegradedConfirmed,
@@ -297,6 +300,36 @@ private:
     Config cfg_{};
 };
 
+// Vertical velocity (NED down) from successive heights above ground
+// (rangefinder corrected for tilt). A MEASURED vertical rate: flat
+// ground assumed between two samples; no value outside 20-300 ms.
+class RangeRateEstimator final {
+public:
+    explicit RangeRateEstimator(float height_sigma_m = 0.02F) noexcept : height_sigma_m_(height_sigma_m) {}
+    void reset() noexcept { valid_ = false; }
+    // Returns true and sets vd/sigma when a rate over a valid interval exists.
+    bool push(uint64_t time_us, float height_m, float& vd_m_s, float& sigma_m_s) noexcept;
+
+private:
+    float height_sigma_m_;
+    uint64_t last_us_{0U};
+    float last_h_{0.0F};
+    bool valid_{false};
+};
+
+// Full body-frame (FRD) velocity from the horizontal body velocity of the
+// flow estimator and the measured NED down velocity:
+// vd = R20 vx + R21 vy + R22 vz  ->  vz = (vd - R20 vx - R21 vy) / R22.
+// False for tilts beyond max_tilt_rad or non-finite input.
+struct BodyVelocity3d {
+    Vector3f velocity_m_s{};
+    Vector3f variance_m2_s2{};
+};
+[[nodiscard]] bool bodyVelocity3d(const Vector2f& body_xy_m_s, float sigma_xy_m_s,
+                                  float vd_ned_m_s, float sigma_vd_m_s,
+                                  const AttitudeSample& attitude, float max_tilt_rad,
+                                  BodyVelocity3d& out) noexcept;
+
 // Integrates vehicle gyro delta angles over an optical-flow integration
 // interval for sensors without their own gyro (PAW3902-class, Gazebo).
 // Only an interval FULLY covered by stored IMU packets is integrated;
@@ -353,6 +386,7 @@ private:
     bool started_{false};
     bool degraded_episode_{false};
     bool engaged_{false};
+    SafetyReason latched_reason_{SafetyReason::Nominal};
 };
 
 [[nodiscard]] const char* toString(SafetyAction action) noexcept;

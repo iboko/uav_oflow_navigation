@@ -60,6 +60,7 @@ mkdir -p "$MODULE_DST/ofnav_core"
 
 cp "$MODULE_SRC/CMakeLists.txt" "$MODULE_DST/CMakeLists.txt"
 cp "$MODULE_SRC/Kconfig" "$MODULE_DST/Kconfig"
+cp "$MODULE_SRC/module.yaml" "$MODULE_DST/module.yaml"
 cp "$MODULE_SRC/ofnav_px4.cpp" "$MODULE_DST/ofnav_px4.cpp"
 cp "$MODULE_SRC/ofnav_sitl_csv_replay.cpp" "$MODULE_DST/ofnav_sitl_csv_replay.cpp"
 cp "$MODULE_SRC/ofnav_sitl_eskf_replay.cpp" "$MODULE_DST/ofnav_sitl_eskf_replay.cpp"
