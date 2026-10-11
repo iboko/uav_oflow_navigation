@@ -135,6 +135,34 @@ def tilt_error_deg(d: dict, t0_us: int) -> dict:
             "pitch": round(float(np.mean(pa[sel] - np.interp(a["timestamp"][sel], g["timestamp"], pg))), 2)}
 
 
+def heading_phase(args, px4: gz.Px4, link, report: dict, check) -> None:
+    """After GNSS loss: EKF2 heading vs truth with a magnetic heading error from boot."""
+    report["mag_decl_error"] = {"wmm_declination_deg": args.wmm_declination_deg,
+                                "error_deg": args.mag_decl_error_deg, "set_at": "boot"}
+    samples = []
+    for _ in range(20):
+        gz.sim_sleep(2)
+        est = float(topic(px4, "vehicle_local_position").get("heading", math.nan))
+        truth = float(topic(px4, "vehicle_local_position_groundtruth").get("heading", math.nan))
+        f = topic(px4, "estimator_status_flags")
+        err = math.degrees((est - truth + math.pi) % (2 * math.pi) - math.pi)
+        samples.append({"t": round(link.boot_s, 1), "heading_error_deg": round(err, 2),
+                        "cs_ev_yaw": f.get("cs_ev_yaw"), "cs_mag_hdg": f.get("cs_mag_hdg"),
+                        "cs_mag_3d": f.get("cs_mag_3d")})
+        print(samples[-1], flush=True)
+    report["heading_samples"] = samples
+    late = [abs(x["heading_error_deg"]) for x in samples[10:]]
+    info = dict(max_abs_heading_error_last_20s_deg=round(max(late), 2),
+                ev_yaw_fused=samples[-1]["cs_ev_yaw"], mag_fused=samples[-1]["cs_mag_hdg"] == "True"
+                or samples[-1]["cs_mag_3d"] == "True")
+    if args.ev_yaw:
+        check("H_heading_held_by_map_despite_mag_error", max(late) < 4.0 and samples[-1]["cs_ev_yaw"] == "True",
+              **info)
+    else:
+        report["heading_without_ev_yaw"] = info  # reference run, not a pass criterion
+        print("INFO heading_without_ev_yaw", info, flush=True)
+
+
 def combine(args) -> None:
     flights = []
     for d in args.flights:
@@ -181,7 +209,14 @@ def read_map_log(path: Path) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("px4_dir", type=Path)
-    ap.add_argument("--mode", choices=("calibrate", "combine", "test"), required=True)
+    ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
+    ap.add_argument("--ev-yaw", action="store_true",
+                    help="heading: send the map-referenced heading to EKF2 (EKF2_EV_CTRL bit 3)")
+    ap.add_argument("--mag-decl-error-deg", type=float, default=12.0,
+                    help="heading: declination error from boot (EKF2_DECL_TYPE=0), e.g. a wrong "
+                         "declination or a magnetic disturbance at the take-off site")
+    ap.add_argument("--wmm-declination-deg", type=float, default=3.41,
+                    help="heading: declination PX4 derives from WMM at the Gazebo world origin")
     ap.add_argument("--flights", type=Path, nargs="*", default=(),
                     help="combine: calibration flight directories, 3 fit then 2 held out")
     ap.add_argument("--isotropic", action="store_true",
@@ -193,8 +228,15 @@ def main() -> None:
     ap.add_argument("--georef-error", type=float, nargs=2, default=(0.15, -0.10))
     ap.add_argument("--companion-python", default=sys.executable)
     args = ap.parse_args()
-    if args.mode == "test" and not args.calibration:
-        ap.error("--mode test needs --calibration")
+    if args.mode in ("test", "heading") and not args.calibration:
+        ap.error("--mode test/heading needs --calibration")
+    params = dict(PARAMS, EKF2_EV_CTRL="13") if args.mode == "heading" and args.ev_yaw else dict(PARAMS)
+    if args.mode == "heading":
+        # A 3D magnetometer with estimated earth field absorbs a declination
+        # change made in flight within minutes (checked): the error must be
+        # present at alignment, as with a wrong declination at the take-off site.
+        params.update(EKF2_DECL_TYPE="0",
+                      EKF2_MAG_DECL=f"{args.wmm_declination_deg + args.mag_decl_error_deg:.3f}")
     if args.mode == "combine":
         combine(args)
         return
@@ -206,11 +248,12 @@ def main() -> None:
     map_png, georef = make_orthophoto(px4_dir, args.out, tuple(args.georef_error))
     control = args.out / "map_control.json"
     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
-    report: dict = {"type": f"PX4_SITL_GAZEBO_COMPANION_MAP_{args.mode.upper()}", "params": PARAMS,
+    report: dict = {"type": f"PX4_SITL_GAZEBO_COMPANION_MAP_{args.mode.upper()}", "params": params,
+                    "ev_yaw": bool(args.ev_yaw),
                     "focal_error": args.focal_error, "georef_error_ne_m": list(args.georef_error),
                     "checks": {}, "segments": {}}
     started_wall = time.time()
-    px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", gz.TEXTURED_WORLD, PARAMS, model=f"gz_{vo_flight.MODEL}")
+    px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", gz.TEXTURED_WORLD, params, model=f"gz_{vo_flight.MODEL}")
     link = gz.Link()
     gz.SIM_CLOCK = link
     clog_path = args.out / "companion.log"
@@ -244,10 +287,16 @@ def main() -> None:
                "--save-frames", str(args.out / "frames")]
         cmd += ["--map-mode", "observe"] if args.mode == "calibrate" else \
             ["--map-mode", "fuse", "--map-calibration", str(args.calibration.resolve())]
+        if args.ev_yaw:
+            cmd += ["--map-yaw"]
         # The companion starts after the preflight gate: its start-up load
         # (orthophoto features) during EKF2 initialisation coincided with
         # failed magnetometer alignment in SITL.
-        report["preflight"] = vo_flight.wait_estimator_settled(px4)
+        # The heading mode starts with a deliberate heading error: the SITL
+        # sanity threshold is widened to keep that start (still rejecting the
+        # 30-50 deg SITL artefacts).
+        report["preflight"] = vo_flight.wait_estimator_settled(
+            px4, max_heading_error_deg=args.mag_decl_error_deg + 8.0 if args.mode == "heading" else 10.0)
         companion = subprocess.Popen(cmd, stdout=clog, stderr=subprocess.STDOUT)
         gz.sim_sleep(5)
 
@@ -293,6 +342,8 @@ def main() -> None:
             f2["cs_ev_pos"] = topic(px4, "estimator_status_flags").get("cs_ev_pos")
             check("2_gnss_lost_ekf2_on_map_and_vo", f2["cs_ev_pos"] == "True" and f2["cs_ev_vel"] == "True"
                   and f2["cs_gnss_pos"] == "False" and f2["xy_valid"] == "True", **f2)
+            if args.mode == "heading":
+                heading_phase(args, px4, link, report, check)
             # 3: box pattern, absolute error.
             errors, legs = [], []
             for pitch, roll in ((300, 0), (0, 300), (300, 0), (0, 300)):
@@ -306,6 +357,7 @@ def main() -> None:
             report["route_end_us"] = int(link.boot_s * 1e6)
             check("3_route_absolute_error_on_map", max(errors) < 0.5, max_abs_error_m=round(max(errors), 3),
                   mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors))
+        if args.mode == "test":
             # 4: map fault.
             before = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
             truth0, est0 = truth_est()

@@ -96,6 +96,7 @@ class BodyVelocityMeasurement:
     vo: VisualOdomResult
     vd_m_s: float
     height_mid_m: float = float("nan")   # над ровной землей, середина интервала
+    rpy_mid: tuple[float, float, float] = (float("nan"),) * 3  # ориентация автопилота, середина
 
 
 class CompanionVo:
@@ -191,4 +192,4 @@ class CompanionVo:
         self.count("PUBLISHED")
         return BodyVelocityMeasurement((t0 + t1) // 2, tuple(float(v) for v in v_body),
                                        tuple(float(cov_body[i, i]) for i in range(3)), result, vd,
-                                       float(mid[3]))
+                                       float(mid[3]), (float(mid[0]), float(mid[1]), float(mid[2])))

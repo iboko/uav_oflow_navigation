@@ -98,3 +98,12 @@ def test_heading_offset_from_map_fixes_corrects_vo_direction():
     _, pos2, _ = _fly(anchor, 60, start=pos, t0=1_000_000 + 300 * DT, fix_every=1000,
                       heading_error=np.radians(9.0))
     assert np.linalg.norm(np.array(anchor.status().position_ne_m) - pos2) < 0.05
+
+
+def test_heading_sigma_has_a_floor_and_follows_the_spread():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    assert not anchor.heading_known
+    _fly(anchor, 200, fix_every=4, heading_error=np.radians(9.0))
+    assert anchor.heading_known
+    assert anchor.heading_sigma_rad() == pytest.approx(0.05)  # identical offsets: floor
+    assert anchor.heading_sigma_rad(floor_rad=0.0) < 1e-6
