@@ -1,0 +1,133 @@
+"""Конвейер VO компаньон-компьютера: синхронизация, высота, скорость FRD."""
+import math
+
+import numpy as np
+import pytest
+
+cv2 = pytest.importorskip("cv2")
+
+from src.camera_rotation_compensation import CameraMountCalibration
+from src.companion_vo import CompanionVo, History, TimeOffset
+from src.continuous_visual_odometry import ContinuousPlanarOdometry
+from src.ground_visual_motion import CameraCalibration
+from src.velocity_uncertainty import VelocityErrorAssumptions
+
+IMAGE_TO_BODY = ((0.0, -1.0), (1.0, 0.0))
+BODY_FROM_CAMERA = ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+F_PX = 240.0
+OFFSET_US = 7_000_000  # часы автопилота впереди часов компаньона
+
+
+def _texture():
+    rng = np.random.default_rng(5)
+    img = np.zeros((900, 900), np.float32)
+    for cells, weight in ((12, 0.6), (45, 1.0), (150, 0.8)):
+        img += weight * cv2.resize(rng.random((cells, cells)).astype(np.float32), (900, 900),
+                                   interpolation=cv2.INTER_CUBIC)
+    img = (img - img.min()) / (img.max() - img.min())
+    return (255 * img).astype(np.uint8)
+
+
+def _pipeline():
+    cal = CameraCalibration(F_PX, F_PX, 160.0, 120.0, IMAGE_TO_BODY)
+    vo = ContinuousPlanarOdometry(
+        cal, camera_mount=CameraMountCalibration(BODY_FROM_CAMERA),
+        velocity_error_assumptions=VelocityErrorAssumptions(0.5, 0.05, 0.002, 0.02, 0.01,
+                                                            velocity_model_floor_m_s=0.05),
+        max_tilt_rad=0.25)
+    pipe = CompanionVo(vo)
+    for k in range(5):  # обмен TIMESYNC, задержка круга 2-6 мс
+        sent = 1_000_000 + k * 200_000
+        rtt = 2000 + 1000 * k
+        pipe.clock.add(sent, sent + rtt // 2 + OFFSET_US, sent + rtt)
+    return pipe
+
+
+def test_time_offset_uses_minimum_round_trip_and_rejects_slow_samples():
+    clock = TimeOffset()
+    assert not clock.valid
+    clock.add(0, 5_000 + 900, 1_000)          # rtt 1 мс -> смещение 5 мс + 0.4
+    clock.add(10_000, 10_000 + 5_000 + 20_000, 40_000)  # rtt 30 мс: асимметрия
+    clock.add(20_000, 20_000 + 9_999_999, 120_000)      # rtt 100 мс: отброшен
+    clock.add(50_000, 50_000 + 5_000 + 1_000, 52_000)
+    assert clock.valid
+    assert clock.offset_us == 5_400
+    with pytest.raises(ValueError):
+        TimeOffset().offset_us
+
+
+def test_history_interpolates_only_inside_a_bounded_gap():
+    h = History(max_gap_us=100)
+    h.add(1000, 1.0)
+    h.add(1100, 3.0)
+    h.add(1050, 9.0)  # немонотонный отсчет отбрасывается
+    assert h.bracket(1050) == (1.0, 3.0, 0.5)
+    assert h.bracket(999) is None and h.bracket(1101) is None
+    h.add(1300, 5.0)
+    assert h.bracket(1200) is None  # разрыв 200 мкс > 100
+
+
+def test_forward_and_climb_give_body_frd_velocity_from_measurements():
+    """Вперед 1 м/с, подъем 0.5 м/s, курс 90 градусов, без наклона."""
+    texture = _texture()
+    pipe = _pipeline()
+    yaw = math.pi / 2
+    q = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+    dt_us = 66_667
+    outs = []
+    for k in range(8):
+        t_cam = 2_000_000 + k * dt_us
+        height = 3.0 + 0.5 * k * dt_us * 1e-6
+        # Отсчеты автопилота каждые 10 мс вокруг кадра, в его часах.
+        for j in range(-8, 9):
+            t_ap = t_cam + OFFSET_US + j * 10_000
+            pipe.attitude.add(t_ap, q)
+            pipe.distance.add(t_ap, 3.0 + 0.5 * (t_ap - OFFSET_US - 2_000_000) * 1e-6)
+        assert pipe.ready_for(t_cam)
+        # Сдвиг вперед на 1 м/с: изображение земли уходит вниз (+v).
+        shift_px = 1.0 * k * dt_us * 1e-6 * F_PX / height
+        row = 400 - shift_px
+        crop = cv2.getRectSubPix(texture, (320, 240), (450.0, row + 120.0))
+        # Масштаб от высоты не моделируется: подъем мал на 8 кадрах.
+        out = pipe.process(t_cam, crop)
+        if out is not None:
+            outs.append(out)
+    assert len(outs) >= 5, pipe.counts
+    vx = np.median([o.velocity_frd[0] for o in outs])
+    vy = np.median([o.velocity_frd[1] for o in outs])
+    vz = np.median([o.velocity_frd[2] for o in outs])
+    assert vx == pytest.approx(1.0, abs=0.12)
+    assert abs(vy) < 0.1
+    assert vz == pytest.approx(-0.5, abs=0.05)   # подъем: FRD z вниз
+    # Курс 90°: вперед по корпусу = на восток.
+    assert np.median([o.vo.ve_m_s for o in outs]) == pytest.approx(1.0, abs=0.12)
+    o = outs[-1]
+    assert o.variance_frd[2] == pytest.approx(2 * 0.02 ** 2 / (dt_us * 1e-6) ** 2, rel=1e-6)
+    assert o.time_us == (o.vo.interval_start_us + o.vo.timestamp_us) // 2
+
+
+def test_no_measurement_without_time_sync_or_rangefinder():
+    texture = _texture()
+    cal = CameraCalibration(F_PX, F_PX, 160.0, 120.0, IMAGE_TO_BODY)
+    pipe = CompanionVo(ContinuousPlanarOdometry(cal, camera_mount=CameraMountCalibration(BODY_FROM_CAMERA)))
+    crop = texture[:240, :320].copy()
+    assert not pipe.ready_for(1_000_000)
+    assert pipe.process(1_000_000, crop) is None
+    assert pipe.counts == {"NO_TIME_SYNC": 1}
+    pipe = _pipeline()
+    for j in range(20):
+        pipe.attitude.add(1_900_000 + OFFSET_US + j * 10_000, (1.0, 0.0, 0.0, 0.0))
+    assert not pipe.ready_for(2_000_000)  # нет дальномера
+    assert pipe.process(2_000_000, crop) is None
+    assert pipe.counts["NO_ATTITUDE_OR_RANGE"] == 1
+
+
+def test_no_measurement_below_minimum_height():
+    texture = _texture()
+    pipe = _pipeline()
+    for j in range(-20, 21):
+        t_ap = 2_000_000 + OFFSET_US + j * 10_000
+        pipe.attitude.add(t_ap, (1.0, 0.0, 0.0, 0.0))
+        pipe.distance.add(t_ap, 0.3)
+    assert pipe.process(2_000_000, texture[:240, :320].copy()) is None
+    assert pipe.counts == {"BELOW_MIN_HEIGHT": 1}

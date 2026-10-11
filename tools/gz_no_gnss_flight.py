@@ -53,6 +53,13 @@ def topic(px4: gz.Px4, name: str) -> dict:
             out[key] = float(value)
         except ValueError:
             out[key] = value
+    # Arrays print as 'velocity: [0.1, 0.2, 0.3]': stored as 'velocity[i]'.
+    for key, values in re.findall(r"^\s*([a-z_]+): \[([^\]]*)\]", text, re.M):
+        for i, value in enumerate(values.split(",")):
+            try:
+                out[f"{key}[{i}]"] = float(value)
+            except ValueError:
+                pass
     return out
 
 
