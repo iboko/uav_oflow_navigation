@@ -548,7 +548,7 @@ void OfNavRuntime::reset(uint64_t time_us) noexcept {
     ekf_.reset(time_us);
     last_flow_estimate_ = {};
     last_innovation_ok_ = false;
-    last_fusion_us_ = 0U;
+    last_fusion_us_ = time_us;  // the unaided interval starts at the reset
 }
 
 void OfNavRuntime::predictImu(const ImuSample& imu,
@@ -607,10 +607,15 @@ RuntimeOutput OfNavRuntime::step(const ImuSample& imu,
     last_flow_estimate_ = {};
     last_innovation_ok_ = false;
     if (fresh_imu && fresh_att && fresh_flow && fresh_range && aligned) {
+        if (last_fusion_us_ == 0U) {
+            // Never reset: the first measurement starts the unaided interval,
+            // so a first-frame outlier cannot bypass the innovation gate.
+            last_fusion_us_ = flow.time_us;
+        }
         last_flow_estimate_ = flow_estimator_.update(flow, range, imu, attitude);
         last_innovation_ok_ = ekf_.updateFlowVelocity(last_flow_estimate_, flow.quality);
         if (last_flow_estimate_.accepted && !last_innovation_ok_ && cfg_.velocity_reset_timeout_us > 0U &&
-            (last_fusion_us_ == 0U || flow.time_us > last_fusion_us_ + cfg_.velocity_reset_timeout_us) &&
+            flow.time_us > last_fusion_us_ + cfg_.velocity_reset_timeout_us &&
             ekf_.resetVelocity(last_flow_estimate_)) {
             // A single outlier during continuous aiding is still gated; only
             // after an aiding outage the inertial velocity is not trusted.

@@ -107,8 +107,18 @@ void test_velocity_reset_after_aiding_outage_but_not_during_aiding() {
     auto cfg = baseConfig();
     ofnav::OfNavRuntime runtime(cfg);
     runtime.reset(1000000U);
+    // Right after a reset an outlier is gated: no unaided interval yet.
+    {
+        const uint64_t t0 = 1001000U;
+        runtime.predictImu({t0, {}, {0.0F, 0.0F, -9.81F}, true}, {t0, 0.0F, 0.0F, 0.0F});
+        const ofnav::OpticalFlowRadSample fast{t0, 0.04F, 0.04F, 0.0F, 0.0F, 0.0F, 0.0F, 220U, true};
+        const auto out = runtime.step({t0, {}, {0.0F, 0.0F, -9.81F}, true}, {t0, 1.0F, true}, fast,
+                                      {t0, 0.0F, 0.0F, 0.0F}, t0);
+        assert(out.flow.reason == ofnav::RejectReason::InnovationGate);
+        assert(runtime.velocityResets() == 0U);
+    }
     // 3 s unaided with a 1 m/s^2 accelerometer error: ~3 m/s velocity drift.
-    uint64_t t = 1000000U;
+    uint64_t t = 1001000U;
     for (int i = 0; i < 300; ++i) {
         t += 10000U;
         runtime.predictImu({t, {}, {1.0F, 0.0F, -9.81F}, true}, {t, 0.0F, 0.0F, 0.0F});

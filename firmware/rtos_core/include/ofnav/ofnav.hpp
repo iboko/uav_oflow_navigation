@@ -382,6 +382,8 @@ public:
 private:
     FlowVelocityEstimate last_flow_estimate_{};
     bool last_innovation_ok_{false};
+    // Last accepted flow fusion, or the start of aiding (reset / first
+    // measurement): the unaided interval for the velocity reset.
     uint64_t last_fusion_us_{0U};
     uint32_t velocity_resets_{0U};
     Config cfg_{};

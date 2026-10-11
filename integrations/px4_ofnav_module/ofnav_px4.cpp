@@ -123,7 +123,16 @@ static int bench_task_main(int argc, char *argv[])
 
 static int run_bench()
 {
-    BenchJob job{};
+    // Static: a task that outlives the wait below must never write into a
+    // returned stack frame. A new run is refused while one is still running.
+    static BenchJob job{};
+
+    if (g_bench_job != nullptr && !job.done) {
+        PX4_ERR("OFNAV_BENCH previous run still active");
+        return -1;
+    }
+
+    job = BenchJob{};
     job.buffers = new ofnav15::WorkloadBuffers{};
 
     if (job.buffers == nullptr) {
@@ -140,6 +149,8 @@ static int run_bench()
 
     if (tid < 0) {
         delete job.buffers;
+        job.buffers = nullptr;
+        job.done = true;
         PX4_ERR("OFNAV_BENCH task spawn failed");
         return -1;
     }
@@ -148,7 +159,7 @@ static int run_bench()
 
     if (!job.done) {
         PX4_ERR("OFNAV_BENCH timeout");
-        return -1;  // buffers intentionally leaked: the task may still run
+        return -1;  // job and buffers stay owned by the still-running task
     }
 
 #else
@@ -182,6 +193,7 @@ static int run_bench()
     PX4_INFO("OFNAV_BENCH stack_used=%ld of %d bytes (-1: no NuttX stack coloration) buffers=%u bytes",
              job.stack_used, kTaskStackBytes, static_cast<unsigned>(sizeof(ofnav15::WorkloadBuffers)));
     delete job.buffers;
+    job.buffers = nullptr;
     return ok ? 0 : -1;
 }
 
