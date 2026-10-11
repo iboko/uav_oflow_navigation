@@ -180,6 +180,15 @@ def evaluate(rows: list[dict], split_s: float, holdout_gap_s: float = 0.0) -> di
                    for r in cal])
     matrix = np.array([[1., r["h"] ** 2, float(np.linalg.norm(r["ref"])) ** 2]
                        for r in cal])
+    # Масштабы столбцов различаются на порядки (1, h^2, v^2).
+    # Ранг и обусловленность оцениваются ПОСЛЕ нормировки столбцов:
+    # ненулевое решение NNLS не доказывает идентифицируемости трех шумов.
+    norms = np.linalg.norm(matrix, axis=0)
+    normalized = matrix / np.where(norms > 0, norms, 1.0)
+    singular = np.linalg.svd(normalized, compute_uv=False)
+    rank = int(np.sum(singular > singular[0] * 1e-8))
+    condition = float(singular[0] / singular[-1]) if singular[-1] > 0 else math.inf
+    identifiable = rank == 3 and math.isfinite(condition) and condition < 1e4
     coef = fit_nonnegative_variances(matrix, e2)
     fitted = {
         "sigma_min_m_s": math.sqrt(coef[0]),
@@ -204,6 +213,13 @@ def evaluate(rows: list[dict], split_s: float, holdout_gap_s: float = 0.0) -> di
             "heading_offset_deg": heading,
             "speed_scale_vo_over_ref": scale,
             "fitted_noise_model": fitted,
+            "noise_model_design_rank": rank,
+            "noise_model_normalized_condition_number": condition if math.isfinite(condition) else None,
+            "noise_model_identifiable": bool(identifiable),
+            "fitted_noise_model_validated_for_flight": False,
+            "noise_model_warning": (None if identifiable else
+                "Три вклада дисперсии неразличимы по данным обучающей части: "
+                "значения отдельных коэффициентов NNLS не интерпретировать физически"),
             "raw_before_heading_and_scale": metrics(cal, 0.0, 1.0, None),
             "after": metrics(cal, heading, scale, fitted),
         },
