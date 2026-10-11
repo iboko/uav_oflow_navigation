@@ -127,3 +127,17 @@ def test_ppk_invalid_reference_is_rejected(tmp_path, bad):
             "2022/02/22 19:11:16.000 " + bad,
             "2022/02/22 19:11:16.200 47.2 -52.8 100.4 1",
         ]))
+
+
+@pytest.mark.parametrize("flag,value", [("--scale", "0"), ("--scale", "nan"),
+                                        ("--scale", "-0.5"), ("--frame-step", "0")])
+def test_importer_rejects_invalid_cli_parameters_before_file_access(tmp_path, monkeypatch, flag, value):
+    import sys
+    monkeypatch.setattr(sys, "argv",
+                        ["munfrl_bag_slice", "nonexistent.bag", "nonexistent.pos",
+                         str(tmp_path / "output"), "--connections-from", "nonexistent.head",
+                         flag, value])
+    with pytest.raises(SystemExit) as exc:
+        bag.main()
+    assert exc.value.code == 2
+    assert not (tmp_path / "output").exists()
