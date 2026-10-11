@@ -25,6 +25,7 @@ import json
 import math
 import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -191,21 +192,41 @@ def main() -> None:
         map_log.write("t_us,localizer_status,north_m,east_m,inliers,heading_offset_rad,height_m,"
                       "injected_shift_n,injected_shift_e,anchor_result,nis,process_ms\n")
 
+    # MAVLink is read in its own thread: the MSCKF initialisation takes
+    # 0.7-1.8 s, and a loop blocked that long overflowed the UDP buffer
+    # (HIGHRES_IMU lost for seconds -> RESET_IMU_GAP -> a new initialisation).
+    inbox: queue.Queue = queue.Queue()
+
+    def reader() -> None:
+        while True:
+            m = link.recv_match(blocking=True, timeout=0.1)
+            if m is None:
+                continue
+            arrival = clock_us[0]
+            if m.get_type() == "TIMESYNC" and m.get_srcComponent() == 1 and m.tc1 == 0:
+                # PX4 asks: answer at once with the companion clock.
+                link.mav.timesync_send(arrival * 1000, m.ts1)
+                continue
+            inbox.put((m, arrival))
+    threading.Thread(target=reader, daemon=True).start()
+
     while True:
         # Drain everything queued: a late TIMESYNC answer spoils both offsets.
-        msgs = [link.recv_match(blocking=True, timeout=0.01)]
-        while msgs[-1] is not None:
-            msgs.append(link.recv_match(blocking=False))
+        msgs = []
+        try:
+            msgs.append(inbox.get(timeout=0.01))
+            while True:
+                msgs.append(inbox.get_nowait())
+        except queue.Empty:
+            pass
         now = clock_us[0]
-        for msg in msgs[:-1]:
+        for msg, arrival in msgs:
             if pipeline is None:
                 break
             t = msg.get_type()
             if t == "TIMESYNC" and msg.get_srcComponent() == 1:
-                if msg.tc1 == 0:      # PX4 asks: answer with the companion clock
-                    link.mav.timesync_send(clock_us[0] * 1000, msg.ts1)
-                else:                 # answer to our request
-                    pipeline.clock.add(msg.ts1 // 1000, msg.tc1 // 1000, clock_us[0])
+                # Answer to our request, at its arrival time.
+                pipeline.clock.add(msg.ts1 // 1000, msg.tc1 // 1000, arrival)
             elif t == "ATTITUDE_QUATERNION":
                 pipeline.attitude.add(msg.time_boot_ms * 1000, (msg.q1, msg.q2, msg.q3, msg.q4))
             elif t == "HIGHRES_IMU" and msckf is not None and pipeline.clock.valid:
