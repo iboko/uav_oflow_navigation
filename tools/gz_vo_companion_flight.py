@@ -155,6 +155,8 @@ def main() -> None:
     ap.add_argument("px4_dir", type=Path)
     ap.add_argument("--out", type=Path, default=Path("build/gz_vo_companion"))
     ap.add_argument("--world", default=gz.TEXTURED_WORLD)
+    ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo")
+    ap.add_argument("--altitude", type=float, default=3.0)
     ap.add_argument("--companion-python", default=sys.executable,
                     help="interpreter with gz.transport13 / gz.msgs10, numpy, cv2, pymavlink")
     args = ap.parse_args()
@@ -166,8 +168,9 @@ def main() -> None:
         gz.install_textured_world(px4_dir)
     install_vehicle(px4_dir)
     report: dict = {"type": "PX4_SITL_GAZEBO_GNSS_LOSS_COMPANION_VO", "world": args.world,
-                    "params": PARAMS, "checks": {}, "samples": []}
-    px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", args.world, PARAMS, model=f"gz_{MODEL}")
+                    "params": PARAMS, "estimator": args.estimator, "altitude": args.altitude, "checks": {}, "samples": []}
+    params = dict(PARAMS, MIS_TAKEOFF_ALT=f"{args.altitude:.1f}")
+    px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", args.world, params, model=f"gz_{MODEL}")
     link = gz.Link()
     gz.SIM_CLOCK = link
     companion_log = (args.out / "companion.log").open("w")
@@ -190,7 +193,8 @@ def main() -> None:
         # subscription, for an already running Gazebo world.
         companion = subprocess.Popen(
             [args.companion_python, str(Path(__file__).with_name("gz_vo_companion.py")), "--world", args.world,
-             "--camera-topic", CAMERA_TOPIC, "--log", str(args.out / "companion_vo.csv")],
+             "--camera-topic", CAMERA_TOPIC, "--log", str(args.out / "companion_vo.csv"),
+             "--estimator", args.estimator],
             stdout=companion_log, stderr=subprocess.STDOUT)
         # On the ground the camera is ~0.2 m above the texture and VO has no
         # track: the takeoff is GNSS-aided, VO fusion is checked in the air.
@@ -207,7 +211,7 @@ def main() -> None:
         z_home = link.state["z"]
         link.command(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, float("nan"),
                      float("nan"), float("nan"), float("nan"))
-        if not gz.wait(lambda: link.state["z"] - z_home > 2.7, 60):
+        if not gz.wait(lambda: link.state["z"] - z_home > args.altitude - 0.3, 90):
             raise RuntimeError(f"takeoff failed dz={link.state['z'] - z_home}")
         gz.sim_sleep(4)
         link.set_mode(3)

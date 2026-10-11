@@ -126,6 +126,15 @@ class CompanionVo:
         t = companion_t_us + self.clock.offset_us
         return self.attitude.latest_us >= t and self.distance.latest_us >= t
 
+    def quaternion_at_camera_time(self, companion_t_us: int):
+        """Autopilot attitude quaternion (FRD->NED) at the frame, or None."""
+        if not self.clock.valid:
+            return None
+        att = self.attitude.bracket(companion_t_us + self.clock.offset_us)
+        if att is None:
+            return None
+        return tuple(float(x) for x in slerp(np.asarray(att[0]), np.asarray(att[1]), att[2]))
+
     def state_at_camera_time(self, companion_t_us: int):
         """(roll, pitch, yaw, height) на момент кадра или None."""
         if not self.clock.valid:

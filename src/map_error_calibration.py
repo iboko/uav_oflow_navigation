@@ -62,6 +62,7 @@ def calibrate_map_error(
     min_fitting_flights: int = 3,
     min_holdout_flights: int = 2,
     min_samples_per_flight: int = 30,
+    outliers_removed_by_rule: str | None = None,
 ) -> MapErrorCalibration:
     """Estimate bias and *centered* 2D covariance, then report holdout coverage.
 
@@ -81,11 +82,15 @@ def calibrate_map_error(
     labels = [x.name for x in fit + holdout]
     if len(set(labels)) != len(labels):
         raise ValueError("Полеты настройки и независимой проверки пересекаются")
-    if any(f.false_fixes for f in fit):
+    if any(f.false_fixes for f in fit) and not outliers_removed_by_rule:
         raise ValueError(
             "В обучающих данных есть ложные принятые привязки; "
             "одна гауссова ковариация непригодна без модели выбросов"
         )
+    # With an explicit outlier rule the errors_ne_m are the inliers by that
+    # rule; false_fixes counts the removed ones. Their rate is reported (also
+    # for the fit flights): the onboard gate has to reject them, the
+    # Gaussian covariance does not describe them.
     train = [_errors(f, min_samples=min_samples_per_flight) for f in fit]
     test = [_errors(f, min_samples=min_samples_per_flight) for f in holdout]
     bias = np.mean(np.stack([np.mean(x, axis=0) for x in train]), axis=0)

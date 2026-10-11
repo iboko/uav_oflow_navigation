@@ -169,7 +169,8 @@ def combine(args) -> None:
         f = json.loads((d / "map_errors.json").read_text())
         flights.append(MapErrorFlight(f["name"], tuple(map(tuple, f["errors_ne_m"])), f["total_frames"],
                                       f["false_fixes"]))
-    cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30)
+    cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30,
+                              outliers_removed_by_rule=f"|error - flight median| > {FALSE_FIX_M} m")
     cov = np.asarray(cal.covariance_ne_m2)
     holdout = {"coverage": cal.holdout_nees_coverage_95pct, "mean_nees": cal.holdout_mean_nees_2d}
     if args.isotropic:
@@ -189,6 +190,9 @@ def combine(args) -> None:
            "holdout_nees_coverage_95pct": cal.holdout_nees_coverage_95pct,
            "holdout_mean_nees_2d": cal.holdout_mean_nees_2d,
            "holdout_false_fix_rate": cal.holdout_false_fix_rate_among_accepted,
+           "fit_false_fix_rate": float(np.mean([f.false_fixes / max(1, f.false_fixes + len(f.errors_ne_m))
+                                                 for f in flights[:3]])),
+           "outlier_rule": f"|error - flight median| > {FALSE_FIX_M} m",
            "holdout_details": cal.holdout_flight_details,
            "independently_validated_for_flight": False,
            "note": "simulated flights (Gazebo, idealised camera)"}
@@ -224,9 +228,16 @@ def main() -> None:
                          "from fewer than 5 fit flights); held-out NEES recomputed with it")
     ap.add_argument("--out", type=Path, default=Path("build/gz_map_companion"))
     ap.add_argument("--calibration", type=Path, help="map_calibration.json from --mode calibrate")
-    ap.add_argument("--focal-error", type=float, default=0.05)
+    ap.add_argument("--focal-error", type=float,
+                    help="injected focal-length error (VO scale fault); default 0.05 textured, 0 swiss "
+                         "(the long swiss route shows the natural VO drift, and NCC needs the true scale)")
     ap.add_argument("--georef-error", type=float, nargs=2, default=(0.15, -0.10))
     ap.add_argument("--companion-python", default=sys.executable)
+    ap.add_argument("--scene", choices=("textured", "swiss"), default="textured",
+                    help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
+    ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
+    ap.add_argument("--altitude", type=float, help="take-off altitude, m (default 5 textured, 40 swiss)")
+    ap.add_argument("--camera-hz", type=int, default=15)
     args = ap.parse_args()
     if args.mode in ("test", "heading") and not args.calibration:
         ap.error("--mode test/heading needs --calibration")
@@ -240,12 +251,26 @@ def main() -> None:
     if args.mode == "combine":
         combine(args)
         return
+    if args.scene == "swiss" and not args.swiss_dir:
+        ap.error("--scene swiss needs --swiss-dir")
+    altitude = args.altitude or (40.0 if args.scene == "swiss" else TAKEOFF_M)
+    if args.focal_error is None:
+        args.focal_error = 0.0 if args.scene == "swiss" else 0.05
+    params["MIS_TAKEOFF_ALT"] = f"{altitude:.1f}"
+    world = "ofnav_swiss" if args.scene == "swiss" else gz.TEXTURED_WORLD
+    # Route scale: legs long enough to cross several camera footprints.
+    stick, leg_s, sample_s = (400, 15, 3) if args.scene == "swiss" else (300, 4, 2)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     args.out.mkdir(parents=True, exist_ok=True)
     px4_dir = args.px4_dir.resolve()
-    gz.install_textured_world(px4_dir)
-    vo_flight.install_vehicle(px4_dir)
-    map_png, georef = make_orthophoto(px4_dir, args.out, tuple(args.georef_error))
+    vo_flight.install_vehicle(px4_dir, rate_hz=args.camera_hz)
+    if args.scene == "swiss":
+        # Ground: SWISSIMAGE 2025; map: SWISSIMAGE 2019, exact LV95 georef.
+        map_png, georef = args.swiss_dir / "orthophoto.png", args.swiss_dir / "orthophoto_georef.json"
+        args.georef_error = (0.0, 0.0)
+    else:
+        gz.install_textured_world(px4_dir)
+        map_png, georef = make_orthophoto(px4_dir, args.out, tuple(args.georef_error))
     control = args.out / "map_control.json"
     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
     report: dict = {"type": f"PX4_SITL_GAZEBO_COMPANION_MAP_{args.mode.upper()}", "params": params,
@@ -253,7 +278,7 @@ def main() -> None:
                     "focal_error": args.focal_error, "georef_error_ne_m": list(args.georef_error),
                     "checks": {}, "segments": {}}
     started_wall = time.time()
-    px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", gz.TEXTURED_WORLD, params, model=f"gz_{vo_flight.MODEL}")
+    px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", world, params, model=f"gz_{vo_flight.MODEL}")
     link = gz.Link()
     gz.SIM_CLOCK = link
     clog_path = args.out / "companion.log"
@@ -280,7 +305,7 @@ def main() -> None:
         if not gz.wait(lambda: link.m.target_system != 0, 180):
             raise RuntimeError("no MAVLink heartbeat from PX4")
         cmd = [args.companion_python, str(Path(__file__).with_name("gz_vo_companion.py")),
-               "--world", gz.TEXTURED_WORLD, "--camera-topic", vo_flight.CAMERA_TOPIC,
+               "--world", world, "--camera-topic", vo_flight.CAMERA_TOPIC,
                "--log", str(args.out / "companion_vo.csv"), "--focal-error", str(args.focal_error),
                "--orthophoto", str(map_png), "--map-georef", str(georef),
                "--map-log", str(args.out / "companion_map.csv"), "--map-control", str(control),
@@ -289,6 +314,8 @@ def main() -> None:
             ["--map-mode", "fuse", "--map-calibration", str(args.calibration.resolve())]
         if args.ev_yaw:
             cmd += ["--map-yaw"]
+        if args.scene == "swiss":
+            cmd += ["--map-method", "ncc"]
         # The companion starts after the preflight gate: its start-up load
         # (orthophoto features) during EKF2 initialisation coincided with
         # failed magnetometer alignment in SITL.
@@ -308,7 +335,7 @@ def main() -> None:
         z_home = link.state["z"]
         link.command(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, float("nan"),
                      float("nan"), float("nan"), float("nan"))
-        if not gz.wait(lambda: link.state["z"] - z_home > TAKEOFF_M - 0.3, 60):
+        if not gz.wait(lambda: link.state["z"] - z_home > altitude - 0.3, 120):
             raise RuntimeError(f"takeoff failed dz={link.state['z'] - z_home}")
         report["takeoff_us"] = int(link.boot_s * 1e6)
         gz.sim_sleep(4)
@@ -318,9 +345,9 @@ def main() -> None:
 
         if args.mode == "calibrate":
             # One flight: three places over the map, slow motions in each.
-            for pitch, roll in ((0, 0), (300, 0), (0, 300)):
+            for pitch, roll in ((0, 0), (stick, 0), (0, stick)):
                 if pitch or roll:
-                    move(pitch, roll, 4)
+                    move(pitch, roll, 4 if args.scene == "textured" else 8)
                     gz.sim_sleep(4)
                 for p, r in ((120, 0), (0, 120), (-120, 0), (0, -120)):
                     move(p, r, 2)
@@ -346,8 +373,14 @@ def main() -> None:
                 heading_phase(args, px4, link, report, check)
             # 3: box pattern, absolute error.
             errors, legs = [], []
-            for pitch, roll in ((300, 0), (0, 300), (300, 0), (0, 300)):
-                move(pitch, roll, 4)
+            for pitch, roll in ((stick, 0), (0, stick), (stick, 0), (0, stick)):
+                link.pitch, link.roll = pitch, roll
+                t_leg = link.boot_s
+                while link.boot_s - t_leg < leg_s:
+                    gz.sim_sleep(sample_s)
+                    truth, est = truth_est()
+                    errors.append(float(np.linalg.norm(est - truth)))
+                link.pitch = link.roll = 0
                 for _ in range(4):
                     gz.sim_sleep(2)
                     truth, est = truth_est()
@@ -355,7 +388,11 @@ def main() -> None:
                 legs.append({"truth_ne_m": truth.round(2).tolist(), "estimate_ne_m": est.round(2).tolist()})
             report["route_legs"] = legs
             report["route_end_us"] = int(link.boot_s * 1e6)
-            check("3_route_absolute_error_on_map", max(errors) < 0.5, max_abs_error_m=round(max(errors), 3),
+            # Limit fixed before the flight: 3 sigma of the calibrated map error, at least 0.5 m.
+            cal = json.loads(args.calibration.read_text())
+            limit = max(0.5, 3.0 * math.sqrt(max(cal["covariance_ne_m2"][0][0], cal["covariance_ne_m2"][1][1])))
+            report["route_error_limit_m"] = round(limit, 3)
+            check("3_route_absolute_error_on_map", max(errors) < limit, max_abs_error_m=round(max(errors), 3),
                   mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors))
         if args.mode == "test":
             # 4: map fault.
@@ -430,7 +467,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         report["ekf2_heading_error"] = heading_error_deg(d, report["takeoff_us"])
     rows = read_map_log(args.out / "companion_map.csv")
     offset = int(report["companion_final_status"].get("time_offset_us") or 0)
-    acc = [r for r in rows if r["localizer_status"] == "GEOMETRICALLY_ACCEPTED_UNVALIDATED"]
+    acc = [r for r in rows if r["localizer_status"].endswith("ACCEPTED_UNVALIDATED")]
     report["map_fixes"] = {"attempted": len(rows), "accepted_by_localizer": len(acc),
                            "median_process_ms": float(np.median([float(r["process_ms"]) for r in rows]))
                            if rows else None}
@@ -444,8 +481,14 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
     if args.mode == "calibrate":
         t0, t1 = report["segments"]["flight"]
         sel = (t >= t0) & (t <= t1)
-        e = err[sel]
-        false = int(np.sum(np.linalg.norm(e - np.median(e, axis=0), axis=1) > FALSE_FIX_M))
+        e_all = err[sel]
+        # Explicit outlier rule (fixed before the swiss flights): more than
+        # FALSE_FIX_M from the flight median is a false fix. The covariance is
+        # estimated from the rest; the rate is reported, the flight is kept
+        # (re-flying until no outlier would hide them).
+        bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
+        false = int(np.sum(bad))
+        e = e_all[~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
@@ -453,7 +496,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"]}
         (args.out / "map_errors.json").write_text(json.dumps(out, indent=1))
         report["flight_map_errors"] = {k: v for k, v in out.items() if k != "errors_ne_m"}
-        report["analysis_ok"] = len(e) >= 30 and false == 0
+        report["analysis_ok"] = len(e) >= 30
         print("MAP_ERRORS", report["flight_map_errors"], flush=True)
         return
     t_f0, t_f1 = report.get("fault_start_us"), report.get("fault_end_us")

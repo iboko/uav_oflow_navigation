@@ -37,9 +37,16 @@ from pymavlink import mavutil
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E402
 from src.companion_map import MapAnchor  # noqa: E402
-from src.companion_vo import CompanionVo  # noqa: E402
-from src.continuous_visual_odometry import ContinuousPlanarOdometry  # noqa: E402
+from src.camera_rotation_compensation import body_to_ned  # noqa: E402
+from src.companion_msckf import CompanionMsckf  # noqa: E402
+from src.companion_vo import BodyVelocityMeasurement, CompanionVo  # noqa: E402
+from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
+from src.feature_tracker import KltTracker  # noqa: E402
+from src.imu_preintegration import ImuReading  # noqa: E402
+from src.msckf_vio import PinholeCamera  # noqa: E402
+from src.continuous_visual_odometry import ContinuousPlanarOdometry, VisualOdomResult  # noqa: E402
 from src.ground_visual_motion import CameraCalibration  # noqa: E402
+from src.ortho_ncc_localizer import OrthoNccLocalizer  # noqa: E402
 from src.orthophoto_localization import MapGeoReference, OrthophotoLocalizer, OrthophotoTile  # noqa: E402
 from src.velocity_uncertainty import VelocityErrorAssumptions  # noqa: E402
 
@@ -66,6 +73,36 @@ def to_gray(msg: Image) -> np.ndarray | None:
     return None
 
 
+# Gazebo IMU through PX4 (conservative: the same densities as the Xsens runs).
+MSCKF_IMU_NOISE = ImuNoiseDensity(gyro_rad_s_sqrt_hz=0.004, accel_m_s2_sqrt_hz=0.08,
+                                  gyro_bias_walk_rad_s2_sqrt_hz=1e-4, accel_bias_walk_m_s3_sqrt_hz=4e-5)
+
+
+def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: KltTracker, t_frame: int,
+                      gray: np.ndarray, last_t: int) -> BodyVelocityMeasurement | None:
+    """MSCKF output in the same form as the VO measurement (body-FRD velocity,
+    N/E velocity in the autopilot heading frame for the map anchor)."""
+    state = pipeline.state_at_camera_time(t_frame)
+    q = pipeline.quaternion_at_camera_time(t_frame)
+    feats = tracker.track(gray)
+    if state is None or q is None:
+        msckf.count("NO_ATTITUDE_OR_RANGE")
+        return None
+    roll, pitch, yaw, height = state
+    out = msckf.process(t_frame, feats, attitude_q=q, roll=roll, pitch=pitch,
+                        range_m=height / (math.cos(roll) * math.cos(pitch)))
+    if out is None:
+        return None
+    r_nb = body_to_ned(roll, pitch, yaw)          # autopilot attitude, not the MSCKF heading
+    v_ne = r_nb @ np.asarray(out.velocity_frd)
+    cov_ne = r_nb @ np.diag(out.variance_frd) @ r_nb.T
+    start = last_t if last_t and t_frame - last_t < 300_000 else t_frame - 66_000
+    vo = VisualOdomResult(t_frame, 0, "MSCKF", True, 0.0, 0.0, float(v_ne[0]), float(v_ne[1]), 0, 0.0, 0.0,
+                          float(cov_ne[0, 0]), float(cov_ne[0, 1]), float(cov_ne[1, 1]), start)
+    return BodyVelocityMeasurement(t_frame, out.velocity_frd, out.variance_frd, vo, float(v_ne[2]),
+                                   height, (roll, pitch, yaw))
+
+
 def stamp_us(header) -> int:
     return header.stamp.sec * 1_000_000 + header.stamp.nsec // 1000
 
@@ -76,7 +113,8 @@ def main() -> None:
     ap.add_argument("--camera-topic", default="/ofnav/vo_camera")
     ap.add_argument("--hfov", type=float, default=1.2)
     ap.add_argument("--mavlink", default="udpin:0.0.0.0:14540")
-    ap.add_argument("--camera-offset-frd", type=float, nargs=3, default=(0.0, 0.0, -0.1))
+    ap.add_argument("--camera-offset-frd", type=float, nargs=3, default=(0.0, 0.0, 0.1),
+                    help="camera position in body FRD (x500_vo_down: 0.1 m below the centre)")
     ap.add_argument("--max-latency-ms", type=float, default=200.0)
     ap.add_argument("--focal-error", type=float, default=0.0,
                     help="injected relative focal-length error (VO scale fault)")
@@ -87,6 +125,9 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
+    ap.add_argument("--map-method", choices=("orb", "ncc"), default="orb",
+                    help="ncc: ortho-rectified frame + correlation around a position prior "
+                         "(orthophoto of another year/season)")
     ap.add_argument("--map-yaw", action="store_true",
                     help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
@@ -94,6 +135,9 @@ def main() -> None:
     ap.add_argument("--map-log", type=Path)
     ap.add_argument("--save-frames", type=Path, help="directory: every --save-every-th frame as PNG")
     ap.add_argument("--save-every", type=int, default=75)
+    ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo",
+                    help="msckf: tightly coupled VIO on the autopilot IMU (HIGHRES_IMU), initialised "
+                         "without GNSS from the rangefinder")
     ap.add_argument("--log", type=Path)
     ap.add_argument("--status-s", type=float, default=5.0)
     args = ap.parse_args()
@@ -128,6 +172,10 @@ def main() -> None:
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
     map_shift = np.zeros(2)
+    msckf: CompanionMsckf | None = None
+    tracker: KltTracker | None = None
+    last_msckf_t = 0
+    local_ne = np.array([np.nan, np.nan])
     last_map_t, last_control, frame_no = 0, 0.0, 0
     map_counts: dict[str, int] = {}
     map_log = args.map_log.open("w") if args.map_log else None
@@ -152,6 +200,11 @@ def main() -> None:
                     pipeline.clock.add(msg.ts1 // 1000, msg.tc1 // 1000, clock_us[0])
             elif t == "ATTITUDE_QUATERNION":
                 pipeline.attitude.add(msg.time_boot_ms * 1000, (msg.q1, msg.q2, msg.q3, msg.q4))
+            elif t == "HIGHRES_IMU" and msckf is not None and pipeline.clock.valid:
+                msckf.add_imu(ImuReading(int(msg.time_usec) - pipeline.clock.offset_us,
+                                         (msg.xgyro, msg.ygyro, msg.zgyro), (msg.xacc, msg.yacc, msg.zacc)))
+            elif t == "LOCAL_POSITION_NED":
+                local_ne = np.array([msg.x, msg.y])
             elif t == "DISTANCE_SENSOR" and msg.orientation == 25 and msg.current_distance > 0:
                 pipeline.distance.add(msg.time_boot_ms * 1000, msg.current_distance * 0.01)
         if pipeline is None and link.target_system and now > 0:
@@ -170,17 +223,28 @@ def main() -> None:
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=0.25, max_pair_dt_s=0.25)
             pipeline = CompanionVo(vo)
+            if args.estimator == "msckf":
+                msckf = CompanionMsckf(
+                    PinholeCamera(cal.focal_x_px, cal.focal_y_px, cal.center_x_px, cal.center_y_px,
+                                  BODY_FROM_CAMERA, tuple(args.camera_offset_frd), pixel_sigma=1.0),
+                    MSCKF_IMU_NOISE)
+                tracker = KltTracker(max_features=100)
             if args.map_mode != "off":
                 import cv2
                 # Radiometric normalisation of map and frame: the rendered
                 # frames are dark and low-contrast; ORB matches none raw.
                 clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
                 georef = json.loads(args.map_georef.read_text())
-                tile = OrthophotoTile("orthophoto", clahe.apply(cv2.imread(str(args.orthophoto), cv2.IMREAD_GRAYSCALE)),
-                                      MapGeoReference(tuple(georef["origin_ne_m"]),
-                                                      tuple(tuple(r) for r in georef["matrix_ne_m_per_px"])))
-                localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),
-                                                camera_offset_body_m=tuple(args.camera_offset_frd))
+                geo = MapGeoReference(tuple(georef["origin_ne_m"]),
+                                      tuple(tuple(r) for r in georef["matrix_ne_m_per_px"]))
+                map_gray = cv2.imread(str(args.orthophoto), cv2.IMREAD_GRAYSCALE)
+                if args.map_method == "ncc":
+                    localizer = OrthoNccLocalizer(map_gray, geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
+                                                  camera_offset_body_m=tuple(args.camera_offset_frd))
+                else:
+                    tile = OrthophotoTile("orthophoto", clahe.apply(map_gray), geo)
+                    localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),
+                                                    camera_offset_body_m=tuple(args.camera_offset_frd))
             if args.map_mode == "fuse":
                 c = json.loads(args.map_calibration.read_text())
                 anchor = MapAnchor(bias_ne_m=tuple(c["bias_ne_m"]),
@@ -194,8 +258,11 @@ def main() -> None:
             link.mav.timesync_send(0, now * 1000)
             last_ts = wall
         if wall - last_rates > 5.0:
-            for msg_id, hz in ((mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE_QUATERNION, 100),
-                               (mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR, 50)):
+            streams = [(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE_QUATERNION, 100),
+                       (mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR, 50)]
+            if msckf is not None:
+                streams.append((mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 200))
+            for msg_id, hz in streams:
                 link.mav.command_long_send(link.target_system, 1,
                                            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
                                            msg_id, 1e6 / hz, 0, 0, 0, 0, 0)
@@ -209,14 +276,19 @@ def main() -> None:
             except (OSError, ValueError):
                 pass
         # Process frames in order once autopilot samples exist after them.
-        while pending and pipeline.ready_for(pending[0][0]):
+        while pending and pipeline.ready_for(pending[0][0]) and (msckf is None or msckf.ready_for(pending[0][0])):
             t_frame, gray = pending.pop(0)
             frame_no += 1
             if args.save_frames and frame_no % args.save_every == 0:
                 import cv2
                 args.save_frames.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(args.save_frames / f"{t_frame}.png"), gray)
-            out = pipeline.process(t_frame, gray)
+            if msckf is not None:
+                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t)
+                if out is not None:
+                    last_msckf_t = t_frame
+            else:
+                out = pipeline.process(t_frame, gray)
             if out is not None and anchor is not None:
                 r = out.vo
                 anchor.propagate(r.interval_start_us, r.timestamp_us, (r.vn_m_s, r.ve_m_s),
@@ -226,8 +298,21 @@ def main() -> None:
                 if state is not None:
                     last_map_t = t_frame
                     t_start = time.perf_counter()
-                    fix = localizer.localize(clahe.apply(gray), height_agl_m=state[3], roll_rad=state[0],
-                                             pitch_rad=state[1], yaw_rad=state[2])
+                    if args.map_method == "ncc":
+                        # Position prior: the anchor once locked, otherwise the
+                        # autopilot's own local position (GNSS-aided before loss).
+                        st = anchor.status() if anchor is not None else None
+                        if st is not None and st.locked:
+                            prior = np.asarray(st.position_ne_m)
+                            radius = max(10.0, 3 * math.sqrt(max(st.covariance_ne_m2[0][0],
+                                                                 st.covariance_ne_m2[1][1])) + 5.0)
+                        else:
+                            prior, radius = local_ne, 20.0
+                        fix = localizer.localize(gray, prior_ne_m=prior, radius_m=radius, height_agl_m=state[3],
+                                                 roll_rad=state[0], pitch_rad=state[1], yaw_rad=state[2])
+                    else:
+                        fix = localizer.localize(clahe.apply(gray), height_agl_m=state[3], roll_rad=state[0],
+                                                 pitch_rad=state[1], yaw_rad=state[2])
                     ms = (time.perf_counter() - t_start) * 1e3
                     n, e = fix.north_m + map_shift[0], fix.east_m + map_shift[1]
                     result, nis = "", float("nan")
@@ -300,6 +385,8 @@ def main() -> None:
             status = {"sim_s": round(now * 1e-6, 1), "sent": sent,
                       "time_offset_us": pipeline.clock.offset_us if pipeline.clock.valid else None,
                       "counts": pipeline.counts}
+            if msckf is not None:
+                status["msckf"] = {"counts": msckf.counts, "last_init": msckf.last_init}
             if localizer is not None:
                 status["map_localizer"] = map_counts
             if anchor is not None:
