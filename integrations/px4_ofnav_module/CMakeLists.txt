@@ -8,8 +8,10 @@ px4_add_module(
     SRCS
         ofnav_px4.cpp
         ofnav_sitl_csv_replay.cpp
+        ofnav_sitl_eskf_replay.cpp
         ofnav_core/src/ofnav.cpp
         ofnav_core/src/eskf15.cpp
+        ofnav_core/src/eskf_runner.cpp
     INCLUDES
         ofnav_core/include
     DEPENDS

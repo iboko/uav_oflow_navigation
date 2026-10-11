@@ -75,6 +75,14 @@ class MapLocalizationFix:
     geometric_jacobian_error: float = float("nan")
     # No covariance provided: parameters require independent calibration.
     covariance_validated: bool = False
+    # Heading of the body x axis implied by the matched homography:
+    # assumed yaw + rotation between observed and predicted ground Jacobians.
+    # Like the position, its error statistics need independent calibration.
+    yaw_rad: float = float("nan")
+    # Ground point hit by the optical axis (map of the principal point).
+    # Independent of the assumed attitude, unlike north_m/east_m.
+    ground_north_m: float = float("nan")
+    ground_east_m: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,8 @@ class _Candidate:
     ratio: float
     residual: float
     jac_error: float
+    yaw_offset: float = 0.0
+    ground: np.ndarray | None = None
 
 
 def _ground_ray_offset(
@@ -290,9 +300,13 @@ class OrthophotoLocalizer:
                 ne_vehicle = ground - ground_offset - lever_ne
                 if not np.isfinite(ne_vehicle).all():
                     continue
+                # observed = R(yaw_true) A, expected = R(yaw_assumed) A.
+                rotation = observed_jac @ np.linalg.inv(expected_jac)
+                yaw_offset = float(np.arctan2(rotation[1, 0] - rotation[0, 1],
+                                              rotation[0, 0] + rotation[1, 1]))
                 candidates.append(_Candidate(
                     tile, ne_vehicle, inlier_count, len(good),
-                    fraction, median, jac_error
+                    fraction, median, jac_error, yaw_offset, ground
                 ))
             except (ValueError, cv2.error, np.linalg.LinAlgError):
                 continue
@@ -314,4 +328,7 @@ class OrthophotoLocalizer:
             float(best.ne[0]), float(best.ne[1]),
             best.matched, best.inliers, best.ratio,
             best.residual, best.jac_error, False,
+            float(np.arctan2(np.sin(yaw_rad + best.yaw_offset),
+                             np.cos(yaw_rad + best.yaw_offset))),
+            float(best.ground[0]), float(best.ground[1]),
         )

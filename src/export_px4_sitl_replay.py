@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -142,14 +143,102 @@ def export_replay(
     }
 
 
+ESKF_FIELDS = ("kind", "arrival_us", "time_us", "a", "b", "c", "d", "e", "f")
+
+
+def export_eskf_events(
+    results_csv: str | Path, imu_csv: str | Path,
+    output_csv: str | Path, expected_json: str | Path,
+) -> dict:
+    """Arrival-ordered IMU + delayed body-velocity events for ``ofnav sitl-eskf``.
+
+    Rows: ``I`` (IMU: gyro xyz, specific force xyz) and ``B`` (VO body-frame
+    velocity at the interval midpoint: vx, vy, cxx, cxy, cyy). The Python
+    FixedLagEskfReplay with the SAME default parameters as C++
+    ``ofnav15::Parameters`` processes the same sequence; its final state is
+    the expected output inside PX4. No truth is read.
+    """
+    from .error_state_inertial_filter import (
+        BodyVelocityMeasurement, ImuNoiseDensity, InertialErrorStateFilter,
+    )
+    from .fixed_lag_eskf_replay import FixedLagEskfReplay
+    from .imu_preintegration import ImuBias, ImuReading
+
+    imus = _read(Path(imu_csv), {
+        "timestamp_us", "gyro_x_rad_s", "gyro_y_rad_s", "gyro_z_rad_s",
+        "accel_x_m_s2", "accel_y_m_s2", "accel_z_m_s2",
+    })
+    results = _read(Path(results_csv), {
+        "arrival_timestamp_imu_us", "body_time_us", "body_vx_vo_m_s",
+        "body_vy_vo_m_s", "body_cov_xx", "body_cov_xy", "body_cov_yy",
+    })
+    events = []
+    for r in imus:
+        t = int(r["timestamp_us"])
+        events.append((t, 0, ["I", t, t] + [float(r[k]) for k in (
+            "gyro_x_rad_s", "gyro_y_rad_s", "gyro_z_rad_s",
+            "accel_x_m_s2", "accel_y_m_s2", "accel_z_m_s2")]))
+    for r in results:
+        values = [float(r[k]) for k in ("body_vx_vo_m_s", "body_vy_vo_m_s",
+                                         "body_cov_xx", "body_cov_xy", "body_cov_yy")]
+        if not all(map(math.isfinite, values)) or int(r["body_time_us"]) <= 0:
+            continue
+        arrival = int(r["arrival_timestamp_imu_us"])
+        events.append((arrival, 1, ["B", arrival, int(r["body_time_us"])] + values + [0.]))
+    events.sort(key=lambda e: (e[0], e[1]))
+    replay = FixedLagEskfReplay(
+        lambda: InertialErrorStateFilter(
+            quaternion_body_to_ned=(1., 0., 0., 0.), initial_bias=ImuBias(),
+            noise=ImuNoiseDensity(.003, .03, .00005, .0003), max_imu_dt_s=.05),
+        max_lag_us=300_000, max_imu_samples=64)
+    statuses: dict[str, int] = {}
+    for _, _, row in events:
+        if row[0] == "I":
+            replay.push_imu(ImuReading(row[2], tuple(row[3:6]), tuple(row[6:9])))
+        else:
+            status = replay.push_delayed_visual(BodyVelocityMeasurement(
+                row[2], row[3], row[4], ((row[5], row[6]), (row[6], row[7])))).status
+            statuses[status] = statuses.get(status, 0) + 1
+    destination = Path(output_csv)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(ESKF_FIELDS)
+        for _, _, row in events:
+            writer.writerow(row[:3] + [repr(float(x)) for x in row[3:]])
+    state = replay.state
+    expected = {
+        "imu_events": sum(1 for e in events if e[2][0] == "I"),
+        "body_velocity_events": sum(1 for e in events if e[2][0] == "B"),
+        "statuses": statuses,
+        "position_ned_m": [float(x) for x in state.position_ned_m],
+        "velocity_ned_m_s": [float(x) for x in state.velocity_ned_m_s],
+        "accepted": state.accepted_visual_count,
+        "rejected": state.rejected_visual_count,
+        "publish_to_uorb": False,
+        "publish_to_ekf2": False,
+    }
+    Path(expected_json).write_text(json.dumps(expected, indent=2), encoding="utf-8")
+    return expected
+
+
 def main() -> None:
     p=argparse.ArgumentParser(description="Безопасный CSV для replay в PX4 SITL без uORB-публикации")
     p.add_argument("--results-csv", required=True)
     p.add_argument("--camera-csv", required=True)
     p.add_argument("--imu-csv", required=True)
     p.add_argument("--output-csv", required=True)
+    p.add_argument("--eskf-events-csv",
+                   help="Также записать поток ИИМ+VO для команды ofnav sitl-eskf")
+    p.add_argument("--eskf-expected-json",
+                   help="Ожидаемое конечное состояние Python-РФК для того же потока")
     a=p.parse_args()
     print(export_replay(a.results_csv,a.camera_csv,a.imu_csv,a.output_csv))
+    if a.eskf_events_csv:
+        if not a.eskf_expected_json:
+            p.error("--eskf-expected-json обязателен вместе с --eskf-events-csv")
+        print(export_eskf_events(a.results_csv,a.imu_csv,a.eskf_events_csv,
+                                 a.eskf_expected_json))
 
 
 if __name__=="__main__":

@@ -76,7 +76,18 @@ enum class RejectReason : uint8_t {
     InnovationGate,
     StaleRange,
     StaleFlow,
-    ImuInvalid
+    ImuInvalid,
+    // Physics-based velocity uncertainty h * sigma_flow exceeds the
+    // configured limit: the measurement is too coarse at this height.
+    VelocityUncertainty
+};
+
+// Explicit measurement-source envelope. The legacy optical-flow sensor
+// envelope (0.2-4 m) stays the default; a downward camera VO source has its
+// own height range and an uncertainty model scaled by height.
+enum class SensorProfile : uint8_t {
+    OpticalFlowSensor = 0,
+    DownwardCameraVo = 1
 };
 
 enum class NavMode : uint8_t {
@@ -85,6 +96,40 @@ enum class NavMode : uint8_t {
     DegradedHold,
     FailsafeLand,
     ManualRequired
+};
+
+// Reaction requested from the autopilot for the current navigation health.
+// The autopilot integration decides whether it is executed (opt-in).
+enum class SafetyAction : uint8_t {
+    None = 0,          // no request; never commands a return to position mode
+    AltitudeHold = 1,  // stop relying on horizontal navigation: altitude mode
+    Land = 2,          // latched: land in place
+    ManualTakeover = 3 // latched: hand over to the pilot (stabilized mode)
+};
+
+struct SafetyActionConfig {
+    uint64_t failsafe_confirm_us{200000U};   // FAILSAFE_LAND must persist
+    uint64_t degraded_confirm_us{300000U};   // DEGRADED_HOLD must persist
+    uint64_t degraded_to_land_us{5000000U};  // unrecovered degradation -> land
+    uint64_t recovery_us{1000000U};          // healthy FLOW_NAV clears hold
+};
+
+enum class SafetyReason : uint8_t {
+    Nominal = 0,
+    DegradedConfirmed,
+    DegradedTooLong,
+    FailsafeConfirmed,
+    ManualRequested,
+    Recovered,
+    NonMonotonicTime
+};
+
+struct SafetyDecision {
+    SafetyAction action{SafetyAction::None};
+    SafetyReason reason{SafetyReason::Nominal};
+    bool changed{false};
+    bool latched{false};
+    uint64_t action_since_us{0U};
 };
 
 struct HealthFlags {
@@ -107,6 +152,8 @@ struct FlowVelocityEstimate {
     Vector2f velocity_nav_m_s{};
     float flow_x_rate_rad_s{0.0F};
     float flow_y_rate_rad_s{0.0F};
+    // One-sigma horizontal velocity uncertainty used for the EKF update.
+    float velocity_sigma_m_s{kNaN};
 };
 
 struct EkfState {
@@ -150,7 +197,22 @@ struct Config {
     float flow_vel_sigma_quality_gain_m_s{0.18F};
     float flow_vel_sigma_height_gain_m_s{0.025F};
     float innovation_gate_2d{9.21F};
+
+    float max_integration_time_s{0.20F};
+    // If > 0: sigma_v^2 = sigma_min^2 + (h*sigma_flow)^2 + (|v|*sigma_h_rel)^2,
+    // inflated by low quality, and rejected above max_velocity_sigma_m_s.
+    // If == 0: legacy empirical optical-flow sensor model (clamped 0.35 m/s).
+    float flow_rate_sigma_rad_s{0.0F};
+    float height_rel_sigma{0.0F};
+    float max_velocity_sigma_m_s{0.35F};
 };
+
+// Validated configuration for a measurement-source envelope.
+[[nodiscard]] Config makeProfileConfig(SensorProfile profile, uint8_t min_quality = 120U) noexcept;
+[[nodiscard]] const char* toString(SensorProfile profile) noexcept;
+// One-sigma velocity uncertainty for given height, speed and quality.
+[[nodiscard]] float flowVelocitySigma(const Config& cfg, float height_m,
+                                      float speed_m_s, uint8_t quality) noexcept;
 
 [[nodiscard]] bool isFinite(float v) noexcept;
 [[nodiscard]] Vector3f cross(Vector3f a, Vector3f b) noexcept;
@@ -220,6 +282,36 @@ public:
 private:
     Config cfg_{};
 };
+
+// Debounced, escalating and latching mapping NavMode -> SafetyAction.
+// Land and ManualTakeover are latched until reset() (pilot / ground crew).
+// AltitudeHold clears to None only after recovery_us of healthy FLOW_NAV;
+// the manager never requests a return to a horizontal-position mode.
+class SafetyActionManager final {
+public:
+    explicit SafetyActionManager(SafetyActionConfig cfg = SafetyActionConfig{}) noexcept
+        : cfg_(cfg) {}
+
+    [[nodiscard]] SafetyDecision update(NavMode mode, uint64_t now_us) noexcept;
+    void reset() noexcept;
+    [[nodiscard]] SafetyAction action() const noexcept { return action_; }
+
+private:
+    SafetyDecision decide(SafetyAction action, SafetyReason reason, uint64_t now_us) noexcept;
+
+    SafetyActionConfig cfg_{};
+    SafetyAction action_{SafetyAction::None};
+    NavMode last_mode_{NavMode::Standby};
+    uint64_t mode_since_us_{0U};
+    uint64_t degraded_since_us_{0U};
+    uint64_t action_since_us_{0U};
+    uint64_t last_us_{0U};
+    bool started_{false};
+    bool degraded_episode_{false};
+};
+
+[[nodiscard]] const char* toString(SafetyAction action) noexcept;
+[[nodiscard]] const char* toString(SafetyReason reason) noexcept;
 
 class OfNavRuntime final {
 public:

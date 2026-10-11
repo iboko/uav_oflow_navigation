@@ -308,6 +308,135 @@ void test_combined_roll_pitch_exceeds_inclination_limit() {
     assert(result.reason == ofnav::RejectReason::ExcessiveTilt);
 }
 
+ofnav::OpticalFlowRadSample cameraFlow(float height, float vx_body, float dt) {
+    return ofnav::OpticalFlowRadSample{1000000U, dt, 0.0F, (vx_body / height) * dt,
+                                       0.0F, 0.0F, 0.0F, 200U, true};
+}
+
+void test_flow_sensor_profile_still_rejects_100m() {
+    const auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::OpticalFlowSensor);
+    assert(near(cfg.max_height_m, 4.0F));
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::RangeSample range{1000000U, 100.0F, true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto result = estimator.update(cameraFlow(100.0F, 1.0F, 0.2F), range, imu, att);
+    assert(!result.accepted);
+    assert(result.reason == ofnav::RejectReason::HeightTooHigh);
+}
+
+void test_camera_profile_accepts_100m_with_height_scaled_sigma() {
+    const auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::DownwardCameraVo);
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::RangeSample range{1000000U, 100.0F, true};
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto result = estimator.update(cameraFlow(100.0F, 1.2F, 0.2F), range, imu, att);
+    assert(result.accepted);
+    assert(near(result.velocity_nav_m_s.x, 1.2F, 1.0e-3F));
+    // sqrt(0.05^2 + (100*0.0015)^2 + (1.2*0.01)^2)
+    const float expected = std::sqrt(0.0025F + 0.0225F + 0.000144F);
+    assert(near(result.velocity_sigma_m_s, expected, 1.0e-4F));
+    const auto low = estimator.update(cameraFlow(20.0F, 1.2F, 0.2F),
+        ofnav::RangeSample{1000000U, 20.0F, true}, imu, att);
+    assert(low.accepted && low.velocity_sigma_m_s < result.velocity_sigma_m_s);
+}
+
+void test_camera_profile_rejects_coarse_measurement_by_uncertainty() {
+    auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::DownwardCameraVo);
+    cfg.max_velocity_sigma_m_s = 0.12F;  // 100 m * 1.5 mrad/s = 0.15 m/s
+    ofnav::FlowVelocityEstimator estimator(cfg);
+    const ofnav::ImuSample imu{1000000U, {}, {}, true};
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    const auto result = estimator.update(cameraFlow(100.0F, 1.0F, 0.2F),
+        ofnav::RangeSample{1000000U, 100.0F, true}, imu, att);
+    assert(!result.accepted);
+    assert(result.reason == ofnav::RejectReason::VelocityUncertainty);
+    const auto below = estimator.update(cameraFlow(3.0F, 1.0F, 0.2F),
+        ofnav::RangeSample{1000000U, 3.0F, true}, imu, att);
+    assert(below.reason == ofnav::RejectReason::HeightTooLow);
+}
+
+void test_camera_profile_ekf_uses_estimator_sigma() {
+    const auto cfg = ofnav::makeProfileConfig(ofnav::SensorProfile::DownwardCameraVo);
+    ofnav::OfNavRuntime runtime(cfg);
+    const ofnav::AttitudeSample att{1000000U, 0.0F, 0.0F, 0.0F};
+    for (uint64_t t = 1000000U; t <= 1200000U; t += 10000U) {
+        const ofnav::ImuSample imu{t, {}, {0.0F, 0.0F, -9.80665F}, true};
+        runtime.predictImu(imu, ofnav::AttitudeSample{t, 0.0F, 0.0F, 0.0F});
+    }
+    const uint64_t t = 1200000U;
+    const ofnav::ImuSample imu{t, {}, {0.0F, 0.0F, -9.80665F}, true};
+    ofnav::OpticalFlowRadSample flow = cameraFlow(100.0F, 0.3F, 0.2F);
+    flow.time_us = t;
+    const auto out = runtime.step(imu, ofnav::RangeSample{t, 100.0F, true}, flow,
+                                  ofnav::AttitudeSample{t, 0.0F, 0.0F, 0.0F}, t);
+    (void)att;
+    assert(out.flow.accepted);
+    assert(out.mode == ofnav::NavMode::FlowNav);
+    assert(out.state.vn_m_s > 0.0F && out.state.vn_m_s < 0.3F);
+}
+
+void test_safety_failsafe_is_debounced_then_latched_land() {
+    ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    assert(m.update(NavMode::FlowNav, 1000000U).action == SafetyAction::None);
+    // A single 100 ms FAILSAFE glitch does not land the vehicle.
+    assert(m.update(NavMode::FailsafeLand, 1100000U).action == SafetyAction::None);
+    assert(m.update(NavMode::FailsafeLand, 1200000U).action == SafetyAction::None);
+    assert(m.update(NavMode::FlowNav, 1210000U).action == SafetyAction::None);
+    // Persisting failsafe lands; land is latched against later recovery.
+    (void)m.update(NavMode::FailsafeLand, 2000000U);
+    const auto land = m.update(NavMode::FailsafeLand, 2200000U);
+    assert(land.action == SafetyAction::Land && land.changed && land.latched);
+    assert(land.reason == ofnav::SafetyReason::FailsafeConfirmed);
+    assert(m.update(NavMode::FlowNav, 9000000U).action == SafetyAction::Land);
+    assert(!m.update(NavMode::FlowNav, 9100000U).changed);
+    m.reset();
+    assert(m.update(NavMode::FlowNav, 9200000U).action == SafetyAction::None);
+}
+
+void test_safety_degraded_hold_escalates_and_recovers_with_hysteresis() {
+    ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    (void)m.update(NavMode::FlowNav, 1000000U);
+    (void)m.update(NavMode::DegradedHold, 1100000U);
+    assert(m.update(NavMode::DegradedHold, 1300000U).action == SafetyAction::None);
+    const auto hold = m.update(NavMode::DegradedHold, 1400000U);
+    assert(hold.action == SafetyAction::AltitudeHold && hold.changed);
+    // Short healthy interval keeps the hold (hysteresis).
+    (void)m.update(NavMode::FlowNav, 1500000U);
+    assert(m.update(NavMode::FlowNav, 2000000U).action == SafetyAction::AltitudeHold);
+    const auto rec = m.update(NavMode::FlowNav, 2500000U);
+    assert(rec.action == SafetyAction::None && rec.reason == ofnav::SafetyReason::Recovered);
+    // Intermittent degradation without 1 s of recovery escalates to land.
+    uint64_t t = 3000000U;
+    ofnav::SafetyDecision d{};
+    for (int i = 0; i < 12; ++i) {
+        d = m.update(NavMode::DegradedHold, t);
+        t += 400000U;
+        d = m.update(NavMode::FlowNav, t);
+        t += 200000U;
+    }
+    assert(d.action == SafetyAction::Land && d.latched);
+}
+
+void test_safety_manual_request_and_time_reversal() {
+    ofnav::SafetyActionManager m{};
+    using ofnav::NavMode;
+    using ofnav::SafetyAction;
+    (void)m.update(NavMode::FlowNav, 1000000U);
+    const auto manual = m.update(NavMode::ManualRequired, 1010000U);
+    assert(manual.action == SafetyAction::ManualTakeover && manual.latched);
+    ofnav::SafetyActionManager clock{};
+    (void)clock.update(NavMode::FlowNav, 2000000U);
+    const auto back = clock.update(NavMode::FlowNav, 1000000U);
+    assert(back.action == SafetyAction::Land);
+    assert(back.reason == ofnav::SafetyReason::NonMonotonicTime);
+}
+
 } // namespace
 
 int main() {
@@ -330,6 +459,13 @@ int main() {
     test_nonfinite_imu_does_not_enter_flow_mode();
     test_missing_imu_history_requires_explicit_reset();
     test_combined_roll_pitch_exceeds_inclination_limit();
+    test_flow_sensor_profile_still_rejects_100m();
+    test_camera_profile_accepts_100m_with_height_scaled_sigma();
+    test_camera_profile_rejects_coarse_measurement_by_uncertainty();
+    test_camera_profile_ekf_uses_estimator_sigma();
+    test_safety_failsafe_is_debounced_then_latched_land();
+    test_safety_degraded_hold_escalates_and_recovers_with_hysteresis();
+    test_safety_manual_request_and_time_reversal();
     std::cout << "ofnav RTOS core tests passed\n";
     return 0;
 }

@@ -88,6 +88,7 @@ const char* toString(RejectReason reason) noexcept {
     case RejectReason::StaleRange: return "STALE_RANGE";
     case RejectReason::StaleFlow: return "STALE_FLOW";
     case RejectReason::ImuInvalid: return "IMU_INVALID";
+    case RejectReason::VelocityUncertainty: return "VELOCITY_UNCERTAINTY";
     }
     return "UNKNOWN";
 }
@@ -101,6 +102,63 @@ const char* toString(NavMode mode) noexcept {
     case NavMode::ManualRequired: return "MANUAL_REQUIRED";
     }
     return "UNKNOWN";
+}
+
+const char* toString(SensorProfile profile) noexcept {
+    switch (profile) {
+    case SensorProfile::OpticalFlowSensor: return "OPTICAL_FLOW_SENSOR";
+    case SensorProfile::DownwardCameraVo: return "DOWNWARD_CAMERA_VO";
+    }
+    return "UNKNOWN";
+}
+
+Config makeProfileConfig(SensorProfile profile, uint8_t min_quality) noexcept {
+    Config cfg{};
+    cfg.min_quality = min_quality;
+    if (profile == SensorProfile::DownwardCameraVo) {
+        // Nadir camera VO at 5-120 m. Angular rate noise 1.5 mrad/s
+        // corresponds to ~0.3 px fitted displacement at f=1000 px over
+        // 0.2 s; it is a design assumption until calibrated on flights.
+        cfg.min_height_m = 5.0F;
+        cfg.max_height_m = 120.0F;
+        cfg.max_tilt_rad = 0.35F;
+        cfg.max_abs_flow_rate_rad_s = 2.0F;
+        cfg.max_horizontal_speed_m_s = 8.0F;
+        cfg.max_flow_age_us = 300000U;
+        cfg.max_range_age_us = 300000U;
+        cfg.max_measurement_skew_us = 100000U;
+        cfg.max_integration_time_s = 0.50F;
+        cfg.flow_vel_sigma_min_m_s = 0.05F;
+        cfg.flow_vel_sigma_quality_gain_m_s = 0.0F;
+        cfg.flow_rate_sigma_rad_s = 0.0015F;
+        cfg.height_rel_sigma = 0.01F;
+        cfg.max_velocity_sigma_m_s = 0.50F;
+        return cfg;
+    }
+    cfg.min_height_m = 0.20F;
+    cfg.max_height_m = 4.00F;
+    cfg.max_tilt_rad = 0.45F;
+    cfg.max_abs_flow_rate_rad_s = 7.4F;
+    cfg.max_horizontal_speed_m_s = 1.5F;
+    return cfg;
+}
+
+float flowVelocitySigma(const Config& cfg, float height_m, float speed_m_s,
+                        uint8_t quality) noexcept {
+    if (!isFinite(height_m) || !isFinite(speed_m_s) || height_m <= 0.0F) {
+        return kNaN;
+    }
+    const float q = clampf(static_cast<float>(quality), 1.0F, 255.0F);
+    const float quality_term = cfg.flow_vel_sigma_quality_gain_m_s * (1.0F - q / 255.0F);
+    if (cfg.flow_rate_sigma_rad_s <= 0.0F) {
+        float sigma = cfg.flow_vel_sigma_min_m_s + quality_term;
+        sigma += cfg.flow_vel_sigma_height_gain_m_s * std::max(height_m - 1.0F, 0.0F);
+        return clampf(sigma, cfg.flow_vel_sigma_min_m_s, 0.35F);
+    }
+    const float sigma = std::sqrt(sq(cfg.flow_vel_sigma_min_m_s) +
+                                  sq(height_m * cfg.flow_rate_sigma_rad_s) +
+                                  sq(speed_m_s * cfg.height_rel_sigma));
+    return sigma + quality_term;
 }
 
 FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& flow,
@@ -128,7 +186,7 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
         return out;
     }
 
-    if (!isFinite(flow.integration_time_s) || flow.integration_time_s <= 0.0F || flow.integration_time_s > 0.20F) {
+    if (!isFinite(flow.integration_time_s) || flow.integration_time_s <= 0.0F || flow.integration_time_s > cfg_.max_integration_time_s) {
         out.reason = RejectReason::BadDeltaTime;
         return out;
     }
@@ -190,6 +248,13 @@ FlowVelocityEstimate FlowVelocityEstimator::update(const OpticalFlowRadSample& f
     const float speed = std::sqrt(sq(velocity_body_at_cg.x) + sq(velocity_body_at_cg.y));
     if (!isFinite(speed) || speed > cfg_.max_horizontal_speed_m_s * 2.5F) {
         out.reason = RejectReason::VelocityLimit;
+        return out;
+    }
+
+    out.velocity_sigma_m_s = flowVelocitySigma(cfg_, h, speed, flow.quality);
+    if (!isFinite(out.velocity_sigma_m_s) ||
+        out.velocity_sigma_m_s > cfg_.max_velocity_sigma_m_s) {
+        out.reason = RejectReason::VelocityUncertainty;
         return out;
     }
 
@@ -365,11 +430,14 @@ bool HorizontalEkf::updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t
 
     const float y0 = flow.velocity_nav_m_s.x - x_.vn_m_s;
     const float y1 = flow.velocity_nav_m_s.y - x_.ve_m_s;
-    const float q = clampf(static_cast<float>(quality), 1.0F, 255.0F);
-    float sigma = cfg_.flow_vel_sigma_min_m_s;
-    sigma += cfg_.flow_vel_sigma_quality_gain_m_s * (1.0F - q / 255.0F);
-    sigma += cfg_.flow_vel_sigma_height_gain_m_s * std::max(flow.height_m - 1.0F, 0.0F);
-    sigma = clampf(sigma, cfg_.flow_vel_sigma_min_m_s, 0.35F);
+    // Estimator-provided sigma when available; legacy model otherwise.
+    float sigma = flow.velocity_sigma_m_s;
+    if (!isFinite(sigma) || sigma <= 0.0F) {
+        sigma = flowVelocitySigma(cfg_, flow.height_m, 0.0F, quality);
+    }
+    if (!isFinite(sigma) || sigma <= 0.0F) {
+        return false;
+    }
     const float r = sq(sigma);
 
     const float s00 = p_[2][2] + r;
@@ -551,6 +619,97 @@ RuntimeOutput OfNavRuntime::monitor(uint64_t now_us,
         status.health.imu_valid = false;
     }
     return status;
+}
+
+const char* toString(SafetyAction action) noexcept {
+    switch (action) {
+    case SafetyAction::None: return "NONE";
+    case SafetyAction::AltitudeHold: return "ALTITUDE_HOLD";
+    case SafetyAction::Land: return "LAND";
+    case SafetyAction::ManualTakeover: return "MANUAL_TAKEOVER";
+    }
+    return "UNKNOWN";
+}
+
+const char* toString(SafetyReason reason) noexcept {
+    switch (reason) {
+    case SafetyReason::Nominal: return "NOMINAL";
+    case SafetyReason::DegradedConfirmed: return "DEGRADED_CONFIRMED";
+    case SafetyReason::DegradedTooLong: return "DEGRADED_TOO_LONG";
+    case SafetyReason::FailsafeConfirmed: return "FAILSAFE_CONFIRMED";
+    case SafetyReason::ManualRequested: return "MANUAL_REQUESTED";
+    case SafetyReason::Recovered: return "RECOVERED";
+    case SafetyReason::NonMonotonicTime: return "NON_MONOTONIC_TIME";
+    }
+    return "UNKNOWN";
+}
+
+void SafetyActionManager::reset() noexcept {
+    action_ = SafetyAction::None;
+    last_mode_ = NavMode::Standby;
+    mode_since_us_ = degraded_since_us_ = action_since_us_ = last_us_ = 0U;
+    started_ = false;
+    degraded_episode_ = false;
+}
+
+SafetyDecision SafetyActionManager::decide(SafetyAction action, SafetyReason reason,
+                                           uint64_t now_us) noexcept {
+    SafetyDecision d{};
+    d.changed = action != action_;
+    if (d.changed) {
+        action_ = action;
+        action_since_us_ = now_us;
+    }
+    d.action = action_;
+    d.reason = reason;
+    d.latched = action_ == SafetyAction::Land || action_ == SafetyAction::ManualTakeover;
+    d.action_since_us = action_since_us_;
+    return d;
+}
+
+SafetyDecision SafetyActionManager::update(NavMode mode, uint64_t now_us) noexcept {
+    if (started_ && now_us < last_us_) {
+        // A clock running backwards invalidates every timeout: fail safe.
+        return decide(action_ == SafetyAction::ManualTakeover ? action_ : SafetyAction::Land,
+                      SafetyReason::NonMonotonicTime, now_us);
+    }
+    if (!started_ || mode != last_mode_) {
+        mode_since_us_ = now_us;
+        last_mode_ = mode;
+        started_ = true;
+    }
+    last_us_ = now_us;
+    const uint64_t in_mode = now_us - mode_since_us_;
+    if (mode == NavMode::DegradedHold || mode == NavMode::FailsafeLand) {
+        if (!degraded_episode_) {
+            degraded_episode_ = true;
+            degraded_since_us_ = now_us;
+        }
+    } else if (mode == NavMode::FlowNav && in_mode >= cfg_.recovery_us) {
+        degraded_episode_ = false;
+    }
+    const SafetyAction current = action_;
+    if (current == SafetyAction::Land || current == SafetyAction::ManualTakeover) {
+        return decide(current, SafetyReason::Nominal, now_us);  // latched
+    }
+    if (mode == NavMode::ManualRequired) {
+        return decide(SafetyAction::ManualTakeover, SafetyReason::ManualRequested, now_us);
+    }
+    if (mode == NavMode::FailsafeLand && in_mode >= cfg_.failsafe_confirm_us) {
+        return decide(SafetyAction::Land, SafetyReason::FailsafeConfirmed, now_us);
+    }
+    if (degraded_episode_ && now_us - degraded_since_us_ >= cfg_.degraded_to_land_us) {
+        return decide(SafetyAction::Land, SafetyReason::DegradedTooLong, now_us);
+    }
+    if ((mode == NavMode::DegradedHold || mode == NavMode::FailsafeLand) &&
+        in_mode >= cfg_.degraded_confirm_us) {
+        return decide(SafetyAction::AltitudeHold, SafetyReason::DegradedConfirmed, now_us);
+    }
+    if (current == SafetyAction::AltitudeHold && mode == NavMode::FlowNav &&
+        in_mode >= cfg_.recovery_us) {
+        return decide(SafetyAction::None, SafetyReason::Recovered, now_us);
+    }
+    return decide(current, SafetyReason::Nominal, now_us);
 }
 
 } // namespace ofnav

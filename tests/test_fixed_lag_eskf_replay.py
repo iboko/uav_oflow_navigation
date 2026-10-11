@@ -1,5 +1,6 @@
 """Проверка отложенных визуальных коррекций с повторным прогнозом ИИМ."""
-from math import sin
+from dataclasses import fields
+from math import isnan, sin
 
 import numpy as np
 import pytest
@@ -8,6 +9,18 @@ from src.error_state_inertial_filter import InertialErrorStateFilter, ImuNoiseDe
 from src.fixed_lag_eskf_replay import FixedLagEskfReplay
 from src.horizontal_visual_inertial_filter import VisualVelocityMeasurement
 from src.imu_preintegration import ImuReading, ImuBias
+
+
+def same_snapshot(a, b):
+    """NaN-aware field comparison: dataclass __eq__ in Python 3.13+
+    compares fields one by one, so an unset NIS (NaN) never equals itself."""
+    for field in fields(a):
+        x, y = getattr(a, field.name), getattr(b, field.name)
+        if isinstance(x, float) and isinstance(y, float) and isnan(x) and isnan(y):
+            continue
+        if x != y:
+            return False
+    return True
 
 
 def factory():
@@ -95,7 +108,7 @@ def test_late_measurement_is_rejected_and_preserves_state():
     before = engine.state
     result = engine.push_delayed_visual(camera(1_100_000, 0.))
     assert result.status == "VISUAL_DELAY_EXCEEDED"
-    assert engine.state == before
+    assert same_snapshot(engine.state, before)
     assert engine.stored_visual_count == 0
 
 
@@ -109,7 +122,7 @@ def test_duplicate_camera_sample_and_invalid_covariance_never_modify_state():
     assert engine.push_delayed_visual(measurement).status == "REPEATED_VISUAL_MEASUREMENT"
     bad = camera(1_070_000, 0.03, variance=float("nan"))
     assert engine.push_delayed_visual(bad).status == "INVALID_VISUAL_MEASUREMENT"
-    assert engine.state == original
+    assert same_snapshot(engine.state, original)
 
 
 def test_history_is_bounded_and_checkpoint_contains_prior_corrections():

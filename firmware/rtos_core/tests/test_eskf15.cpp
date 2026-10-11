@@ -204,6 +204,229 @@ void test_capacity_fails_explicitly_without_heap_growth() {
     assert(lag.current().timestamp()==1640000U);
     assert(lag.storedImu()==FixedLag::kImuCapacity);
 }
+ofnav15::Measurement meas(std::uint64_t t, ofnav15::MeasurementKind kind,
+                         double a, double b, double var, double ci=1.) {
+    ofnav15::Measurement m{};
+    m.time_us=t; m.kind=kind; m.value={a,b};
+    m.covariance={var,0.,0.,kind==ofnav15::MeasurementKind::Yaw?0.:var};
+    m.ci_weight=ci;
+    return m;
+}
+double yawOf(const ofnav15::Quat &q) {
+    return std::atan2(2.*(q[0]*q[3]+q[1]*q[2]),1.-2.*(q[2]*q[2]+q[3]*q[3]));
+}
+Imu moving(std::uint64_t t, int i) {
+    const double s=static_cast<double>(i)*.01;
+    return Imu{t,{.004*std::sin(.9*s),-.003*std::cos(.7*s),.03*std::cos(.5*s)},
+               {.3*std::sin(.6*s),.2*std::cos(.4*s),-9.80665+.05*std::sin(.8*s)}};
+}
+void test_snapshot_replay_equals_sequential_filter() {
+    // Exposures coincide with IMU times: a plain sequential filter performs
+    // exactly the same operations as the replay -> results must agree.
+    using K=ofnav15::MeasurementKind;
+    Filter reference{};
+    FixedLag lag({},630000U);
+    ofnav15::Workspace ws{};
+    struct Frame {std::uint64_t t; ofnav15::Measurement m[4];};
+    Frame frames[6]{};
+    for(int k=0;k<6;++k) {
+        const std::uint64_t t=1000000U+static_cast<std::uint64_t>(10000*(20+12*k));
+        frames[k].t=t;
+        frames[k].m[0]=meas(t,K::VelocityNe,.01*k,-.02,.04);
+        frames[k].m[1]=meas(t,K::BodyVelocityXy,.012*k,-.018,.05);
+        frames[k].m[2]=meas(t,K::Yaw,.001*k,0.,.01);
+        frames[k].m[3]=meas(t,K::PositionNe,.03*k,-.01*k,4.,0.);
+    }
+    int delivered=0;
+    for(int i=0;i<=110;++i) {
+        const std::uint64_t t=1000000U+static_cast<std::uint64_t>(10000*i);
+        const Imu m=moving(t,i);
+        assert(reference.predict(m,ws)==Status::InertialOnly);
+        for(const auto &fr:frames) {
+            if (fr.t==t) {for(const auto &e:fr.m) {
+                assert(ofnav15::measurementProcessed(reference.update(e,ws)));
+            }}
+        }
+        assert(lag.pushImu(m)==Status::InertialOnly);
+        // Deliver frames late and pairwise out of order.
+        if (i==60) {
+            Status st[4]{};
+            assert(ofnav15::measurementProcessed(lag.pushDelayedFrame(frames[1].m,4,st)));
+            assert(ofnav15::measurementProcessed(lag.pushDelayedFrame(frames[0].m,4,st)));
+            delivered+=2;
+        }
+        if (i==95) {
+            Status st[4]{};
+            for(int k:{3,2,4}) {
+                assert(ofnav15::measurementProcessed(lag.pushDelayedFrame(frames[k].m,4,st)));
+                for(const auto x:st) {assert(ofnav15::measurementProcessed(x));}
+                ++delivered;
+            }
+        }
+        if (i==105) {
+            Status st[4]{};
+            assert(ofnav15::measurementProcessed(lag.pushDelayedFrame(frames[5].m,4,st)));
+            ++delivered;
+            assert(lag.lastReplayLength()<lag.storedImu());
+        }
+    }
+    assert(delivered==6);
+    const auto &f=lag.current();
+    for(int i=0;i<3;++i) {
+        assert(near(f.position()[i],reference.position()[i],1.e-9));
+        assert(near(f.velocity()[i],reference.velocity()[i],1.e-9));
+    }
+    for(int i=0;i<4;++i) {assert(near(f.quaternion()[i],reference.quaternion()[i],1.e-12));}
+    for(std::size_t i=0;i<225;++i) {assert(near(f.covariance()[i],reference.covariance()[i],1.e-9));}
+    assert(f.accepted()==reference.accepted());
+}
+void test_frame_rejects_duplicate_kind_and_keeps_state() {
+    using K=ofnav15::MeasurementKind;
+    FixedLag lag({},400000U);
+    for(int i=0;i<=30;++i) {
+        assert(lag.pushImu(sample(1000000U+static_cast<std::uint64_t>(10000*i)))==Status::InertialOnly);
+    }
+    const auto before=lag.current().covariance();
+    ofnav15::Measurement twice[2]={meas(1200000U,K::VelocityNe,0.,0.,.04),
+                                   meas(1200000U,K::VelocityNe,0.,0.,.04)};
+    Status st[2]{};
+    (void)lag.pushDelayedFrame(twice,2,st);
+    assert(st[0]==Status::VisualCorrected);
+    assert(st[1]==Status::InvalidVisual);
+    ofnav15::Measurement bad=meas(1210000U,K::VelocityNe,0.,0.,.04,.5);
+    assert(lag.pushDelayed(bad)==Status::InvalidVisual);  // CI only for position
+    assert(lag.storedVisual()==1);
+    assert(!(lag.current().covariance()==before));
+}
+void test_body_velocity_makes_yaw_observable() {
+    using K=ofnav15::MeasurementKind;
+    ofnav15::Parameters cfg{};
+    cfg.initial_sigma[8]=.5;
+    Filter f(cfg);
+    ofnav15::Workspace ws{};
+    const double true_yaw=.2;
+    // True motion: 1 m/s north. Body-frame velocity seen by the camera
+    // depends on the true heading; NE velocity from another aid.
+    for(int i=0;i<=200;++i) {
+        const std::uint64_t t=1000000U+static_cast<std::uint64_t>(10000*i);
+        assert(f.predict(sample(t),ws)==Status::InertialOnly);
+        if (i%10==0) {
+            assert(ofnav15::measurementProcessed(f.update(meas(t,K::VelocityNe,1.,0.,.0004),ws)));
+            assert(ofnav15::measurementProcessed(f.update(
+                meas(t,K::BodyVelocityXy,std::cos(true_yaw),-std::sin(true_yaw),.0004),ws)));
+        }
+    }
+    assert(std::abs(yawOf(f.quaternion())-true_yaw)<.02);
+    assert(f.covariance()[15*8+8]<.01);
+    assert(finiteCov(f.covariance()));
+}
+void test_yaw_update_with_tilt_and_wraparound() {
+    using K=ofnav15::MeasurementKind;
+    ofnav15::Parameters cfg{};
+    const double roll=.25, pitch=-.15;
+    // q = Rz(0) Ry(pitch) Rx(roll)
+    const double cr=std::cos(.5*roll),sr=std::sin(.5*roll),cp=std::cos(.5*pitch),sp=std::sin(.5*pitch);
+    cfg.initial_quaternion_body_to_ned={cr*cp,sr*cp,cr*sp,-sr*sp};
+    cfg.initial_sigma[8]=1.;
+    Filter f(cfg);
+    ofnav15::Workspace ws{};
+    assert(f.predict(Imu{1000000U,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+    // One linearized step: residual error is second order in the step
+    // (3.9e-4 rad for 0.1 rad with this tilt); a second step reduces it.
+    assert(f.update(meas(1000000U,K::Yaw,.1,0.,1.e-6),ws)==Status::YawCorrected);
+    const double first=std::abs(yawOf(f.quaternion())-.1);
+    assert(first<1.e-3);
+    assert(f.predict(Imu{1010000U,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+    assert(f.update(meas(1010000U,K::Yaw,.1,0.,1.e-6),ws)==Status::YawCorrected);
+    assert(std::abs(yawOf(f.quaternion())-.1)<.6*first);
+    Filter w(cfg);
+    assert(w.predict(Imu{1000000U,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+    // Nominal yaw 0; measurement 2*pi - 0.05 must act as -0.05.
+    assert(w.update(meas(1000000U,K::Yaw,6.283185307179586-.05,0.,1.e-6),ws)==Status::YawCorrected);
+    assert(std::abs(yawOf(w.quaternion())+.05)<1.e-3);
+}
+void test_position_ci_update_is_conservative() {
+    using K=ofnav15::MeasurementKind;
+    ofnav15::Workspace ws{};
+    Filter independent{}, ci{};
+    for(Filter *f:{&independent,&ci}) {
+        assert(f->predict(sample(1000000U),ws)==Status::InertialOnly);
+        assert(f->predict(sample(1010000U),ws)==Status::InertialOnly);
+    }
+    const double prior=independent.covariance()[0];
+    assert(independent.update(meas(1010000U,K::PositionNe,1.,-1.,9.),ws)==Status::PositionCorrected);
+    assert(ci.update(meas(1010000U,K::PositionNe,1.,-1.,9.,0.),ws)==Status::PositionCorrected);
+    assert(ci.lastCiWeight()>0. && ci.lastCiWeight()<1.);
+    assert(near(independent.lastCiWeight(),1.));
+    assert(ci.covariance()[0]>independent.covariance()[0]);
+    assert(ci.covariance()[0]<prior);
+    assert(finiteCov(ci.covariance()));
+    Filter far{};
+    assert(far.predict(sample(1000000U),ws)==Status::InertialOnly);
+    assert(far.update(meas(1000000U,K::PositionNe,500.,0.,1.),ws)==Status::PositionOutlier);
+}
+void test_ground_point_corrects_tilt_and_position() {
+    using K=ofnav15::MeasurementKind;
+    ofnav15::Parameters cfg{};
+    const double pitch_err=.02;  // nominal pitch while the vehicle is level
+    cfg.initial_quaternion_body_to_ned={std::cos(.5*pitch_err),0.,std::sin(.5*pitch_err),0.};
+    cfg.initial_sigma[6]=cfg.initial_sigma[7]=.05;
+    Filter f(cfg);
+    ofnav15::Workspace ws{};
+    // Level vehicle at the origin, 100 m above ground: true ground point (0,0).
+    // Two independent pieces: map ground point and an NE position aid.
+    for(int i=0;i<=40;++i) {
+        const std::uint64_t t=1000000U+static_cast<std::uint64_t>(10000*i);
+        // Accelerometer of a LEVEL vehicle; the filter believes it is pitched.
+        assert(f.predict(Imu{t,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+        if (i%10==0) {
+            auto gp=meas(t,K::MapGroundPointNe,0.,0.,.01);
+            gp.aux={100.,0.,0.,1.};
+            assert(ofnav15::measurementProcessed(f.update(gp,ws)));
+            assert(ofnav15::measurementProcessed(f.update(meas(t,K::PositionNe,0.,0.,.01),ws)));
+        }
+    }
+    const auto &q=f.quaternion();
+    const double pitch=std::asin(2.*(q[0]*q[2]-q[3]*q[1]));
+    assert(std::abs(pitch)<.2*pitch_err);
+    assert(std::abs(f.position()[0])<.2);
+    assert(f.predict(Imu{1410000U,{},{0.,0.,-9.80665}},ws)==Status::InertialOnly);
+    ofnav15::Measurement bad=meas(1410000U,K::MapGroundPointNe,0.,0.,.01);
+    bad.aux={100.,0.,0.,0.};  // not a unit optical axis
+    assert(f.update(bad,ws)==Status::InvalidVisual);
+}
+void test_static_alignment_roll_pitch_gyro_bias() {
+    const double roll=.1, pitch=-.05, g=9.80665;
+    const ofnav15::Vec3 bias{.01,-.02,.005};
+    Imu window[200]{};
+    for(int i=0;i<200;++i) {
+        const double n=.01*std::sin(1.7*i);
+        window[i]=Imu{1000000U+static_cast<std::uint64_t>(5000*i),
+            {bias[0]+.001*std::sin(2.1*i),bias[1],bias[2]},
+            {g*std::sin(pitch)+n,-g*std::sin(roll)*std::cos(pitch),
+             -g*std::cos(roll)*std::cos(pitch)-n}};
+    }
+    ofnav15::Parameters p{};
+    assert(ofnav15::staticAlignment(window,200,.7,.05,{},p)==ofnav15::AlignmentStatus::Aligned);
+    const auto &q=p.initial_quaternion_body_to_ned;
+    const double r=std::atan2(2.*(q[0]*q[1]+q[2]*q[3]),1.-2.*(q[1]*q[1]+q[2]*q[2]));
+    const double pt=std::asin(2.*(q[0]*q[2]-q[3]*q[1]));
+    assert(std::abs(r-roll)<1.e-3 && std::abs(pt-pitch)<1.e-3);
+    assert(std::abs(yawOf(q)-.7)<1.e-9);
+    for(int k=0;k<3;++k) {assert(std::abs(p.initial_gyro_bias_rad_s[k]-bias[k])<1.e-4);}
+    assert(near(p.initial_sigma[8],.05));
+    Filter f(p);
+    assert(f.healthy());
+    for(int i=0;i<200;++i) {
+        Imu m=window[i]; m.time_us=2000000U+static_cast<std::uint64_t>(5000*i);
+        assert(f.predict(m)==Status::InertialOnly);
+    }
+    for(double v:f.velocity()) {assert(std::abs(v)<.02);}
+    window[50].specific_force_m_s2[0]+=5.;
+    assert(ofnav15::staticAlignment(window,200,0.,.1,{},p)==ofnav15::AlignmentStatus::NotStationary);
+    assert(ofnav15::staticAlignment(window,10,0.,.1,{},p)==ofnav15::AlignmentStatus::TooFewSamples);
+}
+
 } // namespace
 
 int main() {
@@ -216,6 +439,13 @@ int main() {
     test_bad_delayed_visual_not_accepted_or_mutate_state();
     test_fixed_memory_history_and_checkpoint_compaction();
     test_capacity_fails_explicitly_without_heap_growth();
+    test_snapshot_replay_equals_sequential_filter();
+    test_frame_rejects_duplicate_kind_and_keeps_state();
+    test_body_velocity_makes_yaw_observable();
+    test_yaw_update_with_tilt_and_wraparound();
+    test_position_ci_update_is_conservative();
+    test_static_alignment_roll_pitch_gyro_bias();
+    test_ground_point_corrects_tilt_and_position();
     std::cout<<"C++ 15-state ESKF and fixed-lag regression PASS\n";
     return 0;
 }

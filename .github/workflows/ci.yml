@@ -23,13 +23,33 @@ jobs:
       - name: Run Python tests
         run: pytest -q
 
-      - name: Run synthetic camera IMU map and delayed ESKF integration
+      - name: Calibrate map and VO errors on separate synthetic flights
+        run: |
+          python -m src.synthetic_bench_calibration \
+            --output build/synthetic_bench_calibration.json \
+            --fit-seeds 9101 9102 9103 \
+            --holdout-seeds 9201 9202
+
+      - name: Run synthetic camera IMU map and delayed ESKF integration (VIO)
         run: |
           python -m src.synthetic_sensor_bench \
             --output-dir build/synthetic_sensor_bench \
             --scenario nominal \
-            --frames 6 \
-            --seed 72118
+            --frames 12 \
+            --seed 72118 \
+            --calibration build/synthetic_bench_calibration.json
+          python - <<'PY'
+          import json
+          s = json.load(open("build/synthetic_sensor_bench/evaluation/sensor_bench_summary.json"))
+          assert s["attitude_source"] == "ESKF_INTERNAL", s
+          assert s["map_position_updates_fused"] >= 8, s
+          assert s["eskf_position_rmse_m"] < 0.2, s
+          assert s["eskf_speed_rmse_m_s"] < 0.1, s
+          assert s["flight_accuracy_validated"] is False
+          PY
+
+      - name: Linearized ESKF observability report
+        run: python -m src.eskf_observability --output build/eskf_observability.json
 
       - name: Archive synthetic camera and IMU integration results
         uses: actions/upload-artifact@v4
@@ -46,6 +66,8 @@ jobs:
             build/synthetic_sensor_bench/sensors/synthetic_orthophoto.png
             build/synthetic_sensor_bench/evaluation/sensor_bench_results.csv
             build/synthetic_sensor_bench/evaluation/sensor_bench_summary.json
+            build/synthetic_bench_calibration.json
+            build/eskf_observability.json
           if-no-files-found: error
           retention-days: 30
 
@@ -58,6 +80,11 @@ jobs:
       - name: Run C++ tests
         run: ctest --test-dir build/rtos_core --output-on-failure
 
+      - name: Measure ESKF stack and time with full buffers
+        run: |
+          mkdir -p build/eskf15_resources
+          build/rtos_core/eskf15_benchmark | tee build/eskf15_resources/host_resources.json
+
       - name: Compare full C++15 ESKF against Python delayed replay
         run: |
           python -m src.compare_cpp15_python \
@@ -68,7 +95,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cpp15-python-full-covariance-parity
-          path: build/eskf15_parity/cpp_python_full_covariance.json
+          path: |
+            build/eskf15_parity/cpp_python_full_covariance.json
+            build/eskf15_resources/host_resources.json
           if-no-files-found: error
           retention-days: 30
 

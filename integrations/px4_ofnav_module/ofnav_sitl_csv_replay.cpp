@@ -53,7 +53,7 @@ bool finite(const Record &r)
 
 } // namespace
 
-int ofnav_sitl_csv_replay(const char *filename)
+int ofnav_sitl_csv_replay(const char *filename, ofnav::SensorProfile profile)
 {
     FILE *fp = std::fopen(filename, "r");
     if (fp == nullptr) {
@@ -70,13 +70,11 @@ int ofnav_sitl_csv_replay(const char *filename)
         return -1;
     }
 
-    ofnav::Config cfg{};
-    // Preserve the existing flight-module safety envelope!
-    cfg.min_height_m = 0.2f;
-    cfg.max_height_m = 4.0f;
-    cfg.min_quality = 120U;
-    cfg.max_horizontal_speed_m_s = 1.5f;
+    // The SAME validated envelope as the live module for this profile.
+    // The optical-flow sensor profile keeps its 0.2-4 m range.
+    const ofnav::Config cfg = ofnav::makeProfileConfig(profile, 120U);
     ofnav::FlowVelocityEstimator estimator(cfg);
+    double sigma_sum = 0.0;
 
     unsigned rows = 0;
     unsigned valid_rows = 0;
@@ -143,7 +141,8 @@ int ofnav_sitl_csv_replay(const char *filename)
         const auto estimate = estimator.update(flow, range, imu, attitude);
         if (estimate.accepted) {
             ++flow_accepted;
-            if (r.height > cfg.max_height_m) {
+            sigma_sum += static_cast<double>(estimate.velocity_sigma_m_s);
+            if (r.height > cfg.max_height_m || r.height < cfg.min_height_m) {
                 unsafe_acceptance = true;
             }
         } else if (estimate.reason == ofnav::RejectReason::HeightTooHigh) {
@@ -159,10 +158,12 @@ int ofnav_sitl_csv_replay(const char *filename)
                 rows, valid_rows, static_cast<unsigned>(unsafe_acceptance));
         return -1;
     }
-    PX4_INFO("OFNAV_SITL_REPLAY_OK rows=%u valid=%u accepted=%u height_rejected=%u other_rejected=%u invalid=%u",
-             rows, valid_rows, flow_accepted, height_rejected,
-             other_rejected, explicitly_invalid);
-    // An expected rejected 100 m frame is a PASS of the safety test.
+    PX4_INFO("OFNAV_SITL_REPLAY_OK profile=%s rows=%u valid=%u accepted=%u height_rejected=%u other_rejected=%u invalid=%u mean_sigma_mm_s=%u",
+             ofnav::toString(profile), rows, valid_rows, flow_accepted,
+             height_rejected, other_rejected, explicitly_invalid,
+             flow_accepted ? static_cast<unsigned>(1000.0 * sigma_sum / flow_accepted) : 0U);
+    // With the flow-sensor profile an expected rejected 100 m frame is a
+    // PASS of the safety test; the camera profile must accept 100 m VO.
     // No uORB topic was advertised and no estimator/control state updated.
     return 0;
 }
