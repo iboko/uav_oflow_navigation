@@ -87,6 +87,8 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
+    ap.add_argument("--map-yaw", action="store_true",
+                    help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
                     help="JSON polled in flight: {\"shift_ne_m\": [dn, de]} injects a map fault")
     ap.add_argument("--map-log", type=Path)
@@ -256,7 +258,7 @@ def main() -> None:
             cov[15] = cov[18] = cov[20] = nan
             # Position only with a map lock: EKF2 stops position fusion on any
             # message without it, so it is sent with every velocity message.
-            pos, pose_cov = [nan, nan, nan], [nan] * 21
+            pos, pose_cov, quat = [nan, nan, nan], [nan] * 21, [nan, nan, nan, nan]
             st = anchor.status() if anchor is not None else None
             if st is not None and st.locked and math.isfinite(out.height_mid_m):
                 back_s = (out.vo.timestamp_us - out.time_us) * 1e-6  # anchor is at the frame time
@@ -267,9 +269,21 @@ def main() -> None:
                 pose_cov[0], pose_cov[6] = st.covariance_ne_m2[0][0], st.covariance_ne_m2[1][1]
                 pose_cov[11] = 0.05 ** 2
                 pose_cov[15] = pose_cov[18] = pose_cov[20] = nan
+                if args.map_yaw and anchor.heading_known and all(map(math.isfinite, out.rpy_mid)):
+                    # Heading = autopilot heading + offset measured by the map.
+                    # EKF2 takes only the yaw of this quaternion (fuseYaw);
+                    # roll and pitch are the autopilot's own.
+                    r, p_, y = out.rpy_mid
+                    y += anchor.heading_offset_rad
+                    cr, sr, cp, sp, cy, sy = (math.cos(r / 2), math.sin(r / 2), math.cos(p_ / 2),
+                                              math.sin(p_ / 2), math.cos(y / 2), math.sin(y / 2))
+                    quat = [cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+                            cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy]
+                    pose_cov[15] = pose_cov[18] = 0.1 ** 2
+                    pose_cov[20] = anchor.heading_sigma_rad() ** 2
             link.mav.odometry_send(
                 out.time_us, mavutil.mavlink.MAV_FRAME_LOCAL_NED, mavutil.mavlink.MAV_FRAME_BODY_FRD,
-                *pos, [nan, nan, nan, nan], *out.velocity_frd, nan, nan, nan,
+                *pos, quat, *out.velocity_frd, nan, nan, nan,
                 pose_cov, cov, 0, mavutil.mavlink.MAV_ESTIMATOR_TYPE_VIO, 100)
             sent += 1
             if log:

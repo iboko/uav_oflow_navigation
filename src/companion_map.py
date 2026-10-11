@@ -80,6 +80,7 @@ class MapAnchor:
         self._psi_needed = heading_fixes_needed
         self._psi_sum = np.zeros(2)  # sum of (cos, sin) of measured offsets
         self._psi_n = 0
+        self._psi_var = 0.0          # exponentially weighted spread of the offsets
         self._p: np.ndarray | None = None
         self._cov: np.ndarray | None = None
         self._t_us = 0
@@ -143,6 +144,15 @@ class MapAnchor:
             # привязкам (см. описание модуля): компаньон их снова наберет.
 
     @property
+    def heading_known(self) -> bool:
+        return self._psi_n >= self._psi_needed
+
+    def heading_sigma_rad(self, floor_rad: float = 0.05) -> float:
+        """Spread of the measured offsets, never below floor_rad: the same
+        offset is repeated in many autopilot messages (not independent)."""
+        return max(floor_rad, float(np.sqrt(self._psi_var)))
+
+    @property
     def heading_offset_rad(self) -> float:
         """Map heading minus autopilot heading; 0 until measured."""
         if self._psi_n < self._psi_needed:
@@ -151,6 +161,10 @@ class MapAnchor:
 
     def _heading(self, offset_rad: float) -> None:
         if isfinite(offset_rad):
+            if self._psi_n >= self._psi_needed:
+                d = float(np.arctan2(np.sin(offset_rad - self.heading_offset_rad),
+                                     np.cos(offset_rad - self.heading_offset_rad)))
+                self._psi_var = 0.95 * self._psi_var + 0.05 * d * d
             # Exponential window (~20 fixes): the magnetometer error changes slowly.
             self._psi_sum = 0.95 * self._psi_sum + (np.cos(offset_rad), np.sin(offset_rad))
             self._psi_n += 1
