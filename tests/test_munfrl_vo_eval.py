@@ -83,6 +83,8 @@ def test_fitted_noise_model_not_identifiable_with_constant_height_and_speed(tmp_
     report = evaluate(rows, 1.5)
     assert report["calibration"]["noise_model_design_rank"] == 1
     assert report["calibration"]["noise_model_identifiable"] is False
+    assert report["calibration"]["fitted_noise_model"] is None
+    assert "mean_nees" not in report["validation"]["with_fitted_model"]
     assert report["calibration"]["noise_model_warning"]
     assert report["calibration"]["fitted_noise_model_validated_for_flight"] is False
 
