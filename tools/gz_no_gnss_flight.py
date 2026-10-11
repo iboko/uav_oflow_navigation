@@ -48,13 +48,13 @@ MAX_ESTIMATE_ERROR_M = 2.0    # EKF2 displacement vs true displacement
 def topic(px4: gz.Px4, name: str) -> dict:
     text = px4.cmd("listener", name, "-n", "1")
     out = {}
-    for key, value in re.findall(r"^\s*([a-z_]+): (\S+)", text, re.M):
+    for key, value in re.findall(r"^\s*([a-z0-9_]+): (\S+)", text, re.M):
         try:
             out[key] = float(value)
         except ValueError:
             out[key] = value
     # Arrays print as 'velocity: [0.1, 0.2, 0.3]': stored as 'velocity[i]'.
-    for key, values in re.findall(r"^\s*([a-z_]+): \[([^\]]*)\]", text, re.M):
+    for key, values in re.findall(r"^\s*([a-z0-9_]+): \[([^\]]*)\]", text, re.M):
         for i, value in enumerate(values.split(",")):
             try:
                 out[f"{key}[{i}]"] = float(value)

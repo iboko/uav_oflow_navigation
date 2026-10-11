@@ -105,6 +105,51 @@ def flags_and_validity(px4: gz.Px4) -> dict:
             "cs_opt_flow": flags.get("cs_opt_flow"), "xy_valid": lp.get("xy_valid")}
 
 
+def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_error_deg: float = 10.0) -> dict:
+    """Preflight gate from EKF2's own signals only (never ground truth).
+
+    5 consecutive seconds: GNSS fused, magnetometer fused (heading or 3D) and
+    consistent, at rest, heading steady within 1 deg. Under load the SITL
+    start can leave EKF2 unaided for ~30 s, or without magnetometer fusion
+    and a 45-50 deg heading error, while the arming checks already pass;
+    after takeoff the controller then turns the vehicle by tens of degrees
+    (seen in the ulogs). A consistent magnetometer heading can still be
+    5-10 deg off in SITL, as on a real vehicle.
+    """
+    state = {"n": 0, "yaw": None}
+
+    def settled() -> bool:
+        f = topic(px4, "estimator_status_flags")
+        lp = topic(px4, "vehicle_local_position")
+        yaw = float(lp.get("heading", math.nan))
+        mag = f.get("cs_mag_3d") == "True" or f.get("cs_mag_hdg") == "True"
+        still = (f.get("cs_gnss_pos", f.get("cs_gps")) == "True" and mag
+                 and f.get("cs_mag_heading_consistent") == "True"
+                 and all(abs(float(lp.get(k, 9.0))) < 0.1 for k in ("vx", "vy", "vz"))
+                 and state["yaw"] is not None
+                 and abs((yaw - state["yaw"] + math.pi) % (2 * math.pi) - math.pi) < math.radians(1.0))
+        state["yaw"] = yaw
+        state["n"] = state["n"] + 1 if still else 0
+        return state["n"] >= 5
+    if not gz.wait(settled, timeout_s, 1):
+        raise SitlStartRejected("EKF2 not settled on the ground (GNSS, magnetometer, rest, steady heading): "
+                                + json.dumps(flags_and_validity(px4)))
+    # Simulation sanity, not navigation: some SITL starts align the heading
+    # 30-50 deg off while every EKF2 flag reads healthy (the heading jumps when
+    # GNSS fusion starts). Such a start is discarded and counted; ground truth
+    # never reaches the companion or the estimator. 10 deg leaves realistic
+    # magnetometer heading errors in the test.
+    truth = float(topic(px4, "vehicle_local_position_groundtruth").get("heading", math.nan))
+    err = math.degrees(abs((state["yaw"] - truth + math.pi) % (2 * math.pi) - math.pi))
+    if not err < max_heading_error_deg:
+        raise SitlStartRejected(f"SITL start rejected: EKF2 heading {err:.1f} deg from simulator truth")
+    return {"heading_rad": state["yaw"], "heading_error_vs_truth_deg": round(err, 2)}
+
+
+class SitlStartRejected(RuntimeError):
+    """The simulated start is unusable (not a navigation failure)."""
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("px4_dir", type=Path)
@@ -152,16 +197,7 @@ def main() -> None:
         # Preflight: EKF2 aided by GNSS and at rest for 5 s. Under load the
         # SITL start can leave EKF2 unaided for ~30 s (hundreds of metres of
         # drift) and still converging when the arming checks already pass.
-        steady = [0]
-
-        def settled() -> bool:
-            f, lp = flags_and_validity(px4), topic(px4, "vehicle_local_position")
-            still = f["cs_gnss_pos"] == "True" and all(
-                abs(float(lp.get(k, 9.0))) < 0.1 for k in ("vx", "vy", "vz"))
-            steady[0] = steady[0] + 1 if still else 0
-            return steady[0] >= 5
-        if not gz.wait(settled, 180, 1):
-            raise RuntimeError("EKF2 did not settle on the ground: " + json.dumps(flags_and_validity(px4)))
+        report["preflight"] = wait_estimator_settled(px4)
 
         def armed():
             link.command(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
