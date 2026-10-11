@@ -5,6 +5,7 @@
 #include <px4_platform_common/tasks.h>
 #include <px4_platform_common/getopt.h>
 #include <drivers/drv_hrt.h>
+#include <drivers/drv_sensor.h>
 
 #include <uORB/uORB.h>
 #include <uORB/Publication.hpp>
@@ -15,6 +16,7 @@
 #include <uORB/topics/debug_vect.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/vehicle_land_detected.h>
 #include <commander/px4_custom_mode.h>
 
 #include <poll.h>
@@ -23,9 +25,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#if defined(__PX4_POSIX)
+#include <chrono>
+#endif
 
 #include "ofnav/ofnav.hpp"
 #include "ofnav/eskf_runner.hpp"
+#include "ofnav/eskf15_workload.hpp"
+
+#if defined(__PX4_NUTTX) && defined(CONFIG_STACK_COLORATION)
+#include <nuttx/arch.h>
+#include <nuttx/sched.h>
+#define OFNAV_STACK_MONITOR 1
+#endif
 
 // Flight builds never include the POSIX-only synthetic CSV replay commands.
 #if defined(__PX4_POSIX)
@@ -51,6 +63,140 @@ static uint64_t px4_clock()
     return hrt_absolute_time();
 }
 
+// Flight configuration of the diagnostic ESKF: 50 Hz filter rate halves the
+// prediction load of 100 Hz (docs/ESKF15_FMU_V6X_RU.md), 1 s alignment.
+static ofnav::EskfRunnerConfig eskf_config()
+{
+    ofnav::EskfRunnerConfig cfg{};
+    cfg.imu_period_us = 20000U;
+    cfg.alignment_samples = 50U;
+    cfg.alignment.min_samples = 50U;
+    return cfg;
+}
+
+#if defined(__PX4_POSIX)
+// SITL-only input masking at the module boundary for closed-loop failure
+// scenarios in Gazebo (gz_bridge does not implement 'failure optical_flow'
+// or 'failure distance_sensor'). Not compiled into flight builds.
+static volatile bool g_fault_flow = false;
+static volatile bool g_fault_range = false;
+#endif
+
+// ---- 'ofnav bench': the shared worst-case workload on THIS processor ----
+struct BenchJob {
+    ofnav15::WorkloadBuffers *buffers{nullptr};
+    ofnav15::WorkloadResult result[2]{};
+    long stack_used{-1};
+    volatile bool done{false};
+};
+static BenchJob *g_bench_job = nullptr;
+
+#if defined(__PX4_POSIX)
+// Lockstep SITL without a simulator does not advance hrt time: wall clock.
+static uint64_t bench_clock()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+#else
+static uint64_t bench_clock()
+{
+    return hrt_absolute_time();
+}
+#endif
+
+static int bench_task_main(int argc, char *argv[])
+{
+    BenchJob *job = g_bench_job;
+    const uint64_t periods[2] = {10000U, 20000U};
+
+    for (int k = 0; k < 2; ++k) {
+        job->result[k] = ofnav15::runWorkload(*job->buffers, &bench_clock, 30, periods[k]);
+    }
+
+#if defined(OFNAV_STACK_MONITOR)
+    job->stack_used = static_cast<long>(up_check_tcbstack(nxsched_self()));
+#endif
+    job->done = true;
+    return 0;
+}
+
+static int run_bench()
+{
+    // Static: a task that outlives the wait below must never write into a
+    // returned stack frame. A new run is refused while one is still running.
+    static BenchJob job{};
+
+    if (g_bench_job != nullptr && !job.done) {
+        PX4_ERR("OFNAV_BENCH previous run still active");
+        return -1;
+    }
+
+    job = BenchJob{};
+    job.buffers = new ofnav15::WorkloadBuffers{};
+
+    if (job.buffers == nullptr) {
+        PX4_ERR("OFNAV_BENCH out of memory");
+        return -1;
+    }
+
+    g_bench_job = &job;
+#if defined(__PX4_NUTTX)
+    // Same stack size and priority class as the ofnav task; NuttX stack
+    // coloration reports the real high-water mark of that task.
+    const int tid = px4_task_spawn_cmd("ofnav_bench", SCHED_DEFAULT, SCHED_PRIORITY_DEFAULT,
+                                       kTaskStackBytes, bench_task_main, nullptr);
+
+    if (tid < 0) {
+        delete job.buffers;
+        job.buffers = nullptr;
+        job.done = true;
+        PX4_ERR("OFNAV_BENCH task spawn failed");
+        return -1;
+    }
+
+    for (int i = 0; i < 600 && !job.done; ++i) { px4_usleep(100000); }
+
+    if (!job.done) {
+        PX4_ERR("OFNAV_BENCH timeout");
+        return -1;  // job and buffers stay owned by the still-running task
+    }
+
+#else
+    (void)bench_task_main(0, nullptr);
+#endif
+
+    const uint64_t rates[2] = {100U, 50U};
+    bool ok = true;
+
+    for (int k = 0; k < 2; ++k) {
+        const auto &r = job.result[k];
+        const uint64_t imu_mean = r.imu_samples ? r.imu_total / r.imu_samples : 0U;
+        const uint64_t frame_mean = r.frames ? r.frame_total / r.frames : 0U;
+        // Busy microseconds per second = CPU load in units of 0.01 %.
+        const uint64_t load = imu_mean * rates[k] + frame_mean * 10U;
+        ok = ok && r.healthy && r.failed_events == 0U;
+        PX4_INFO("OFNAV_BENCH imu_hz=%llu imu_us mean=%llu worst=%llu frame_us mean=%llu worst=%llu",
+                 static_cast<unsigned long long>(rates[k]),
+                 static_cast<unsigned long long>(imu_mean),
+                 static_cast<unsigned long long>(r.imu_worst),
+                 static_cast<unsigned long long>(frame_mean),
+                 static_cast<unsigned long long>(r.frame_worst));
+        PX4_INFO("OFNAV_BENCH imu_hz=%llu cpu_load=%llu.%02llu%% processed=%lu failed=%lu replay<=%u healthy=%u",
+                 static_cast<unsigned long long>(rates[k]),
+                 static_cast<unsigned long long>(load / 10000U),
+                 static_cast<unsigned long long>((load / 100U) % 100U),
+                 static_cast<unsigned long>(r.processed), static_cast<unsigned long>(r.failed_events),
+                 static_cast<unsigned>(r.max_replay_length), static_cast<unsigned>(r.healthy));
+    }
+
+    PX4_INFO("OFNAV_BENCH stack_used=%ld of %d bytes (-1: no NuttX stack coloration) buffers=%u bytes",
+             job.stack_used, kTaskStackBytes, static_cast<unsigned>(sizeof(ofnav15::WorkloadBuffers)));
+    delete job.buffers;
+    job.buffers = nullptr;
+    return ok ? 0 : -1;
+}
+
 static float safe_div(float n, uint32_t dt_us) noexcept
 {
     if (dt_us == 0U) {
@@ -62,7 +208,7 @@ static float safe_div(float n, uint32_t dt_us) noexcept
 
 static bool finite(float v) noexcept
 {
-    return std::isfinite(v);
+    return ofnav::isFiniteValue(v);
 }
 
 static void quat_to_euler(const float q[4], float &roll, float &pitch, float &yaw) noexcept
@@ -74,20 +220,20 @@ static void quat_to_euler(const float q[4], float &roll, float &pitch, float &ya
 
     const float sinr_cosp = 2.0f * (qw * qx + qy * qz);
     const float cosr_cosp = 1.0f - 2.0f * (qx * qx + qy * qy);
-    roll = std::atan2(sinr_cosp, cosr_cosp);
+    roll = atan2f(sinr_cosp, cosr_cosp);
 
     const float sinp = 2.0f * (qw * qy - qz * qx);
 
-    if (std::fabs(sinp) >= 1.0f) {
-        pitch = std::copysign(ofnav::kPi / 2.0f, sinp);
+    if (fabsf(sinp) >= 1.0f) {
+        pitch = (sinp > 0.0f) ? ofnav::kPi / 2.0f : -ofnav::kPi / 2.0f;
 
     } else {
-        pitch = std::asin(sinp);
+        pitch = asinf(sinp);
     }
 
     const float siny_cosp = 2.0f * (qw * qz + qx * qy);
     const float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
-    yaw = std::atan2(siny_cosp, cosy_cosp);
+    yaw = atan2f(siny_cosp, cosy_cosp);
 }
 
 static bool parse_profile(const char *text, ofnav::SensorProfile &profile) noexcept
@@ -126,7 +272,7 @@ public:
     {
         // The 15-state ESKF runs as a DIAGNOSTIC estimator in this task.
         // Its output goes to debug_vect only, never to EKF2 or control.
-        _eskf.configure(ofnav::EskfRunnerConfig{}, &px4_clock);
+        _eskf.configure(eskf_config(), &px4_clock);
         _actions_enabled = actions_enabled;
 
         if (!eskf_enabled) {
@@ -141,6 +287,7 @@ public:
         if (_imu_sub >= 0) { orb_unsubscribe(_imu_sub); }
         if (_att_sub >= 0) { orb_unsubscribe(_att_sub); }
         if (_status_sub >= 0) { orb_unsubscribe(_status_sub); }
+        if (_land_sub >= 0) { orb_unsubscribe(_land_sub); }
     }
 
     static int task_spawn(int argc, char *argv[])
@@ -231,6 +378,22 @@ public:
 
     static int custom_command(int argc, char *argv[])
     {
+        if (argc == 1 && std::strcmp(argv[0], "bench") == 0) {
+            return run_bench();
+        }
+
+#if defined(__PX4_POSIX)
+
+        if (argc == 2 && std::strcmp(argv[0], "fault") == 0) {
+            g_fault_flow = std::strcmp(argv[1], "flow") == 0;
+            g_fault_range = std::strcmp(argv[1], "range") == 0;
+            PX4_INFO("OFNAV_FAULT flow=%u range=%u", static_cast<unsigned>(g_fault_flow),
+                     static_cast<unsigned>(g_fault_range));
+            return 0;
+        }
+
+#endif
+
 #if defined(__PX4_POSIX)
         if ((argc == 2 || argc == 3) && std::strcmp(argv[0], "sitl-replay") == 0) {
             ofnav::SensorProfile profile = ofnav::SensorProfile::OpticalFlowSensor;
@@ -300,9 +463,11 @@ Fusion output is not supported. The -e option is intentionally rejected.
         PRINT_MODULE_USAGE_PARAM_FLAG('a', "Send safety actions as vehicle_command while armed (SITL/bench first)", true);
         PRINT_MODULE_USAGE_PARAM_FLAG('e', "Reserved: reject unsupported EKF2 velocity fusion until validated 3D velocity exists", true);
         PRINT_MODULE_USAGE_COMMAND("stop");
+        PRINT_MODULE_USAGE_COMMAND_DESCR("bench", "Run the worst-case ESKF workload on this CPU: time, load, stack");
         PRINT_MODULE_USAGE_COMMAND("status");
 #if defined(__PX4_POSIX)
         PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-replay", "<csv> [flow|camera]: read a synthetic sensor CSV through C++ diagnostics only; no uORB publish, EKF2 or control");
+        PRINT_MODULE_USAGE_COMMAND_DESCR("fault", "flow|range|none: SITL-only input masking for failure scenarios");
         PRINT_MODULE_USAGE_COMMAND_DESCR("sitl-eskf", "<csv>: run the 15-state fixed-lag ESKF on a synthetic IMU+VO stream inside PX4; no uORB publish");
 #endif
         return 0;
@@ -315,11 +480,30 @@ Fusion output is not supported. The -e option is intentionally rejected.
                  _rate_hz,
                  static_cast<unsigned>(_min_quality),
                  _strict_downward_range ? "true" : "false");
-        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu",
+        PX4_INFO("samples=%lu accepted=%lu degraded=%lu failsafe=%lu sim_placeholders=%lu",
                  static_cast<unsigned long>(_samples),
                  static_cast<unsigned long>(_accepted),
                  static_cast<unsigned long>(_degraded),
-                 static_cast<unsigned long>(_failsafe));
+                 static_cast<unsigned long>(_failsafe),
+                 static_cast<unsigned long>(_flow_placeholders));
+#if defined(OFNAV_STACK_MONITOR)
+        PX4_INFO("task stack min free=%ld of %d bytes", _stack_free_min, kTaskStackBytes);
+#endif
+        for (unsigned r = 0; r < kReasonSlots; ++r) {
+            if (_reasons[r] != 0U) {
+                PX4_INFO("flow reason %s: %lu", ofnav::toString(static_cast<ofnav::RejectReason>(r)),
+                         static_cast<unsigned long>(_reasons[r]));
+            }
+        }
+
+        PX4_INFO("last flow raw=(%.4f %.4f) gyro=(%.4f %.4f) dt=%.3f q=%u h=%.2f v_nav=(%.3f %.3f) ekf v=(%.3f %.3f) vel_resets=%lu",
+                 static_cast<double>(_last_flow.integrated_x_rad), static_cast<double>(_last_flow.integrated_y_rad),
+                 static_cast<double>(_last_flow.integrated_xgyro_rad), static_cast<double>(_last_flow.integrated_ygyro_rad),
+                 static_cast<double>(_last_flow.integration_time_s), static_cast<unsigned>(_last_flow.quality), static_cast<double>(_last_out.flow.height_m),
+                 static_cast<double>(_last_out.flow.velocity_nav_m_s.x), static_cast<double>(_last_out.flow.velocity_nav_m_s.y),
+                 static_cast<double>(_last_out.state.vn_m_s), static_cast<double>(_last_out.state.ve_m_s),
+                 static_cast<unsigned long>(_runtime.velocityResets()));
+        PX4_INFO("safety engaged=%u", static_cast<unsigned>(_safety.engaged()));
         PX4_INFO("safety action=%s reason=%s commands=%s sent=%lu",
                  ofnav::toString(_last_decision.action), ofnav::toString(_last_decision.reason),
                  _actions_enabled ? "armed-only" : "advisory", static_cast<unsigned long>(_commands_sent));
@@ -355,6 +539,7 @@ Fusion output is not supported. The -e option is intentionally rejected.
         _imu_sub = orb_subscribe(ORB_ID(vehicle_imu));
         _att_sub = orb_subscribe(ORB_ID(vehicle_attitude));
         _status_sub = orb_subscribe(ORB_ID(vehicle_status));
+        _land_sub = orb_subscribe(ORB_ID(vehicle_land_detected));
 
         if (_flow_sub < 0 || _range_sub < 0 || _imu_sub < 0 || _att_sub < 0) {
             PX4_ERR("failed to subscribe to required uORB topics");
@@ -362,7 +547,8 @@ Fusion output is not supported. The -e option is intentionally rejected.
         }
 
         orb_set_interval(_flow_sub, static_cast<unsigned>(1000U / _rate_hz));
-        orb_set_interval(_imu_sub, static_cast<unsigned>(1000U / _rate_hz));
+        // vehicle_imu is NOT rate-limited: every delta-angle packet is needed
+        // for the gyro record of flow sensors without a gyro and for the ESKF.
 
         px4_pollfd_struct_t fds[2]{};
         fds[0].fd = _flow_sub;
@@ -394,7 +580,26 @@ Fusion output is not supported. The -e option is intentionally rejected.
             orb_check(_imu_sub, &imu_updated);
             orb_check(_att_sub, &att_updated);
 
-            if (flow_updated) { orb_copy(ORB_ID(sensor_optical_flow), _flow_sub, &flow_msg); }
+            if (flow_updated) {
+                orb_copy(ORB_ID(sensor_optical_flow), _flow_sub, &flow_msg);
+                // Gazebo flow plugin (PX4 OpticalFlow library limitRate):
+                // a frame that is not yet published comes with quality -1
+                // (255 in uORB) and its single-frame flow, which is ALSO
+                // summed into the next published sample, whose timespan
+                // covers only its own frame. Merge the placeholder's
+                // timespan into the next sample and never fuse it.
+                const bool sim = ((flow_msg.device_id >> 16) & 0xFFU) == DRV_FLOW_DEVTYPE_SIM;
+
+                if (sim && flow_msg.quality == 255U) {
+                    _flow_carry_us += flow_msg.integration_timespan_us;
+                    ++_flow_placeholders;
+                    flow_updated = false;
+
+                } else if (_flow_carry_us != 0U) {
+                    flow_msg.integration_timespan_us += _flow_carry_us;
+                    _flow_carry_us = 0U;
+                }
+            }
             if (range_updated) { orb_copy(ORB_ID(distance_sensor), _range_sub, &range_msg); }
             if (imu_updated) { orb_copy(ORB_ID(vehicle_imu), _imu_sub, &imu_msg); }
             if (att_updated) { orb_copy(ORB_ID(vehicle_attitude), _att_sub, &att_msg); }
@@ -404,10 +609,28 @@ Fusion output is not supported. The -e option is intentionally rejected.
 
             if (status_updated) { orb_copy(ORB_ID(vehicle_status), _status_sub, &_status_msg); }
 
+            bool land_updated = false;
+            orb_check(_land_sub, &land_updated);
+
+            if (land_updated) { orb_copy(ORB_ID(vehicle_land_detected), _land_sub, &_land_msg); }
+
             const uint64_t now_us = hrt_absolute_time();
+#if defined(OFNAV_STACK_MONITOR)
+
+            if (now_us - _last_stack_check_us > 1000000U) {
+                const long remain = static_cast<long>(up_check_tcbstack_remain(nxsched_self()));
+                _stack_free_min = (_stack_free_min < 0 || remain < _stack_free_min) ? remain : _stack_free_min;
+                _last_stack_check_us = now_us;
+            }
+
+#endif
             const auto imu = make_imu(imu_msg);
             const auto attitude = make_attitude(att_msg);
             if (imu_updated) {
+                // Gyro record for flow sensors without their own gyro.
+                _gyro.push(imu_msg.timestamp_sample,
+                {imu_msg.delta_angle[0], imu_msg.delta_angle[1], imu_msg.delta_angle[2]},
+                imu_msg.delta_angle_dt);
                 // Independent IMU prediction, regardless of optical-flow rate.
                 _runtime.predictImu(imu, attitude);
                 const bool att_fresh = att_msg.timestamp != 0U &&
@@ -422,7 +645,31 @@ Fusion output is not supported. The -e option is intentionally rejected.
                 {att_msg.q[0], att_msg.q[1], att_msg.q[2], att_msg.q[3]}, att_fresh);
                 publish_eskf(now_us);
             }
-            if (!flow_updated) {
+            if (flow_updated) {
+                if (!_flow_pending) { _flow_pending_since_us = now_us; }
+
+                _flow_pending = true;
+            }
+
+            bool flow_ready = false;
+
+            if (_flow_pending) {
+                if (flow_msg.delta_angle_available) {
+                    flow_ready = true;
+
+                } else {
+                    // Integrate vehicle gyro over (end - span, end]. If the
+                    // IMU record does not yet cover the end of the interval,
+                    // wait for the next IMU packet (at most 50 ms).
+                    const uint64_t t1 = flow_msg.timestamp_sample;
+                    const uint64_t t0 = t1 - flow_msg.integration_timespan_us;
+                    _flow_gyro_valid = flow_msg.integration_timespan_us > 0U && t1 > t0 &&
+                                       _gyro.integrate(t0, t1, _flow_gyro);
+                    flow_ready = _flow_gyro_valid || now_us > _flow_pending_since_us + 50000U;
+                }
+            }
+
+            if (!flow_ready) {
                 // A watchdog must keep running when optical flow stops.
                 if (now_us - _last_health_pub_us >= 100000U) {
                     const auto health = _runtime.monitor(now_us, imu,
@@ -435,11 +682,15 @@ Fusion output is not supported. The -e option is intentionally rejected.
                 continue;
             }
 
+            _flow_pending = false;
             const ofnav::RangeSample range = make_range(flow_msg, range_msg);
             const ofnav::OpticalFlowRadSample flow = make_flow(flow_msg);
 
             const ofnav::RuntimeOutput out = _runtime.step(imu, range, flow, attitude, now_us);
             ++_samples;
+            ++_reasons[static_cast<unsigned>(out.flow.reason) % kReasonSlots];
+            _last_out = out;
+            _last_flow = flow;
 
             if (out.flow.accepted) {
                 // Body-frame centre-of-mass velocity of this flow interval:
@@ -473,16 +724,26 @@ private:
         flow.integration_time_s = static_cast<float>(msg.integration_timespan_us) * 1.0e-6f;
         flow.integrated_x_rad = msg.pixel_flow[0];
         flow.integrated_y_rad = msg.pixel_flow[1];
-        // A zero gyro correction is NOT valid when the sensor has no gyro.
-        // Separate IMU integration over the camera exposure is required for that case.
-        flow.integrated_xgyro_rad = msg.delta_angle_available ? msg.delta_angle[0] : NAN;
-        flow.integrated_ygyro_rad = msg.delta_angle_available ? msg.delta_angle[1] : NAN;
-        flow.integrated_zgyro_rad = msg.delta_angle_available ? msg.delta_angle[2] : NAN;
+        // A zero gyro correction is NOT valid when the sensor has no gyro:
+        // then the vehicle gyro integrated over the same interval is used
+        // (sensor axes == body axes: pixel_flow is raw, SENS_FLOW_ROT=0).
+        const bool gyro = msg.delta_angle_available || _flow_gyro_valid;
+        flow.integrated_xgyro_rad = msg.delta_angle_available ? msg.delta_angle[0] :
+                                    (_flow_gyro_valid ? _flow_gyro.x : NAN);
+        flow.integrated_ygyro_rad = msg.delta_angle_available ? msg.delta_angle[1] :
+                                    (_flow_gyro_valid ? _flow_gyro.y : NAN);
+        flow.integrated_zgyro_rad = msg.delta_angle_available ? msg.delta_angle[2] :
+                                    (_flow_gyro_valid ? _flow_gyro.z : NAN);
         flow.quality = msg.quality;
         flow.valid = msg.timestamp_sample != 0U && msg.integration_timespan_us > 0U &&
-                     msg.delta_angle_available && finite(flow.integrated_x_rad) &&
+                     gyro && finite(flow.integrated_x_rad) &&
                      finite(flow.integrated_y_rad) && finite(flow.integrated_xgyro_rad) &&
                      finite(flow.integrated_ygyro_rad);
+#if defined(__PX4_POSIX)
+
+        if (g_fault_flow) { flow.valid = false; }
+
+#endif
         return flow;
     }
 
@@ -505,6 +766,11 @@ private:
         range.time_us = range_msg.timestamp;
         range.distance_m = range_msg.current_distance;
         range.valid = range_msg.timestamp != 0U && orientation_ok && distance_ok;
+#if defined(__PX4_POSIX)
+
+        if (g_fault_range) { range.valid = false; }
+
+#endif
         return range;
     }
 
@@ -575,7 +841,18 @@ private:
 
     void handle_safety(const ofnav::RuntimeOutput &out, uint64_t now_us)
     {
-        _last_decision = _safety.update(out.mode, now_us);
+        const bool armed_now = _status_msg.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+
+        if (armed_now && !_was_armed) {
+            // Pre-flight conditions (e.g. range below the envelope on the
+            // ground) must not latch an in-flight action.
+            _safety.reset();
+        }
+
+        _was_armed = armed_now;
+        // Unknown land state (never published) counts as on the ground.
+        const bool in_air = armed_now && _land_msg.timestamp != 0U && !_land_msg.landed;
+        _last_decision = _safety.update(out.mode, now_us, in_air);
         debug_vect_s action{};
         action.timestamp = now_us;
         set_debug_name(action, "OFNAV_A");
@@ -675,7 +952,23 @@ private:
     int _att_sub{-1};
 
     bool _actions_enabled{false};
+    bool _was_armed{false};
+    static constexpr unsigned kReasonSlots = 16U;
+    uint32_t _reasons[kReasonSlots] {};
+    ofnav::RuntimeOutput _last_out{};
+    uint32_t _flow_carry_us{0U};
+    uint32_t _flow_placeholders{0U};
+    ofnav::OpticalFlowRadSample _last_flow{};
+    ofnav::GyroIntegrator _gyro{};
+    ofnav::Vector3f _flow_gyro{};
+    bool _flow_gyro_valid{false};
+    bool _flow_pending{false};
+    uint64_t _flow_pending_since_us{0U};
+    long _stack_free_min{-1};
+    uint64_t _last_stack_check_us{0U};
     int _status_sub{-1};
+    int _land_sub{-1};
+    vehicle_land_detected_s _land_msg{};
     vehicle_status_s _status_msg{};
     ofnav::SafetyActionManager _safety{};
     ofnav::SafetyDecision _last_decision{};

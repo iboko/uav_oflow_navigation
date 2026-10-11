@@ -12,6 +12,7 @@ px4_add_module(
         ofnav_core/src/ofnav.cpp
         ofnav_core/src/eskf15.cpp
         ofnav_core/src/eskf_runner.cpp
+        ofnav_core/src/eskf15_workload.cpp
     INCLUDES
         ofnav_core/include
     DEPENDS

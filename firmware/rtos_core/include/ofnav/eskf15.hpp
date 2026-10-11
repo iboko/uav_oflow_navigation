@@ -1,9 +1,8 @@
 #pragma once
 
-#include <array>
+#include "ofnav/compat.hpp"
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 
 // Research-only 15-state error-state inertial filter and bounded fixed-lag
 // replay. No PX4 uORB, EKF2, controller or actuator APIs in this header.
@@ -11,9 +10,12 @@
 // Right orientation error: Rtrue = Rnom Exp([dtheta]x).
 namespace ofnav15 {
 
-using Vec3 = std::array<double, 3>;
-using Quat = std::array<double, 4>;
-using Matrix15 = std::array<double, 225>;
+using ofnav::Array;
+using ofnav::kQuietNaN;
+
+using Vec3 = Array<double, 3>;
+using Quat = Array<double, 4>;
+using Matrix15 = Array<double, 225>;
 
 struct Imu {
     std::uint64_t time_us{0};
@@ -23,8 +25,8 @@ struct Imu {
 
 struct Visual {
     std::uint64_t time_us{0};
-    std::array<double, 2> velocity_ne_m_s{};
-    std::array<double, 4> covariance_ne_m2_s2{0.04, 0., 0., 0.04};
+    Array<double, 2> velocity_ne_m_s{};
+    Array<double, 4> covariance_ne_m2_s2{0.04, 0., 0., 0.04};
 };
 
 // Aiding measurement kinds. The numeric order is the deterministic
@@ -44,9 +46,9 @@ constexpr std::size_t kMeasurementKinds = 5;
 struct Measurement {
     std::uint64_t time_us{0};
     MeasurementKind kind{MeasurementKind::VelocityNe};
-    std::array<double, 2> value{};
+    Array<double, 2> value{};
     // 2x2 row-major covariance; a scalar yaw uses only element [0].
-    std::array<double, 4> covariance{0.04, 0., 0., 0.04};
+    Array<double, 4> covariance{0.04, 0., 0., 0.04};
     // Covariance-intersection weight for an estimate whose error
     // correlation with the filter is UNKNOWN (orthophoto fix computed
     // from the same frames as VO). 1: independent, standard update.
@@ -55,7 +57,7 @@ struct Measurement {
     double ci_weight{1.};
     // MapGroundPointNe only: [height above ground plane along NED down, m;
     // optical axis unit vector in FRD body axes x, y, z].
-    std::array<double, 4> aux{0., 0., 0., 1.};
+    Array<double, 4> aux{0., 0., 0., 1.};
 };
 
 [[nodiscard]] Measurement fromVisual(const Visual &visual) noexcept;
@@ -64,7 +66,7 @@ struct Parameters {
     Quat initial_quaternion_body_to_ned{1., 0., 0., 0.};
     Vec3 initial_gyro_bias_rad_s{};
     Vec3 initial_accel_bias_m_s2{};
-    std::array<double, 15> initial_sigma{
+    Array<double, 15> initial_sigma{
         10., 10., 10., 1., 1., 1., .1, .1, .1,
         .02, .02, .02, .2, .2, .2
     };
@@ -139,9 +141,9 @@ const char *statusName(Status value) noexcept;
 // filter runs inside a small RTOS task stack (see docs/ESKF15_PX4_RUNTIME_RU.md).
 // Not shared between threads; one workspace per executing thread.
 struct Workspace {
-    std::array<Matrix15, 8> m{};
-    std::array<double, 225> cholesky{};
-    std::array<double, 180> noise_map{};
+    Array<Matrix15, 8> m{};
+    Array<double, 225> cholesky{};
+    Array<double, 180> noise_map{};
     // Measurement update scratch (n <= 2 rows).
     double h[2][15]{};
     double pht[15][2]{};
@@ -155,11 +157,14 @@ public:
     // Re-initialize in place (no temporary Filter on the stack).
     void reset(const Parameters &config) noexcept;
 
-    // Host convenience overloads: they place a Workspace (~16 KiB) on the
-    // stack. RTOS code must use the explicit-workspace overloads.
+#if !defined(__PX4_NUTTX)
+    // Host convenience overloads: they place a Workspace (~18 KiB) on the
+    // stack, so they are compiled out of NuttX flight builds (PX4 enforces
+    // -Wframe-larger-than=4096). RTOS code uses the explicit-workspace API.
     [[nodiscard]] Status predict(const Imu &sample) noexcept;
     [[nodiscard]] Status updateVelocity(const Visual &sample) noexcept;
     [[nodiscard]] Status update(const Measurement &sample) noexcept;
+#endif
 
     [[nodiscard]] Status predict(const Imu &sample, Workspace &ws) noexcept;
     [[nodiscard]] Status update(const Measurement &sample, Workspace &ws) noexcept;
@@ -185,8 +190,8 @@ private:
     Quat q_{1., 0., 0., 0.};
     Matrix15 p_cov_{};
     Imu last_{};
-    std::array<std::uint64_t, kMeasurementKinds> last_measurement_us_{};
-    double nis_{std::numeric_limits<double>::quiet_NaN()};
+    Array<std::uint64_t, kMeasurementKinds> last_measurement_us_{};
+    double nis_{kQuietNaN};
     double ci_weight_{1.};
     unsigned accepted_{0}, rejected_{0};
     bool has_imu_{false};
@@ -209,8 +214,8 @@ class FixedLag {
 public:
     static constexpr std::size_t kImuCapacity = 64;
     static constexpr std::size_t kVisualCapacity = 32;
-    static constexpr std::size_t kSnapshots = 4;
-    static constexpr std::size_t kSnapshotStride = 12;
+    static constexpr std::size_t kSnapshots = 10;
+    static constexpr std::size_t kSnapshotStride = 4;
     static constexpr std::size_t kMaxFrameEvents = kMeasurementKinds;
 
     explicit FixedLag(const Parameters &parameters = Parameters{},
@@ -248,6 +253,7 @@ private:
                                    std::uint64_t watch_time, Status *watch_status,
                                    bool refresh_snapshots) noexcept;
     void trim() noexcept;
+    void dropBefore(std::size_t samples) noexcept;
     void invalidateSnapshotsFrom(std::uint64_t time_us) noexcept;
 
     Parameters parameters_{};
@@ -259,13 +265,13 @@ private:
     Filter replay_;
     Imu checkpoint_imu_{};
     bool initialized_{false}, failed_{false};
-    std::array<Imu, kImuCapacity> imu_{};
+    Array<Imu, kImuCapacity> imu_{};
     std::size_t count_{0};
-    std::array<Measurement, kVisualCapacity> visual_{};
-    std::array<Measurement, kVisualCapacity> candidate_{};
-    std::array<Measurement, kMaxFrameEvents> batch_{};
+    Array<Measurement, kVisualCapacity> visual_{};
+    Array<Measurement, kVisualCapacity> candidate_{};
+    Array<Measurement, kMaxFrameEvents> batch_{};
     std::size_t visual_count_{0};
-    std::array<Snapshot, kSnapshots> snapshots_{};
+    Array<Snapshot, kSnapshots> snapshots_{};
     std::size_t since_snapshot_{0};
     std::size_t last_replay_length_{0};
     Workspace ws_{};

@@ -1,13 +1,12 @@
 #pragma once
 
-#include <array>
+#include "ofnav/compat.hpp"
 #include <cstdint>
-#include <limits>
 
 namespace ofnav {
 
 constexpr float kPi = 3.14159265358979323846F;
-constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
+constexpr float kNaN = kQuietNaNf;
 
 struct Vector2f {
     float x{0.0F};
@@ -21,7 +20,7 @@ struct Vector3f {
 };
 
 struct Matrix3f {
-    std::array<float, 9> data{1.0F, 0.0F, 0.0F,
+    Array<float, 9> data{1.0F, 0.0F, 0.0F,
                               0.0F, 1.0F, 0.0F,
                               0.0F, 0.0F, 1.0F};
 
@@ -112,6 +111,10 @@ struct SafetyActionConfig {
     uint64_t degraded_confirm_us{300000U};   // DEGRADED_HOLD must persist
     uint64_t degraded_to_land_us{5000000U};  // unrecovered degradation -> land
     uint64_t recovery_us{1000000U};          // healthy FLOW_NAV clears hold
+    // Act only after flow navigation was established in this flight
+    // (FLOW_NAV for recovery_us while in air): before that there is no
+    // navigation to lose (ground, takeoff below the sensor envelope).
+    bool require_engagement{true};
 };
 
 enum class SafetyReason : uint8_t {
@@ -121,7 +124,9 @@ enum class SafetyReason : uint8_t {
     FailsafeConfirmed,
     ManualRequested,
     Recovered,
-    NonMonotonicTime
+    NonMonotonicTime,
+    OnGround,
+    NotEngaged
 };
 
 struct SafetyDecision {
@@ -197,6 +202,12 @@ struct Config {
     float flow_vel_sigma_quality_gain_m_s{0.18F};
     float flow_vel_sigma_height_gain_m_s{0.025F};
     float innovation_gate_2d{9.21F};
+    // Inertial-only time after which a gate-rejected but otherwise valid
+    // flow velocity re-initialises the EKF velocity (EKF2-style aiding
+    // reset): unaided accelerometer integration drifts by metres per
+    // second while its covariance stays optimistic, which would otherwise
+    // lock the innovation gate shut for good. 0 disables the reset.
+    uint64_t velocity_reset_timeout_us{1000000U};
 
     float max_integration_time_s{0.20F};
     // If > 0: sigma_v^2 = sigma_min^2 + (h*sigma_flow)^2 + (|v|*sigma_h_rel)^2,
@@ -243,6 +254,9 @@ public:
     void reset(uint64_t time_us) noexcept;
     void predict(const ImuSample& imu, const AttitudeSample& attitude) noexcept;
     [[nodiscard]] bool updateFlowVelocity(const FlowVelocityEstimate& flow, uint8_t quality) noexcept;
+    // Replaces the velocity by a measurement; velocity cross-covariances
+    // are cleared, position and accelerometer bias are kept.
+    bool resetVelocity(const FlowVelocityEstimate& flow) noexcept;
 
     [[nodiscard]] EkfState state() const noexcept { return x_; }
     [[nodiscard]] bool healthy() const noexcept { return prediction_healthy_; }
@@ -252,8 +266,8 @@ public:
     }
 
 private:
-    using Matrix6 = std::array<std::array<float, 6>, 6>;
-    using Matrix6x2 = std::array<std::array<float, 2>, 6>;
+    using Matrix6 = Array<Array<float, 6>, 6>;
+    using Matrix6x2 = Array<Array<float, 2>, 6>;
 
     Config cfg_{};
     EkfState x_{};
@@ -283,6 +297,32 @@ private:
     Config cfg_{};
 };
 
+// Integrates vehicle gyro delta angles over an optical-flow integration
+// interval for sensors without their own gyro (PAW3902-class, Gazebo).
+// Only an interval FULLY covered by stored IMU packets is integrated;
+// partial packets are prorated linearly. No interval -> no compensation
+// (the flow sample is then rejected, never compensated with zeros).
+class GyroIntegrator final {
+public:
+    static constexpr uint32_t kCapacity = 96U;  // > 0.35 s at 250 Hz
+
+    void reset() noexcept { count_ = 0U; head_ = 0U; }
+    // Packet covering (end_us - dt_us, end_us], delta angle in body FRD.
+    void push(uint64_t end_us, const Vector3f& delta_angle_rad, uint32_t dt_us) noexcept;
+    [[nodiscard]] bool integrate(uint64_t start_us, uint64_t end_us,
+                                 Vector3f& delta_angle_rad) const noexcept;
+
+private:
+    struct Packet {
+        uint64_t end_us{0U};
+        uint32_t dt_us{0U};
+        Vector3f angle{};
+    };
+    Packet packets_[kCapacity]{};
+    uint32_t count_{0U};
+    uint32_t head_{0U};  // next write position
+};
+
 // Debounced, escalating and latching mapping NavMode -> SafetyAction.
 // Land and ManualTakeover are latched until reset() (pilot / ground crew).
 // AltitudeHold clears to None only after recovery_us of healthy FLOW_NAV;
@@ -292,8 +332,12 @@ public:
     explicit SafetyActionManager(SafetyActionConfig cfg = SafetyActionConfig{}) noexcept
         : cfg_(cfg) {}
 
-    [[nodiscard]] SafetyDecision update(NavMode mode, uint64_t now_us) noexcept;
+    // in_air: vehicle not landed (PX4 vehicle_land_detected). On the ground
+    // the manager is reset and requests nothing.
+    [[nodiscard]] SafetyDecision update(NavMode mode, uint64_t now_us,
+                                        bool in_air = true) noexcept;
     void reset() noexcept;
+    [[nodiscard]] bool engaged() const noexcept { return engaged_; }
     [[nodiscard]] SafetyAction action() const noexcept { return action_; }
 
 private:
@@ -308,6 +352,7 @@ private:
     uint64_t last_us_{0U};
     bool started_{false};
     bool degraded_episode_{false};
+    bool engaged_{false};
 };
 
 [[nodiscard]] const char* toString(SafetyAction action) noexcept;
@@ -333,9 +378,14 @@ public:
                                         const RangeSample& range,
                                         const OpticalFlowRadSample& flow,
                                         const AttitudeSample& attitude) noexcept;
+    [[nodiscard]] uint32_t velocityResets() const noexcept { return velocity_resets_; }
 private:
     FlowVelocityEstimate last_flow_estimate_{};
     bool last_innovation_ok_{false};
+    // Last accepted flow fusion, or the start of aiding (reset / first
+    // measurement): the unaided interval for the velocity reset.
+    uint64_t last_fusion_us_{0U};
+    uint32_t velocity_resets_{0U};
     Config cfg_{};
     FlowVelocityEstimator flow_estimator_;
     HorizontalEkf ekf_;

@@ -1,6 +1,5 @@
 #include "ofnav/eskf_runner.hpp"
 
-#include <algorithm>
 #include <cmath>
 
 namespace ofnav {
@@ -14,7 +13,7 @@ double yawFromQuaternion(const ofnav15::Quat &q) noexcept {
 bool finiteQuat(const ofnav15::Quat &q) noexcept {
     double n = 0.;
     for (double x : q) {
-        if (!std::isfinite(x)) { return false; }
+        if (!isFiniteValue(x)) { return false; }
         n += x * x;
     }
     return n > .64 && n < 1.44;
@@ -28,9 +27,9 @@ EskfRunner::EskfRunner(const EskfRunnerConfig &config, Clock clock) noexcept {
 
 void EskfRunner::configure(const EskfRunnerConfig &config, Clock clock) noexcept {
     config_ = config;
-    config_.alignment_samples = std::min(std::max<std::size_t>(config_.alignment_samples, 2U),
+    config_.alignment_samples = minOf(maxOf<std::size_t>(config_.alignment_samples, 2U),
                                          kMaxAlignmentSamples);
-    config_.alignment.min_samples = std::min(config_.alignment.min_samples,
+    config_.alignment.min_samples = minOf(config_.alignment.min_samples,
                                              config_.alignment_samples);
     clock_ = clock;
     stats_ = EskfRunnerStats{};
@@ -71,9 +70,9 @@ void EskfRunner::addImuDelta(uint64_t time_us, const ofnav15::Vec3 &dang,
                              const ofnav15::Quat &external_q,
                              bool external_q_valid) noexcept {
     if (mode_ == EskfRunnerMode::Disabled) { return; }
-    const bool finite = std::isfinite(dang[0]) && std::isfinite(dang[1]) &&
-                        std::isfinite(dang[2]) && std::isfinite(dvel[0]) &&
-                        std::isfinite(dvel[1]) && std::isfinite(dvel[2]);
+    const bool finite = isFiniteValue(dang[0]) && isFiniteValue(dang[1]) &&
+                        isFiniteValue(dang[2]) && isFiniteValue(dvel[0]) &&
+                        isFiniteValue(dvel[1]) && isFiniteValue(dvel[2]);
     if (clipping || !finite || dang_dt_us == 0U || dvel_dt_us == 0U ||
         time_us <= last_packet_us_) {
         // Saturated or inconsistent inertial data cannot be integrated.
@@ -143,7 +142,7 @@ void EskfRunner::emitImu(const ofnav15::Imu &sample, const ofnav15::Quat &extern
     const uint64_t elapsed = now() - start;
     ++stats_.imu_samples;
     stats_.imu_total_us += elapsed;
-    stats_.imu_worst_us = std::max(stats_.imu_worst_us, elapsed);
+    stats_.imu_worst_us = maxOf(stats_.imu_worst_us, elapsed);
     if (lag_.failed() || !lag_.current().healthy()) {
         ++stats_.filter_restarts;
         restart();
@@ -161,8 +160,8 @@ void EskfRunner::pushVelocity(const ofnav15::Measurement &m) noexcept {
     (void)lag_.pushDelayedFrame(&m, 1U, &status);
     const uint64_t elapsed = now() - start;
     stats_.frame_total_us += elapsed;
-    stats_.frame_worst_us = std::max(stats_.frame_worst_us, elapsed);
-    stats_.max_replay_length = std::max(stats_.max_replay_length, lag_.lastReplayLength());
+    stats_.frame_worst_us = maxOf(stats_.frame_worst_us, elapsed);
+    stats_.max_replay_length = maxOf(stats_.max_replay_length, lag_.lastReplayLength());
     stats_.last_status = status;
     if (ofnav15::measurementProcessed(status)) {
         ++stats_.velocity_processed;
@@ -175,7 +174,7 @@ void EskfRunner::addBodyVelocity(uint64_t time_us, double vx, double vy,
                                  double sigma) noexcept {
     if (mode_ != EskfRunnerMode::Running) { return; }
     ++stats_.velocity_events;
-    if (!std::isfinite(sigma) || !(sigma > 0.)) {
+    if (!isFiniteValue(sigma) || !(sigma > 0.)) {
         ++stats_.velocity_dropped;
         return;
     }

@@ -187,7 +187,10 @@ void test_fixed_memory_history_and_checkpoint_compaction() {
                static_cast<std::uint64_t>(10000*i)))==Status::InertialOnly);
         assert(lag.storedImu()<=FixedLag::kImuCapacity);
     }
-    assert(lag.storedImu()<=35U);
+    // The checkpoint jumps to snapshots: the window keeps at least the lag
+    // (30 samples) and at most lag + one snapshot stride.
+    assert(lag.storedImu()>=30U);
+    assert(lag.storedImu()<=31U+FixedLag::kSnapshotStride);
     assert(lag.pushDelayedVelocity(visual(2180000U,0.))==
            Status::VisualCorrected);
     assert(lag.current().timestamp()==2200000U);

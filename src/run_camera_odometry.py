@@ -57,6 +57,7 @@ def run_manifest(
     attitude_log: str | Path | None = None,
     camera_to_attitude_offset_us: int = 0,
     max_attitude_gap_us: int = 25000,
+    max_tilt_rad: float = 0.15,
 ) -> dict:
     manifest = Path(manifest)
     output_dir = Path(output_dir)
@@ -93,6 +94,7 @@ def run_manifest(
     odom = ContinuousPlanarOdometry(
         camera, camera_mount=mount, camera_offset_body_m=lever,
         velocity_error_assumptions=velocity_errors,
+        max_tilt_rad=max_tilt_rad,
     )
     timeline = (
         AttitudeTimeline.from_csv(
@@ -241,12 +243,15 @@ def main() -> None:
                         help="t_ориентации = t_камеры + offset; оценить при калибровке")
     parser.add_argument("--max-attitude-gap-us", type=int, default=25000,
                         help="Максимальный интервал между соседними отсчетами ориентации")
+    parser.add_argument("--max-tilt-rad", type=float, default=0.15,
+                        help="Допустимый наклон кадра для плоской модели (не более 0,4 рад)")
     args = parser.parse_args()
     result = run_manifest(
         args.manifest, args.calibration, args.output_dir,
         attitude_log=args.attitude_log,
         camera_to_attitude_offset_us=args.camera_to_attitude_offset_us,
         max_attitude_gap_us=args.max_attitude_gap_us,
+        max_tilt_rad=args.max_tilt_rad,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

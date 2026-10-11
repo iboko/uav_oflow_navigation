@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  tools/install_px4_ofnav_module.sh <PX4-Autopilot-path> [board_config]
+  tools/install_px4_ofnav_module.sh [--multicopter-only] <PX4-Autopilot-path> [board_config]
 
 Examples:
   tools/install_px4_ofnav_module.sh ../PX4-Autopilot boards/px4/sitl/default.px4board
@@ -19,8 +19,18 @@ It also copies the RTOS core into:
 If src/modules/CMakeLists.txt exists, the script appends add_subdirectory(ofnav) when missing.
 If src/modules/Kconfig exists, the script appends the ofnav Kconfig source when missing.
 If board_config is provided, CONFIG_MODULES_OFNAV=y is appended when missing.
+
+--multicopter-only additionally disables the fixed-wing and VTOL modules in
+board_config. Full flight boards have no flash left for ofnav otherwise:
+px4_fmu-v6x with the PX4 toolchain (GCC 10.3) overflows by ~19 KB.
 USAGE
 }
+
+MULTICOPTER_ONLY=0
+if [[ "${1:-}" == "--multicopter-only" ]]; then
+  MULTICOPTER_ONLY=1
+  shift
+fi
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
@@ -58,6 +68,7 @@ cp -R "$CORE_SRC/include/ofnav" "$MODULE_DST/ofnav_core/include/"
 cp "$CORE_SRC/src/ofnav.cpp" "$MODULE_DST/ofnav_core/src/ofnav.cpp"
 cp "$CORE_SRC/src/eskf15.cpp" "$MODULE_DST/ofnav_core/src/eskf15.cpp"
 cp "$CORE_SRC/src/eskf_runner.cpp" "$MODULE_DST/ofnav_core/src/eskf_runner.cpp"
+cp "$CORE_SRC/src/eskf15_workload.cpp" "$MODULE_DST/ofnav_core/src/eskf15_workload.cpp"
 
 MODULES_CMAKE="$PX4_DIR/src/modules/CMakeLists.txt"
 if [[ -f "$MODULES_CMAKE" ]] && ! grep -q "add_subdirectory(ofnav)" "$MODULES_CMAKE"; then
@@ -82,6 +93,18 @@ if [[ -n "$BOARD_CONFIG" ]]; then
     printf '\n# UAV optical-flow navigation monitor\nCONFIG_MODULES_OFNAV=y\n' >> "$BOARD_CONFIG_PATH"
     echo "Enabled module in: $BOARD_CONFIG_PATH"
   fi
+
+  if [[ "$MULTICOPTER_ONLY" == 1 ]]; then
+    for option in CONFIG_MODULES_FW_ATT_CONTROL CONFIG_MODULES_FW_AUTOTUNE_ATTITUDE_CONTROL \
+                  CONFIG_MODULES_FW_POS_CONTROL CONFIG_MODULES_FW_RATE_CONTROL \
+                  CONFIG_MODULES_VTOL_ATT_CONTROL CONFIG_MODE_NAVIGATOR_VTOL_TAKEOFF; do
+      sed -i "s/^${option}=y$/${option}=n/" "$BOARD_CONFIG_PATH"
+    done
+    echo "Disabled fixed-wing/VTOL modules in: $BOARD_CONFIG_PATH"
+  fi
+elif [[ "$MULTICOPTER_ONLY" == 1 ]]; then
+  echo "--multicopter-only requires board_config" >&2
+  exit 1
 fi
 
 echo "Installed ofnav PX4 module into: $MODULE_DST"
