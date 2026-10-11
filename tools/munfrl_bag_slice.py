@@ -236,7 +236,15 @@ def main() -> None:
 
     def ref(t_bag: float):
         tu = t_bag - bag_minus_utc
-        lat, lon, hh, q = (np.interp(tu, ppk[:, 0], ppk[:, i]) for i in (1, 2, 3, 4))
+        lat, lon, hh = (np.interp(tu, ppk[:, 0], ppk[:, i]) for i in (1, 2, 3))
+        # RTKLIB Q is categorical: only bracketed fixed solutions count.
+        j = int(np.searchsorted(ppk[:, 0], tu, side="left"))
+        if j == 0 or j >= len(ppk):
+            q = 0
+        else:
+            a, b = ppk[j - 1], ppk[j]
+            q = (1 if int(a[4]) == 1 and int(b[4]) == 1
+                 and b[0] - a[0] <= 1.0 else 0)
         return (math.radians(lat - lat0) * r_m, math.radians(lon - lon0) * r_n * math.cos(math.radians(lat0)),
                 hh - takeoff_h, q)
 
