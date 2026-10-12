@@ -39,7 +39,8 @@ class OrthoNccLocalizer:
                  mount: CameraMountCalibration, *, camera_offset_body_m=(0.0, 0.0, 0.0),
                  patch_m: float = 30.0, min_peak: float = 0.35, min_margin: float = 0.05,
                  exclusion_m: float = 3.0, max_tilt_rad: float = 0.12,
-                 yaw_search_deg=tuple(float(x) for x in range(-12, 13, 2))) -> None:
+                 yaw_search_deg=tuple(float(x) for x in range(-12, 13, 2)),
+                 map_clahe_tile_m: float = 8.75) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -72,6 +73,14 @@ class OrthoNccLocalizer:
         self.max_tilt = max_tilt_rad
         self.yaw_search = tuple(np.radians(yaw_search_deg))
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # The map is equalised once, with tiles of a fixed ground size. It
+        # was equalised per search window: the result then depended on the
+        # search radius (same place, 20 m window: peak 0.514, margin 0.086;
+        # 10 m window after lock: 0.466 and 0.047 -> ambiguous; swiss test).
+        # 8.75 m = the tile of the 20 m window used for the calibration.
+        tiles = (max(1, int(round(gray.shape[0] * self.gsd / map_clahe_tile_m))),
+                 max(1, int(round(gray.shape[1] * self.gsd / map_clahe_tile_m))))
+        self.map_eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=tiles).apply(gray)
         self.last_peak = float("nan")
         self.last_margin = float("nan")
 
@@ -119,7 +128,7 @@ class OrthoNccLocalizer:
         r0, c0 = int(round(row)) - rad, int(round(col)) - rad
         if r0 < 0 or c0 < 0 or r0 + 2 * rad > self.map.shape[0] or c0 + 2 * rad > self.map.shape[1]:
             return MapLocalizationFix(False, "OUTSIDE_MAP")
-        window = self.clahe.apply(self.map[r0:r0 + 2 * rad, c0:c0 + 2 * rad])
+        window = self.map_eq[r0:r0 + 2 * rad, c0:c0 + 2 * rad]
         # Search over heading offsets (+-12 deg): with a 4 deg autopilot
         # heading error the correlation lost its margin in SITL; at 6-7 deg the
         # +-6 deg search left the map unmatched after lock. The heading is a
