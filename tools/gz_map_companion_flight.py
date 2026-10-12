@@ -280,7 +280,7 @@ def main() -> None:
     ap.add_argument("px4_dir", type=Path)
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
     ap.add_argument("--ev-yaw", action="store_true",
-                    help="heading: send the map-referenced heading to EKF2 (EKF2_EV_CTRL bit 3)")
+                    help="send the map-referenced heading to EKF2 (EKF2_EV_CTRL bit 3) in any mode")
     ap.add_argument("--mag-decl-error-deg", type=float, default=12.0,
                     help="heading: declination error from boot (EKF2_DECL_TYPE=0), e.g. a wrong "
                          "declination or a magnetic disturbance at the take-off site")
@@ -310,7 +310,7 @@ def main() -> None:
     args = ap.parse_args()
     if args.mode in ("test", "heading") and not args.calibration:
         ap.error("--mode test/heading needs --calibration")
-    params = dict(PARAMS, EKF2_EV_CTRL="13") if args.mode == "heading" and args.ev_yaw else dict(PARAMS)
+    params = dict(PARAMS, EKF2_EV_CTRL="13") if args.ev_yaw else dict(PARAMS)
     if args.mode == "heading":
         # A 3D magnetometer with estimated earth field absorbs a declination
         # change made in flight within minutes (checked): the error must be

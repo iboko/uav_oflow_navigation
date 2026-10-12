@@ -27,6 +27,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -81,7 +82,8 @@ MSCKF_IMU_NOISE = ImuNoiseDensity(gyro_rad_s_sqrt_hz=0.004, accel_m_s2_sqrt_hz=0
 
 
 def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: KltTracker, t_frame: int,
-                      gray: np.ndarray, last_t: int, record=None) -> BodyVelocityMeasurement | None:
+                      gray: np.ndarray, last_t: int, record=None,
+                      variance_scale: tuple[float, float] | None = None) -> BodyVelocityMeasurement | None:
     """MSCKF output in the same form as the VO measurement (body-FRD velocity,
     N/E velocity in the autopilot heading frame for the map anchor)."""
     state = pipeline.state_at_camera_time(t_frame)
@@ -98,6 +100,9 @@ def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: Klt
     out = msckf.process(t_frame, feats, attitude_q=q, roll=roll, pitch=pitch, range_m=range_m)
     if out is None:
         return None
+    if variance_scale is not None:
+        sx, sz = variance_scale
+        out = replace(out, variance_frd=(sx * out.variance_frd[0], sx * out.variance_frd[1], sz * out.variance_frd[2]))
     r_nb = body_to_ned(roll, pitch, yaw)          # autopilot attitude, not the MSCKF heading
     v_ne = r_nb @ np.asarray(out.velocity_frd)
     cov_ne = r_nb @ np.diag(out.variance_frd) @ r_nb.T
@@ -165,6 +170,8 @@ def main() -> None:
     ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo",
                     help="msckf: tightly coupled VIO on the autopilot IMU (HIGHRES_IMU), initialised "
                          "without GNSS from the rangefinder")
+    ap.add_argument("--msckf-calibration", type=Path,
+                    help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
     ap.add_argument("--msckf-record", type=Path,
                     help="JSON lines: IMU samples and per-frame MSCKF inputs (offline replay)")
     ap.add_argument("--log", type=Path)
@@ -198,6 +205,10 @@ def main() -> None:
     pending: list[tuple[int, np.ndarray]] = []
     log = args.log.open("w") if args.log else None
     record = args.msckf_record.open("w", buffering=1) if args.msckf_record else None
+    msckf_scale = None
+    if args.msckf_calibration:
+        mc = json.loads(args.msckf_calibration.read_text())
+        msckf_scale = (float(mc["horizontal"]["scale"]), float(mc["vertical"]["scale"]))
     if log:
         log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
@@ -346,7 +357,7 @@ def main() -> None:
                 args.save_frames.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(args.save_frames / f"{t_frame}.png"), gray)
             if msckf is not None:
-                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t, record)
+                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t, record, msckf_scale)
                 if out is not None:
                     last_msckf_t = t_frame
             else:

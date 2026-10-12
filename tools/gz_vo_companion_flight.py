@@ -28,6 +28,7 @@ import json
 import math
 import signal
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -200,6 +201,8 @@ def main() -> None:
     ap.add_argument("--world", default=gz.TEXTURED_WORLD)
     ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo")
     ap.add_argument("--altitude", type=float, default=3.0)
+    ap.add_argument("--msckf-calibration", type=Path,
+                    help="variance scales for the MSCKF (calibrate_msckf_covariance.py, separate flights)")
     ap.add_argument("--companion-python", default=sys.executable,
                     help="interpreter with gz.transport13 / gz.msgs10, numpy, cv2, pymavlink")
     args = ap.parse_args()
@@ -207,11 +210,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     args.out.mkdir(parents=True, exist_ok=True)
     px4_dir = args.px4_dir.resolve()
+    started_wall = time.time()
     if args.world == gz.TEXTURED_WORLD:
         gz.install_textured_world(px4_dir)
     install_vehicle(px4_dir)
     report: dict = {"type": "PX4_SITL_GAZEBO_GNSS_LOSS_COMPANION_VO", "world": args.world,
-                    "params": PARAMS, "estimator": args.estimator, "altitude": args.altitude, "checks": {}, "samples": []}
+                    "params": PARAMS, "estimator": args.estimator, "altitude": args.altitude,
+                    "msckf_calibration": str(args.msckf_calibration) if args.msckf_calibration else None,
+                    "checks": {}, "samples": []}
     params = dict(PARAMS, MIS_TAKEOFF_ALT=f"{args.altitude:.1f}")
     px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", args.world, params, model=f"gz_{MODEL}")
     link = gz.Link()
@@ -238,7 +244,8 @@ def main() -> None:
             [args.companion_python, str(Path(__file__).with_name("gz_vo_companion.py")), "--world", args.world,
              "--camera-topic", CAMERA_TOPIC, "--log", str(args.out / "companion_vo.csv"),
              "--estimator", args.estimator]
-            + (["--msckf-record", str(args.out / "msckf_inputs.jsonl")] if args.estimator == "msckf" else []),
+            + (["--msckf-record", str(args.out / "msckf_inputs.jsonl")] if args.estimator == "msckf" else [])
+            + (["--msckf-calibration", str(args.msckf_calibration.resolve())] if args.msckf_calibration else []),
             stdout=companion_log, stderr=subprocess.STDOUT)
         # On the ground the camera is ~0.2 m above the texture and VO has no
         # track: the takeoff is GNSS-aided, VO fusion is checked in the air.
@@ -363,6 +370,10 @@ def main() -> None:
     status = [json.loads(line) for line in log_text.splitlines() if line.startswith("{\"sim_s\"")]
     report["companion_final_status"] = status[-1] if status else None
     report["passed"] = ok_all
+    logs = sorted((px4_dir / "build" / "px4_sitl_default" / "rootfs" / "log").glob("*/*.ulg"),
+                  key=lambda p: p.stat().st_mtime)
+    logs = [p for p in logs if p.stat().st_mtime >= started_wall]
+    report["ulog"] = str(logs[-1]) if logs else None
     (args.out / "gz_vo_companion_flight.json").write_text(json.dumps(report, indent=2))
     raise SystemExit(0 if ok_all else 1)
 
