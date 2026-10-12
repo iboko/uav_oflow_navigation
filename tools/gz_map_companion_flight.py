@@ -118,6 +118,18 @@ def heading_error_deg(d: dict, t0_us: int) -> dict:
             "mean_deg": round(float(np.degrees(np.mean(err))), 2)}
 
 
+def map_heading_errors_deg(d: dict, rows: list[dict], t_us: np.ndarray) -> np.ndarray:
+    """(EKF2 heading + map heading offset) minus true heading at each fix [deg].
+
+    The offset is fix heading minus the autopilot heading used for that
+    frame; NaN where the NCC search gave no heading."""
+    a, g = d["vehicle_attitude"], d["vehicle_attitude_groundtruth"]
+    est = np.interp(t_us, a["timestamp"], np.unwrap(np.radians(yaw_deg(a))))
+    truth = np.interp(t_us, g["timestamp"], np.unwrap(np.radians(yaw_deg(g))))
+    off = np.array([float(r["heading_offset_rad"]) for r in rows])
+    return np.degrees((est + off - truth + np.pi) % (2 * np.pi) - np.pi)
+
+
 def interp(data, t_us: np.ndarray, keys=("x", "y")) -> np.ndarray:
     return np.column_stack([np.interp(t_us, data["timestamp"], data[k]) for k in keys])
 
@@ -161,6 +173,25 @@ def heading_phase(args, px4: gz.Px4, link, report: dict, check) -> None:
     else:
         report["heading_without_ev_yaw"] = info  # reference run, not a pass criterion
         print("INFO heading_without_ev_yaw", info, flush=True)
+
+
+def heading_calibration(dirs) -> dict | None:
+    """Map heading error: mean and SD on the 3 fit flights, coverage of
+    mean +- 2 SD on the 2 held-out flights (diagnostic; MapAnchor uses the
+    spread of its own fixes, floored at 0.05 rad)."""
+    per = []
+    for d in dirs:
+        f = json.loads((d / "map_errors.json").read_text())
+        h = np.asarray([x for x in f.get("heading_errors_deg", []) if x is not None and math.isfinite(x)])
+        per.append(h)
+    if len(per) < 5 or any(len(h) < 10 for h in per):
+        return None
+    fit = np.concatenate(per[:3])
+    m, sd = float(np.mean(fit)), float(np.std(fit))
+    hold = np.concatenate(per[3:])
+    return {"fit_mean_deg": round(m, 2), "fit_sd_deg": round(sd, 2),
+            "per_flight_mean_deg": [round(float(np.mean(h)), 2) for h in per],
+            "holdout_within_2sd": round(float(np.mean(np.abs(hold - m) <= 2 * sd)), 3)}
 
 
 def combine(args) -> None:
@@ -207,6 +238,7 @@ def combine(args) -> None:
            "fit_false_fix_rate": float(np.mean([f.false_fixes / max(1, f.false_fixes + len(f.errors_ne_m))
                                                  for f in flights[:3]])),
            "outlier_rule": f"|error - flight median| > {FALSE_FIX_M} m",
+           "map_heading": heading_calibration(args.flights),
            "holdout_details": cal.holdout_flight_details,
            "independently_validated_for_flight": False,
            "note": "simulated flights (Gazebo, idealised camera)"}
@@ -368,7 +400,14 @@ def main() -> None:
                     gz.sim_sleep(2)
             report["segments"]["flight"] = [report["takeoff_us"] + 8_000_000, int(link.boot_s * 1e6)]
         else:
-            # 1: map lock while GNSS holds.
+            # 1: map lock while GNSS holds. The same small motions as in the
+            # calibration flights: hovering over one spot repeats one view,
+            # and over the swiss start point that view stayed ambiguous
+            # (a second NCC peak 5.5 m away at another heading, margin
+            # 0.04-0.09 against 0.05) for the whole check.
+            for p, r in ((120, 0), (0, 120), (-120, 0), (0, -120)):
+                move(p, r, 2)
+                gz.sim_sleep(2)
             locked = gz.wait(lambda: latest_status(clog_path).get("map_anchor", {}).get("locked"), 60, 1)
             gz.sim_sleep(3)
             f1 = vo_flight.flags_and_validity(px4)
@@ -493,6 +532,12 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                        float(r["east_m"]) - float(r["injected_shift_e"])] for r in acc])
     err = fixes - interp(truth, t)
     report["ekf2_tilt_error_deg"] = tilt_error_deg(d, report.get("takeoff_us", 0))
+    hdg = map_heading_errors_deg(d, acc, t)
+    ok_h = np.isfinite(hdg)
+    report["map_heading_error_deg"] = {
+        "fixes_with_heading": int(ok_h.sum()), "fixes": len(hdg),
+        "mean": round(float(np.mean(hdg[ok_h])), 2) if ok_h.any() else None,
+        "std": round(float(np.std(hdg[ok_h])), 2) if ok_h.any() else None}
     if args.mode == "calibrate":
         t0, t1 = report["segments"]["flight"]
         sel = (t >= t0) & (t <= t1)
@@ -509,7 +554,9 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
                "std_error_ne_m": e.std(axis=0).round(4).tolist(),
                "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"],
-               "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_]))}
+               "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_])),
+               # Map heading error of the same fixes (NaN: no heading from the search).
+               "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]]}
         (args.out / "map_errors.json").write_text(json.dumps(out, indent=1))
         report["flight_map_errors"] = {k: v for k, v in out.items() if k != "errors_ne_m"}
         report["analysis_ok"] = len(e) >= 30
@@ -525,8 +572,14 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         rejected = sum(r["anchor_result"] in ("FIX_REJECTED_NIS", "FIX_REJECTED_STEP") for r in shifted)
         fused_after = sum(r["anchor_result"] == "FIX_FUSED" for r in after)
         live = report.get("fault_live", {})
+        # Integrity: the vehicle is not pulled by the shifted map (true
+        # drift < 0.5 m). The absolute error during the fault includes the
+        # error the estimate already had: same limit as check 3 (it was a
+        # fixed 0.5 m, set for the 20-m scene with sigma 0.16 m).
+        abs_limit = report.get("route_error_limit_m", 0.5)
         ok = (fused_shifted == 0 and rejected >= 5 and fused_after > 0
-              and live.get("max_abs_error_during_fault_m", 9) < 0.5 and live.get("true_drift_during_fault_m", 9) < 0.5)
+              and live.get("max_abs_error_during_fault_m", 9) < abs_limit
+              and live.get("true_drift_during_fault_m", 9) < 0.5)
         report["checks"]["4_shifted_map_rejected"] = {
             "pass": ok, "shifted_fixes": len(shifted), "fused_shifted": fused_shifted,
             "rejected_total": rejected,
