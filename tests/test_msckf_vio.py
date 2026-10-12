@@ -183,3 +183,31 @@ def test_linear_vi_initialization_refuses_without_acceleration():
     cam = PinholeCamera(CAM.fx, CAM.fy, CAM.cx, CAM.cy, CAM.body_from_camera, (0.0, 0.0, 0.0), 0.5)
     res = initialize(imu, frames, cam, (1.0, 0.0, 0.0, 0.0))
     assert not res.ok and res.status in ("INSUFFICIENT_EXCITATION", "DEGENERATE_GEOMETRY")
+
+
+def test_msckf_hover_with_rangefinder_ground_depth(monkeypatch):
+    # Hover at 6 m: tracks have almost no parallax. Triangulated depths
+    # absorb a velocity error (it grew to 0.5 m/s in 17 s); with the
+    # rangefinder ground depth the velocity stays bounded.
+    alt, amp = 6.0, 0.05
+
+    def hover(t):
+        w = 0.5
+        p = np.array([amp * math.sin(w * t), amp * math.cos(1.3 * w * t), -alt])
+        v = np.array([amp * w * math.cos(w * t), -amp * 1.3 * w * math.sin(1.3 * w * t), 0.0])
+        a = np.array([-amp * w * w * math.sin(w * t), -amp * 1.69 * w * w * math.cos(1.3 * w * t), 0.0])
+        return p, v, a, _quat(0.01 * math.sin(0.7 * t), 0.01 * math.cos(0.5 * t), 1.46)
+    monkeypatch.setitem(globals(), "_truth", hover)
+    imu, frames, truth = _simulate(seconds=20.0)
+    p0, v0, _, q0 = hover(T0)
+    f = Msckf(camera=CAM, noise=NOISE, quaternion_body_to_ned=tuple(q0),
+              initial_position_ned_m=tuple(p0), initial_velocity_ned_m_s=tuple(v0))
+    fi, errors = 0, []
+    for reading in imu:
+        f.predict(reading)
+        if fi < len(frames) and frames[fi][0] == reading.timestamp_us:
+            f.process_frame(*frames[fi], ground_height_m=alt)
+            errors.append(np.linalg.norm(f.v - truth[fi][2]))
+            fi += 1
+    assert f.stats.counts.get("ground_depth", 0) > 100
+    assert max(errors[len(errors) // 4:]) < 0.15

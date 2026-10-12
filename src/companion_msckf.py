@@ -173,7 +173,7 @@ class CompanionMsckf:
                     f.predict(r)
             if f.last_imu.timestamp_us != t_us:
                 f.predict(self._reading_at(t_us))
-            f.process_frame(t_us, features)
+            f.process_frame(t_us, features, ground_height_m=height)
         except (ValueError, np.linalg.LinAlgError) as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.reset("RESET_NUMERICAL")
