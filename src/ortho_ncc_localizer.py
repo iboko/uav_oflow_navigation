@@ -42,14 +42,27 @@ class OrthoNccLocalizer:
             raise ValueError("Нужна карта север-вверх с квадратным пикселем")
         if not mount.valid(calibration):
             raise ValueError("Несогласованная калибровка камеры")
+        offset = np.asarray(camera_offset_body_m, dtype=float)
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("Некорректное смещение камеры")
+        if (not isinstance(gray, np.ndarray) or gray.ndim != 2 or gray.dtype != np.uint8
+                or not gray.size):
+            raise ValueError("Нужна непустая карта uint8 в оттенках серого")
+        if (not all(isfinite(x) for x in (patch_m, min_peak, min_margin, exclusion_m, max_tilt_rad))
+                or patch_m <= 0 or not 0 <= min_peak <= 1 or not 0 < min_margin <= 2
+                or exclusion_m <= 0 or not 0 < max_tilt_rad <= 0.2
+                or not yaw_search_deg or not all(isfinite(x) for x in yaw_search_deg)):
+            raise ValueError("Недопустимые параметры NCC")
         self.gsd = float(jac[1, 0])
         self.origin = np.asarray(georef.origin_ne_m, dtype=float)
         self.map = gray
         self.k = np.array([[calibration.focal_x_px, 0, calibration.center_x_px],
                            [0, calibration.focal_y_px, calibration.center_y_px], [0, 0, 1.0]])
         self.r_bc = np.asarray(mount.body_from_camera, dtype=float)
-        self.offset = np.asarray(camera_offset_body_m, dtype=float)
+        self.offset = offset
         self.npx = int(round(patch_m / self.gsd))
+        if self.npx < 3:
+            raise ValueError("Патч NCC должен содержать не менее трех пикселей на сторону")
         self.min_peak, self.min_margin = min_peak, min_margin
         self.exclusion_px = max(1, int(round(exclusion_m / self.gsd)))
         self.max_tilt = max_tilt_rad
@@ -64,14 +77,16 @@ class OrthoNccLocalizer:
 
     def ortho_patch(self, frame: np.ndarray, height_agl_m: float, roll: float, pitch: float, yaw: float):
         """North-up patch centred below the camera; returns (patch, fully_inside)."""
-        r_nc = body_to_ned(roll, pitch, yaw) @ self.r_bc
+        r_nb = body_to_ned(roll, pitch, yaw)
+        r_nc = r_nb @ self.r_bc
         js, is_ = np.meshgrid(np.arange(self.npx), np.arange(self.npx))
         dn = (self.npx / 2 - is_ - 0.5) * self.gsd
         de = (js - self.npx / 2 + 0.5) * self.gsd
-        # Camera height above the ground: rangefinder height at the vehicle;
-        # the camera offset is small against tens of metres (ignored here,
-        # the lever arm is applied to the position below).
-        pts = np.stack([dn, de, np.full_like(dn, height_agl_m)], -1)
+        # NED z is down: a camera below the body has a smaller AGL.
+        camera_height = height_agl_m - (r_nb @ self.offset)[2]
+        if camera_height <= 0:
+            return None, False
+        pts = np.stack([dn, de, np.full_like(dn, camera_height)], -1)
         pc = pts @ r_nc
         uv = pc @ self.k.T
         mx = (uv[..., 0] / uv[..., 2]).astype(np.float32)
@@ -86,6 +101,8 @@ class OrthoNccLocalizer:
             return MapLocalizationFix(False, "NONFINITE_INPUT")
         if prior_ne_m is None or not np.isfinite(prior_ne_m).all():
             return MapLocalizationFix(False, "NO_PRIOR_POSITION")
+        if np.asarray(prior_ne_m).shape != (2,) or radius_m <= 0:
+            return MapLocalizationFix(False, "INVALID_SEARCH_WINDOW")
         if abs(roll_rad) > self.max_tilt or abs(pitch_rad) > self.max_tilt:
             return MapLocalizationFix(False, "UNSUPPORTED_ATTITUDE")
         if not 5.0 <= height_agl_m <= 150.0:
@@ -105,19 +122,26 @@ class OrthoNccLocalizer:
         # search nuisance here, not a measurement (it also absorbed a
         # systematic rotation between the 2019 and 2025 products).
         best = None
+        envelope = None
         for dyaw in self.yaw_search:
             patch, inside = self.ortho_patch(image, height_agl_m, roll_rad, pitch_rad, yaw_rad + dyaw)
             if not inside:
-                return MapLocalizationFix(False, "PATCH_OUTSIDE_FRAME")
+                continue
             patch = self.clahe.apply(patch)
             if float(np.std(patch)) < 5.0:
-                return MapLocalizationFix(False, "INSUFFICIENT_TEXTURE")
+                continue
             r = cv2.matchTemplate(window, patch, cv2.TM_CCOEFF_NORMED)
+            envelope = r.copy() if envelope is None else np.maximum(envelope, r)
             _, pk, _, lc = cv2.minMaxLoc(r)
             if best is None or pk > best[0]:
                 best = (pk, lc, r)
+        if best is None:
+            return MapLocalizationFix(False, "NO_USABLE_ORTHO_PATCH")
         peak, loc, res = best
-        masked = res.copy()
+        # Compare all heading hypotheses: a different position at another
+        # heading is also a competing map match. The selected surface alone
+        # misses such ambiguity.
+        masked = envelope.copy()
         cv2.circle(masked, loc, self.exclusion_px, -1.0, -1)
         second = float(masked.max())
         self.last_peak, self.last_margin = float(peak), float(peak - second)

@@ -409,7 +409,8 @@ def main() -> None:
             control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
             report["fault_end_us"] = int(link.boot_s * 1e6)
             fused_during = during.get("FIX_FUSED", 0) - before.get("FIX_FUSED", 0)
-            rejected = during.get("FIX_REJECTED_NIS", 0) - before.get("FIX_REJECTED_NIS", 0)
+            rejected = sum(during.get(key, 0) - before.get(key, 0)
+                           for key in ("FIX_REJECTED_NIS", "FIX_REJECTED_STEP"))
             drift = float(np.linalg.norm(truth - truth0))
             gz.sim_sleep(10)
             after = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
@@ -506,13 +507,16 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         shifted = [r for r in rows if in_fault(r)]
         after = [r for r in rows if int(r["t_us"]) + offset > t_f1 and not in_fault(r)]
         fused_shifted = sum(r["anchor_result"] == "FIX_FUSED" for r in shifted)
-        rejected = sum(r["anchor_result"] == "FIX_REJECTED_NIS" for r in shifted)
+        rejected = sum(r["anchor_result"] in ("FIX_REJECTED_NIS", "FIX_REJECTED_STEP") for r in shifted)
         fused_after = sum(r["anchor_result"] == "FIX_FUSED" for r in after)
         live = report.get("fault_live", {})
         ok = (fused_shifted == 0 and rejected >= 5 and fused_after > 0
               and live.get("max_abs_error_during_fault_m", 9) < 0.5 and live.get("true_drift_during_fault_m", 9) < 0.5)
         report["checks"]["4_shifted_map_rejected"] = {
-            "pass": ok, "shifted_fixes": len(shifted), "fused_shifted": fused_shifted, "rejected_nis": rejected,
+            "pass": ok, "shifted_fixes": len(shifted), "fused_shifted": fused_shifted,
+            "rejected_total": rejected,
+            "rejected_nis": sum(r["anchor_result"] == "FIX_REJECTED_NIS" for r in shifted),
+            "rejected_step": sum(r["anchor_result"] == "FIX_REJECTED_STEP" for r in shifted),
             "min_nis_shifted": round(min((float(r["nis"]) for r in shifted if r["nis"] != "nan"), default=math.nan), 1),
             "fused_after_fault": fused_after, **{k: v for k, v in live.items() if k != "status_counts_delta"}}
         report["analysis_ok"] = ok
