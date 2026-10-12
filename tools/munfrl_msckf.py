@@ -27,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from munfrl_vo_eskf import IMU_NOISE, evaluate, load_attitude, load_imu, procrustes  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
 from src.imu_preintegration import ImuReading  # noqa: E402
+from src.imu_preintegration import ImuBias  # noqa: E402
 from src.msckf_vio import Msckf, PinholeCamera  # noqa: E402
+from src.vi_initialization import initialize  # noqa: E402
 
 CAMERA_TO_IMU_OFFSET_US = -37_000  # t_imu = t_camera + offset (docs/REAL_DATA_MUNFRL_RU.md)
 
@@ -63,32 +65,77 @@ def run(slice_dir: Path, *, pixel_sigma: float, max_clones: int, max_features: i
     # velocity guess (sigma 5 m/s, as the loosely coupled run) the first
     # low-parallax tracks set the velocity through a poor depth
     # linearisation and the filter diverges (checked on quarry2).
-    if init_velocity == "gnss":
-        v0, sv = (*frames[0]["ref_vel"], 0.0), 0.3
-    else:
-        v0, sv = (0.0, 0.0, 0.0), 5.0
-    sig = (0.01, 0.01, 0.01, sv, sv, sv, 0.05, 0.05, 0.2, 0.01, 0.01, 0.01, 0.3, 0.3, 0.3)
-    filt = Msckf(camera=camera, noise=IMU_NOISE, quaternion_body_to_ned=q0, initial_error_sigma=sig,
-                 initial_velocity_ned_m_s=v0, max_clones=max_clones)
     tracker = KltTracker(max_features=max_features)
-    k, traj, start = 0, [], time.perf_counter()
-    filt.predict(imu[0])
+    start = time.perf_counter()
+    filt, init_report = None, None
+    if init_velocity in ("gnss", "zero"):
+        if init_velocity == "gnss":
+            v0, sv = (*frames[0]["ref_vel"], 0.0), 0.3
+        else:
+            v0, sv = (0.0, 0.0, 0.0), 5.0
+        sig = (0.01, 0.01, 0.01, sv, sv, sv, 0.05, 0.05, 0.2, 0.01, 0.01, 0.01, 0.3, 0.3, 0.3)
+        filt = Msckf(camera=camera, noise=IMU_NOISE, quaternion_body_to_ned=q0, initial_error_sigma=sig,
+                     initial_velocity_ned_m_s=v0, max_clones=max_clones)
+        filt.predict(imu[0])
+    window, window_heights, last_try = [], [], 0
+    traj = []
     k = 1
     for f in frames:
         t_imu = f["t"] + offset_us
+        gray = cv2.imread(str(slice_dir / f["image"]), cv2.IMREAD_GRAYSCALE)
+        feats = tracker.track(gray)
+        if filt is None:
+            # Without GNSS: linear VI initialisation over a growing window,
+            # 1.5 s at least, tried every 0.5 s up to 5 s.
+            window.append((t_imu, feats))
+            # vi_height: PPK height above the take-off point stands in for a
+            # rangefinder (MUN-FRL has none); flat ground assumed.
+            window_heights.append((t_imu, f["h"]))
+            span = (t_imu - window[0][0]) * 1e-6
+            if span >= 1.5 and t_imu - last_try >= 500_000:
+                last_try = t_imu
+                q_ahrs = load_attitude(slice_dir / "attitude.csv", window[0][0])
+                heights = {t: h for t, h in window_heights} if init_velocity == "vi_height" else None
+                res = initialize(imu, window, camera, q_ahrs, estimate_accel_bias=True, heights_agl_m=heights)
+                init_report = {"status": res.status, "window_s": round(span, 2), "features": res.features,
+                               "sigma_velocity_m_s": res.sigma_velocity_m_s,
+                               "sigma_accel_bias_m_s2": res.sigma_accel_bias_m_s2,
+                               "velocity_end": list(res.velocity_end_ned_m_s),
+                               "ppk_velocity_at_end": list(f["ref_vel"]),
+                               "accel_bias": list(res.accel_bias_body_m_s2),
+                               "median_depth_m": res.median_depth_m, "chi2_per_dof": res.chi2_per_dof,
+                               "gravity_tilt_deg": list(res.gravity_tilt_deg),
+                               "excitation_m_s2": res.excitation_m_s2,
+                               "ppk_height_m": f["h"]}
+                if res.ok:
+                    sv = np.sqrt(np.clip(np.diag(np.asarray(res.velocity_end_cov)), 1e-4, None))
+                    sig = (0.01, 0.01, 0.01, *sv, 0.05, 0.05, 0.2, 0.01, 0.01, 0.01,
+                           *(max(res.sigma_accel_bias_m_s2, 0.02),) * 3)
+                    filt = Msckf(camera=camera, noise=IMU_NOISE, quaternion_body_to_ned=res.quaternion_end,
+                                 initial_error_sigma=sig, initial_velocity_ned_m_s=res.velocity_end_ned_m_s,
+                                 initial_bias=ImuBias(accel_body_m_s2=res.accel_bias_body_m_s2),
+                                 max_clones=max_clones)
+                    while k < len(imu) and imu[k].timestamp_us < t_imu:
+                        k += 1
+                    filt.predict(interpolate(imu[k - 1], imu[k], t_imu))
+                elif span > 5.0:
+                    return {"frames": len(frames), "init_velocity": init_velocity, "vi_init": init_report,
+                            "failed": "no consistent VI initialisation within 5 s"}
+            traj.append({"t": f["t"], "p": (math.nan, math.nan), "v": (math.nan, math.nan),
+                         "pv": (math.nan, math.nan)})
+            continue
         while k < len(imu) and imu[k].timestamp_us < t_imu:
             filt.predict(imu[k])
             k += 1
         if filt.last_imu.timestamp_us != t_imu:
             filt.predict(interpolate(filt.last_imu, imu[k], t_imu))
-        gray = cv2.imread(str(slice_dir / f["image"]), cv2.IMREAD_GRAYSCALE)
-        feats = tracker.track(gray)
         filt.process_frame(t_imu, feats)
         traj.append({"t": f["t"], "p": tuple(filt.p[:2]), "v": tuple(filt.v[:2]),
                      "pv": (filt.cov[3, 3], filt.cov[4, 4])})
     elapsed = time.perf_counter() - start
     half = len(frames) // 2
-    theta, _ = procrustes(np.array([x["v"] for x in traj[:half]]), np.array([f["ref_vel"] for f in frames[:half]]))
+    first = [i for i in range(half) if np.isfinite(traj[i]["v"]).all()]
+    theta, _ = procrustes(np.array([traj[i]["v"] for i in first]), np.array([frames[i]["ref_vel"] for i in first]))
     metrics = evaluate(frames, traj, theta)
     stats = dict(vars(filt.stats))
     nis = np.asarray(stats.pop("nis_per_dof"))
@@ -97,7 +144,7 @@ def run(slice_dir: Path, *, pixel_sigma: float, max_clones: int, max_features: i
     # Pixel sigma that would make the mean NIS/dof equal to 1 (for calibration).
     stats["pixel_sigma_for_unit_nis"] = float(pixel_sigma * np.sqrt(np.mean(nis))) if len(nis) else None
     return {"imu": imu_info, "frames": len(frames), "heading_alignment_deg": math.degrees(theta),
-            "init_velocity": init_velocity, "stats": stats, "tracker": tracker.counts,
+            "init_velocity": init_velocity, "vi_init": init_report, "stats": stats, "tracker": tracker.counts,
             "final_gyro_bias": filt.bg.round(5).tolist(), "final_accel_bias": filt.ba.round(4).tolist(),
             "runtime_s_per_frame": elapsed / len(frames), **metrics}
 
@@ -110,7 +157,9 @@ def main() -> None:
     ap.add_argument("--max-features", type=int, default=150)
     ap.add_argument("--imu-decimate", type=int, default=4, help="400 Hz Xsens -> 100 Hz")
     ap.add_argument("--camera-offset-us", type=int, default=CAMERA_TO_IMU_OFFSET_US)
-    ap.add_argument("--init-velocity", choices=("gnss", "zero"), default="gnss")
+    ap.add_argument("--init-velocity", choices=("gnss", "zero", "vi", "vi_height"), default="gnss",
+                    help="vi: visual-inertial initialisation, no GNSS; vi_height: plus height above "
+                         "ground (PPK height as a rangefinder stand-in)")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
     report = {"type": "MUNFRL_MSCKF_VS_PPK", "pixel_sigma": args.pixel_sigma, "max_clones": args.max_clones,
@@ -121,6 +170,9 @@ def main() -> None:
                                       max_features=args.max_features, imu_decimate=args.imu_decimate,
                                       offset_us=args.camera_offset_us, init_velocity=args.init_velocity)
         r = report["flights"][name]
+        if "failed" in r:
+            print(name, "FAILED", r["vi_init"], flush=True)
+            continue
         print(name, {k: (round(r[k], 3) if isinstance(r[k], float) else r[k]) for k in
                      ("final_drift_m", "max_drift_m", "path_length_m", "velocity_rmse_m_s", "velocity_nees_2d",
                       "runtime_s_per_frame")}, "sigma_for_unit_nis", r["stats"]["pixel_sigma_for_unit_nis"], flush=True)

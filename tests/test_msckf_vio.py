@@ -133,3 +133,81 @@ def test_klt_tracker_keeps_ids_on_a_shifted_texture():
     assert len(common) > 50
     shifts = np.array([np.subtract(second[i], first[i]) for i in common])
     assert np.allclose(np.median(shifts, axis=0), (2.0, -3.0), atol=0.1)
+
+
+def test_linear_vi_initialization_recovers_velocity_without_gnss():
+    from src.vi_initialization import initialize
+    imu, frames, truth = _simulate(seconds=4.0, accel_bias=(0.04, -0.03, 0.05), gyro_bias=(0.0, 0.0, 0.0))
+    window = frames[:20]  # 2 s at 10 Hz
+    q0 = tuple(_truth(window[0][0] * 1e-6)[3])
+    # Rangefinder: height above the (flat, +-0.3 m) ground, 2 % noise.
+    rng = np.random.default_rng(9)
+    heights = {t: float(-truth[k][1][2]) * (1 + rng.normal(0, 0.02)) for k, (t, _) in enumerate(window)}
+    res = initialize(imu, window, CAM, q0, heights_agl_m=heights)
+    assert res.ok, res
+    v_true_end = truth[19][2]
+    assert np.allclose(res.velocity_end_ned_m_s, v_true_end, atol=0.1)
+    assert abs(res.accel_bias_body_m_s2[2] - 0.05) < 0.03
+    assert 25 < res.median_depth_m < 40
+    assert max(abs(x) for x in res.gravity_tilt_deg) < 0.5
+
+
+def test_vi_initialization_without_height_refuses_or_is_accurate():
+    from src.vi_initialization import initialize
+    imu, frames, truth = _simulate(seconds=4.0, accel_bias=(0.04, -0.03, 0.05), gyro_bias=(0.0, 0.0, 0.0))
+    window = frames[:20]
+    res = initialize(imu, window, CAM, tuple(_truth(window[0][0] * 1e-6)[3]))
+    # Horizontal bias and gravity tilt look alike over 2 s: weak scale.
+    if res.ok:
+        assert np.allclose(res.velocity_end_ned_m_s, truth[19][2], atol=3 * res.sigma_velocity_m_s)
+    else:
+        assert res.status == "INSUFFICIENT_EXCITATION"
+
+
+def test_linear_vi_initialization_refuses_without_acceleration():
+    from src.vi_initialization import initialize
+    from src.imu_preintegration import ImuReading
+    rng = np.random.default_rng(1)
+    pts = np.column_stack([rng.uniform(-30, 30, 800), rng.uniform(-30, 30, 800), np.zeros(800)])
+    r_bc = np.asarray(CAM.body_from_camera)
+    v = np.array([2.0, 0.0, 0.0])
+    imu = [ImuReading(1_000_000 + k * 5000, (0.0, 0.0, 0.0), (0.0, 0.0, -9.80665)) for k in range(0, 501)]
+    frames = []
+    for k in range(1, 21):
+        t = k * 0.1
+        p = np.array([0.0, 0.0, -30.0]) + v * t
+        pc = (pts - p - r_bc @ np.zeros(3)) @ r_bc
+        uv = np.column_stack([CAM.fx * pc[:, 0] / pc[:, 2] + CAM.cx, CAM.fy * pc[:, 1] / pc[:, 2] + CAM.cy])
+        vis = np.where((uv[:, 0] > 0) & (uv[:, 0] < 640) & (uv[:, 1] > 0) & (uv[:, 1] < 480))[0][:100]
+        frames.append((1_000_000 + k * 100_000, {int(i): tuple(uv[i]) for i in vis}))
+    cam = PinholeCamera(CAM.fx, CAM.fy, CAM.cx, CAM.cy, CAM.body_from_camera, (0.0, 0.0, 0.0), 0.5)
+    res = initialize(imu, frames, cam, (1.0, 0.0, 0.0, 0.0))
+    assert not res.ok and res.status in ("INSUFFICIENT_EXCITATION", "DEGENERATE_GEOMETRY")
+
+
+def test_msckf_hover_with_rangefinder_ground_depth(monkeypatch):
+    # Hover at 6 m: tracks have almost no parallax. Triangulated depths
+    # absorb a velocity error (it grew to 0.5 m/s in 17 s); with the
+    # rangefinder ground depth the velocity stays bounded.
+    alt, amp = 6.0, 0.05
+
+    def hover(t):
+        w = 0.5
+        p = np.array([amp * math.sin(w * t), amp * math.cos(1.3 * w * t), -alt])
+        v = np.array([amp * w * math.cos(w * t), -amp * 1.3 * w * math.sin(1.3 * w * t), 0.0])
+        a = np.array([-amp * w * w * math.sin(w * t), -amp * 1.69 * w * w * math.cos(1.3 * w * t), 0.0])
+        return p, v, a, _quat(0.01 * math.sin(0.7 * t), 0.01 * math.cos(0.5 * t), 1.46)
+    monkeypatch.setitem(globals(), "_truth", hover)
+    imu, frames, truth = _simulate(seconds=20.0)
+    p0, v0, _, q0 = hover(T0)
+    f = Msckf(camera=CAM, noise=NOISE, quaternion_body_to_ned=tuple(q0),
+              initial_position_ned_m=tuple(p0), initial_velocity_ned_m_s=tuple(v0))
+    fi, errors = 0, []
+    for reading in imu:
+        f.predict(reading)
+        if fi < len(frames) and frames[fi][0] == reading.timestamp_us:
+            f.process_frame(*frames[fi], ground_height_m=alt)
+            errors.append(np.linalg.norm(f.v - truth[fi][2]))
+            fi += 1
+    assert f.stats.counts.get("ground_depth", 0) > 100
+    assert max(errors[len(errors) // 4:]) < 0.15

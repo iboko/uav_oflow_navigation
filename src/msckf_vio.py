@@ -14,13 +14,16 @@
    состояния, остается ограничение только на позы;
 4. χ² по каждому треку (95 %), затем одно совместное обновление.
 
-Масштаб наблюдается через ускорения ИИМ, а не через внешнюю высоту:
-дальномер и высота над землей НЕ используются. Курс по-прежнему
+Масштаб наблюдается через ускорения ИИМ, а не через внешнюю высоту.
+Высота над ровной землей (дальномер) необязательна. Она используется
+только для треков без параллакса (зависание): им задается глубина
+пересечения луча с землей (``process_frame(..., ground_height_m)``).
+В офлайн-прогонах MUN-FRL она не задается. Курс по-прежнему
 ненаблюдаем (как в любой VIO без внешнего курса).
 
 Камера — проективная, кадры уже без дисторсии. Внешняя калибровка
-камера–ИИМ и сдвиг времени считаются известными. Результат НЕ передается
-в EKF2.
+камера–ИИМ и сдвиг времени считаются известными. В EKF2 результат
+передает только компаньон в SITL (``companion_msckf``).
 """
 from __future__ import annotations
 
@@ -70,6 +73,7 @@ class _Clone:
     t_us: int
     p: np.ndarray
     q: np.ndarray
+    height_m: float | None = None   # body above flat ground (rangefinder), optional
 
 
 @dataclass
@@ -94,7 +98,8 @@ class Msckf:
                      0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 0.02, 0.02, 0.1,
                      0.01, 0.01, 0.01, 0.2, 0.2, 0.2),
                  max_clones: int = 10, min_track_length: int = 3,
-                 min_parallax_rad: float = 0.003, max_imu_dt_s: float = 0.05) -> None:
+                 min_parallax_rad: float = 0.003, max_imu_dt_s: float = 0.05,
+                 ground_parallax_rad: float = 0.05) -> None:
         if not noise.valid() or max_clones < 3 or min_track_length < 3:
             raise ValueError("Недопустимые параметры MSCKF")
         self.r_bc, self.p_bc = camera.matrices()
@@ -114,6 +119,7 @@ class Msckf:
         self.max_clones = max_clones
         self.min_track = min_track_length
         self.min_parallax = min_parallax_rad
+        self.ground_parallax_rad = ground_parallax_rad
         self.max_imu_dt = max_imu_dt_s
         self.last_imu: ImuReading | None = None
         self.stats = MsckfStats()
@@ -149,7 +155,7 @@ class Msckf:
         self.last_imu = reading
 
     # ------------------------------------------------------------ frames
-    def _augment(self, t_us: int) -> None:
+    def _augment(self, t_us: int, height_m: float | None = None) -> None:
         n = self.cov.shape[0]
         j = np.zeros((6, n))
         j[0:3, P] = np.eye(3)
@@ -157,7 +163,7 @@ class Msckf:
         top = np.hstack([self.cov, self.cov @ j.T])
         bottom = np.hstack([j @ self.cov, j @ self.cov @ j.T])
         self.cov = np.vstack([top, bottom])
-        self.clones.append(_Clone(t_us, self.p.copy(), self.q.copy()))
+        self.clones.append(_Clone(t_us, self.p.copy(), self.q.copy(), height_m))
 
     def _drop_clone(self, index: int) -> None:
         a = 15 + 6 * index
@@ -167,12 +173,22 @@ class Msckf:
         for obs in self.tracks.values():
             obs[:] = [o for o in obs if o[0] != t]
 
-    def process_frame(self, t_us: int, features: dict[int, tuple[float, float]]) -> dict:
-        """Кадр на момент последнего отсчета ИИМ (t_us == last_imu.timestamp_us)."""
+    def process_frame(self, t_us: int, features: dict[int, tuple[float, float]],
+                      ground_height_m: float | None = None) -> dict:
+        """Кадр на момент последнего отсчета ИИМ (t_us == last_imu.timestamp_us).
+
+        ``ground_height_m`` — высота корпуса над ровной землей (дальномер).
+        Если задана, трек без параллакса (зависание) не отбрасывается: точка
+        ставится на пересечение луча с землей. Ограничение на относительные
+        перемещения клонов (масштаб 1/глубина) при этом сохраняется, а
+        ошибка глубины входит только в линеаризацию.
+        """
         if self.last_imu is None or t_us != self.last_imu.timestamp_us:
             raise ValueError("Кадр должен совпадать по времени с последним отсчетом ИИМ")
         self.stats.frames += 1
-        self._augment(t_us)
+        if ground_height_m is not None and not (isfinite(ground_height_m) and ground_height_m > 0):
+            ground_height_m = None
+        self._augment(t_us, ground_height_m)
         for fid, (u, v) in features.items():
             self.tracks.setdefault(fid, []).append((t_us, float(u), float(v)))
         lost = [fid for fid in self.tracks if fid not in features]
@@ -198,7 +214,44 @@ class Msckf:
         r_wb = rotation_body_to_ned(clone.q)
         return r_wb @ self.r_bc, clone.p + r_wb @ self.p_bc
 
-    def _triangulate(self, obs, poses) -> np.ndarray | None:
+    def _triangulate(self, obs, poses, height_m: float | None = None,
+                     body_p: np.ndarray | None = None) -> np.ndarray | None:
+        """Точка признака; с высотой над землей — запасная точка на земле.
+
+        Без параллакса или при неудаче триангуляции (у короткой базы
+        зависания она часто уходит за камеру) точка ставится на
+        пересечение луча якорного кадра с ровной землей.
+        """
+        ground = None
+        if height_m is not None and body_p is not None:
+            r_a, p_a = poses[0]
+            u, v = obs[0][1], obs[0][2]
+            ray = r_a @ np.array([(u - self.cam.cx) / self.cam.fx, (v - self.cam.cy) / self.cam.fy, 1.0])
+            ray /= np.linalg.norm(ray)
+            if ray[2] > 0.2:
+                # Flat ground below the anchor clone (NED: z grows down).
+                ground = p_a + ray * (body_p[2] + height_m - p_a[2]) / ray[2]
+        if ground is not None and self._parallax(obs, poses) < self.ground_parallax_rad:
+            # Short baseline: the triangulated depth is free to absorb a
+            # velocity error (seen at hover: 15 m instead of 6 m), the
+            # rangefinder depth is not.
+            self.stats.counts["ground_depth"] = self.stats.counts.get("ground_depth", 0) + 1
+            return ground
+        pf = self._triangulate_points(obs, poses)
+        if pf is None and ground is not None:
+            self.stats.counts["ground_depth"] = self.stats.counts.get("ground_depth", 0) + 1
+            return ground
+        return pf
+
+    def _parallax(self, obs, poses) -> float:
+        rays = []
+        for (_, u, v), (r_wc, _) in zip(obs, poses):
+            ray = r_wc @ np.array([(u - self.cam.cx) / self.cam.fx, (v - self.cam.cy) / self.cam.fy, 1.0])
+            rays.append(ray / np.linalg.norm(ray))
+        cos_min = min(float(a @ b) for a in rays for b in rays)
+        return float(np.arccos(np.clip(cos_min, -1.0, 1.0)))
+
+    def _triangulate_points(self, obs, poses) -> np.ndarray | None:
         """Inverse-depth Gauss-Newton anchored at the first observation.
 
         Robust for distant points with little parallax (a 30-m nadir view
@@ -277,7 +330,7 @@ class Msckf:
             return None
         clones = [self.clones[index[o[0]]] for o in obs]
         poses = [self._camera_pose(c) for c in clones]
-        pf = self._triangulate(obs, poses)
+        pf = self._triangulate(obs, poses, clones[0].height_m, clones[0].p)
         if pf is None:
             self.stats.features_rejected_triangulation += 1
             return None

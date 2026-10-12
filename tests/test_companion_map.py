@@ -107,3 +107,12 @@ def test_heading_sigma_has_a_floor_and_follows_the_spread():
     assert anchor.heading_known
     assert anchor.heading_sigma_rad() == pytest.approx(0.05)  # identical offsets: floor
     assert anchor.heading_sigma_rad(floor_rad=0.0) < 1e-6
+
+
+def test_last_fix_time_tracks_only_map_backed_updates():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, pos, t = _fly(anchor, 3)
+    assert anchor.last_fix_us == t  # lock
+    locked_at = anchor.last_fix_us
+    _fly(anchor, 10, start=pos, t0=t, map_shift=(0.0, 3.0), fix_every=5)  # all rejected
+    assert anchor.last_fix_us == locked_at

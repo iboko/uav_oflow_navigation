@@ -88,6 +88,7 @@ class MapAnchor:
         self._vo_since_candidate = np.zeros(2)
         self.counts: dict[str, int] = {}
         self.last_nis = float("nan")
+        self.last_fix_us = 0   # time of the last fused (or locking) map fix
 
     def _count(self, key: str) -> None:
         self.counts[key] = self.counts.get(key, 0) + 1
@@ -201,6 +202,7 @@ class MapAnchor:
         self._cov = (np.eye(2) - k) @ self._cov
         self._cov = 0.5 * (self._cov + self._cov.T)
         self._heading(heading_offset_rad)
+        self.last_fix_us = t_us
         self._count("FIX_FUSED")
         return "FIX_FUSED"
 
@@ -224,6 +226,7 @@ class MapAnchor:
         self._p = z.copy()
         self._cov = self._r.copy()
         self._candidates.clear()
+        self.last_fix_us = t_us
         self._count("LOCK_ACQUIRED")
         return "LOCK_ACQUIRED"
 
