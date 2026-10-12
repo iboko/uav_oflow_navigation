@@ -131,6 +131,9 @@ def main() -> None:
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
                     help="send the anchor position only this long after the last fused map fix")
+    ap.add_argument("--max-map-step-error-m", type=float, default=1.0,
+                    help="map displacement minus VO displacement: base engineering bound, "
+                         "plus accumulated scale/heading/gap allowance (not flight validated)")
     ap.add_argument("--map-method", choices=("orb", "ncc"), default="orb",
                     help="ncc: ortho-rectified frame + correlation around a position prior "
                          "(orthophoto of another year/season)")
@@ -284,7 +287,8 @@ def main() -> None:
             if args.map_mode == "fuse":
                 c = json.loads(args.map_calibration.read_text())
                 anchor = MapAnchor(bias_ne_m=tuple(c["bias_ne_m"]),
-                                   covariance_ne_m2=tuple(tuple(r) for r in c["covariance_ne_m2"]))
+                                   covariance_ne_m2=tuple(tuple(r) for r in c["covariance_ne_m2"]),
+                                   max_map_step_error_m=args.max_map_step_error_m)
             pending.append((t0, first))
             print(json.dumps({"camera": [w, h], "focal_px": round(cal.focal_x_px, 1)}), flush=True)
         if pipeline is None:
@@ -357,7 +361,7 @@ def main() -> None:
                         if out is not None and out.vo.timestamp_us == t_frame:
                             psi = math.atan2(math.sin(fix.yaw_rad - state[2]), math.cos(fix.yaw_rad - state[2]))
                             result = anchor.fix(t_frame, fix.accepted, n, e, psi)
-                            nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS") else nis
+                            nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS", "FIX_REJECTED_STEP") else nis
                         else:
                             result = "NO_VO_AT_FRAME"
                     map_counts[fix.status] = map_counts.get(fix.status, 0) + 1
@@ -434,6 +438,8 @@ def main() -> None:
             if anchor is not None:
                 st = anchor.status()
                 status["map_anchor"] = {"locked": st.locked, "counts": st.counts,
+                                        "step_error_m": anchor.last_step_error_m,
+                                        "ci_weight_prior": anchor.last_ci_weight_prior,
                                         "heading_offset_deg": round(math.degrees(st.heading_offset_rad), 2),
                                         "position_ne_m": st.position_ne_m,
                                         "sigma_ne_m": [math.sqrt(st.covariance_ne_m2[i][i]) for i in (0, 1)]

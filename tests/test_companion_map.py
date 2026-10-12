@@ -116,3 +116,61 @@ def test_last_fix_time_tracks_only_map_backed_updates():
     locked_at = anchor.last_fix_us
     _fly(anchor, 10, start=pos, t0=t, map_shift=(0.0, 3.0), fix_every=5)  # all rejected
     assert anchor.last_fix_us == locked_at
+
+
+def test_repeated_correlated_fixes_do_not_collapse_covariance():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _fly(anchor, 150, v=(0.0, 0.0))
+    cov = np.asarray(anchor.status().covariance_ne_m2)
+    # Independent-update formula would shrink R nearly 150-fold.
+    assert np.linalg.eigvalsh(cov - np.asarray(R)).min() >= -1e-12
+    assert anchor.counts["FIX_FUSED"] == 147
+
+
+def test_wide_covariance_does_not_hide_an_abrupt_shift_or_poison_reference():
+    wide = ((0.82 ** 2, 0.0), (0.0, 0.82 ** 2))
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=wide)
+    _, pos, t = _fly(anchor, 3)
+    last_fix = anchor.last_fix_us
+    results, pos, t = _fly(anchor, 30, start=pos, t0=t, map_shift=(0.0, 3.0), fix_every=5)
+    assert set(results) == {"FIX_REJECTED_STEP"}
+    assert anchor.last_nis < 9.21  # marginal gate alone would accept
+    assert anchor.last_fix_us == last_fix
+    results, _, _ = _fly(anchor, 3, start=pos, t0=t)
+    assert set(results) == {"FIX_FUSED"}
+
+
+def test_step_gate_compares_displacement_not_distance_travelled():
+    wide = ((0.82 ** 2, 0.0), (0.0, 0.82 ** 2))
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=wide)
+    _, pos, t = _fly(anchor, 3)
+    # Move 10 m between map fixes: this is not a map jump.
+    anchor.propagate(t, t + 1_000_000, (10.0, 0.0), VO_COV)
+    assert anchor.fix(t + 1_000_000, True, pos[0] + 10.0, pos[1]) == "FIX_FUSED"
+
+
+def test_duplicate_map_fix_cannot_refresh_freshness_or_heading():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, pos, t = _fly(anchor, 3)
+    before = anchor.status()
+    assert anchor.fix(t, True, *pos, heading_offset_rad=1.0) == "FIX_DUPLICATE_OR_OLD"
+    assert anchor.last_fix_us == t
+    assert anchor.status().position_ne_m == before.position_ne_m
+    assert anchor.heading_offset_rad == before.heading_offset_rad
+
+
+@pytest.mark.parametrize("bad", [((1.0, 2.0), (0.0, 1.0)),
+                                  ((-1.0, 0.0), (0.0, 1.0))])
+def test_bad_vo_covariance_does_not_change_anchor(bad):
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, _, t = _fly(anchor, 3)
+    before = anchor.status()
+    anchor.propagate(t, t + DT, (1.0, 0.0), bad)
+    assert anchor.status().position_ne_m == before.position_ne_m
+    assert anchor.status().covariance_ne_m2 == before.covariance_ne_m2
+
+
+@pytest.mark.parametrize("limit", [0.0, -1.0, float("nan"), float("inf")])
+def test_step_limit_must_be_positive_and_finite(limit):
+    with pytest.raises(ValueError):
+        MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R, max_map_step_error_m=limit)

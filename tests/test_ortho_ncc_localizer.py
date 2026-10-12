@@ -64,3 +64,43 @@ def test_ncc_refuses_repetitive_texture_and_missing_prior():
     assert not fix.accepted and fix.status == "AMBIGUOUS_MAP_MATCH"
     assert loc.localize(frame, prior_ne_m=None, radius_m=25.0, height_agl_m=40.0, roll_rad=0.0, pitch_rad=0.0,
                         yaw_rad=0.0).status == "NO_PRIOR_POSITION"
+
+
+def test_ncc_uses_camera_height_and_full_rotated_lever_arm():
+    world = _texture(seed=7)
+    offset = np.array([1.5, -1.0, 2.0])
+    n, e, h, r, p, y = 12.0, -8.0, 40.0, 0.04, -0.03, math.radians(65)
+    lever = body_to_ned(r, p, y) @ offset
+    frame = _render(world, n + lever[0], e + lever[1], h - lever[2], r, p, y)
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, camera_offset_body_m=offset, patch_m=20.0,
+                            yaw_search_deg=(0.0,))
+    fix = loc.localize(frame, prior_ne_m=(n + 3.0, e - 2.0), radius_m=10.0,
+                       height_agl_m=h, roll_rad=r, pitch_rad=p, yaw_rad=y)
+    assert fix.accepted, fix
+    assert math.hypot(fix.north_m - n, fix.east_m - e) < 0.3
+
+
+def test_ambiguity_at_another_heading_is_rejected(monkeypatch):
+    world = _texture()
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(0.0, 2.0))
+    frame = _render(world, 0, 0, 40, 0, 0, 0)
+    surfaces = []
+    # Each heading is individually unambiguous, but distinct positions at
+    # the two headings have almost equal scores.
+    def match(window, patch, method):
+        response = np.zeros((window.shape[0] - patch.shape[0] + 1,
+                             window.shape[1] - patch.shape[1] + 1), np.float32)
+        response[15, 15 if not surfaces else 40] = 0.9 if not surfaces else 0.88
+        surfaces.append(response)
+        return response
+    monkeypatch.setattr(cv2, "matchTemplate", match)
+    fix = loc.localize(frame, prior_ne_m=(0.0, 0.0), radius_m=20.0,
+                       height_agl_m=40, roll_rad=0, pitch_rad=0, yaw_rad=0)
+    assert not fix.accepted and fix.status == "AMBIGUOUS_MAP_MATCH"
+
+
+@pytest.mark.parametrize("kwargs", [{"yaw_search_deg": ()}, {"patch_m": 0},
+                                    {"camera_offset_body_m": (0, 0, float("nan"))}])
+def test_invalid_ncc_geometry_is_refused(kwargs):
+    with pytest.raises(ValueError):
+        OrthoNccLocalizer(_texture(), GEO, CAL, MOUNT, **kwargs)

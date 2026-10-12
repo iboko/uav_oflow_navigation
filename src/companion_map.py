@@ -11,8 +11,10 @@
 
 * захват: три подряд привязки, разности которых совпадают с перемещением
   по VO (кинематическая проверка, не только по самой карте);
-* сопровождение: NIS привязки относительно распространенного положения
-  не больше χ²(2; 0,99). Отклоненная привязка не меняет положение, и
+* сопровождение: NIS не больше χ²(2; 0,99) и изменение привязки
+  согласуется с накопленным перемещением VO. После этих проверок
+  пересечение ковариаций (CI) учитывает неизвестную корреляцию карты
+  и прогноза. Отклоненная привязка не меняет положение, и
   захват заново по самим привязкам при этом не начинается: ложная, но
   самосогласованная карта (сдвиг георефа) иначе была бы принята.
   Захват заново нужен только после потери (СКО положения > max_sigma_m
@@ -24,9 +26,10 @@
 принятым привязкам поворачивает перемещения VO, пока она не набрана —
 неопределенность курса входит в ковариацию.
 
-Неучтенное: ошибки VO и привязки по одним кадрам коррелированы, а EKF2
-получает и это положение, и скорость VO (двойной учет VO). Ковариация
-положения при распространении растет по модели ошибок VO.
+CI не исправляет неверную калибровку и не исключает двойной учет VO:
+EKF2 получает и это положение, и скорость VO. Ковариация положения
+при распространении растет по модели ошибок VO. Проверка скачка
+имеет инженерный порог и не является гарантией целостности карты.
 """
 from __future__ import annotations
 
@@ -34,6 +37,8 @@ from dataclasses import dataclass, field
 from math import hypot, isfinite
 
 import numpy as np
+
+from .map_covariance_intersection import _covariance, covariance_intersection_2d
 
 CHI2_2D_99 = 9.210340371976184
 
@@ -54,15 +59,20 @@ class MapAnchor:
                  acquisition_tolerance_m: float = 0.3, max_sigma_m: float = 3.0,
                  nis_gate: float = CHI2_2D_99, max_gap_speed_m_s: float = 2.0,
                  heading_sigma_unknown_rad: float = 0.15, heading_sigma_known_rad: float = 0.03,
-                 heading_fixes_needed: int = 3) -> None:
+                 heading_fixes_needed: int = 3, max_map_step_error_m: float = 1.0) -> None:
         r = np.asarray(covariance_ne_m2, dtype=float)
         b = np.asarray(bias_ne_m, dtype=float)
         if r.shape != (2, 2) or b.shape != (2,) or not np.isfinite(r).all() or not np.isfinite(b).all():
             raise ValueError("Нужны конечные смещение и ковариация ошибки карты")
-        if not np.allclose(r, r.T) or np.min(np.linalg.eigvalsh(r)) <= 0:
-            raise ValueError("Ковариация ошибки карты не положительно определена")
+        r = _covariance(r, "ошибка карты")
+        if not all(isfinite(x) for x in (vo_scale_sigma, acquisition_tolerance_m, max_sigma_m,
+                nis_gate, max_gap_speed_m_s, heading_sigma_unknown_rad, heading_sigma_known_rad,
+                max_map_step_error_m)):
+            raise ValueError("Неконечные параметры привязки")
         if not (0 <= vo_scale_sigma < 0.5 and acquisition_fixes >= 2 and acquisition_tolerance_m > 0
-                and max_sigma_m > 0 and nis_gate > 0):
+                and max_sigma_m > 0 and nis_gate > 0 and max_gap_speed_m_s >= 0
+                and heading_sigma_unknown_rad >= 0 and heading_sigma_known_rad >= 0
+                and heading_fixes_needed >= 1 and max_map_step_error_m > 0):
             raise ValueError("Недопустимые параметры привязки")
         self._r = r
         self._bias = b
@@ -72,6 +82,10 @@ class MapAnchor:
         self._max_var = max_sigma_m ** 2
         self._gate = nis_gate
         self._gap_speed = max_gap_speed_m_s
+        self._step_limit = max_map_step_error_m
+        self._last_map_z: np.ndarray | None = None
+        self._vo_since_fix = np.zeros(2)
+        self._step_budget_m = 0.0
         # Heading of the autopilot (used by VO for N/E) relative to the map
         # frame, measured by the map fixes: magnetometer headings are off by
         # 5-10 deg, which rotates every VO displacement.
@@ -88,6 +102,8 @@ class MapAnchor:
         self._vo_since_candidate = np.zeros(2)
         self.counts: dict[str, int] = {}
         self.last_nis = float("nan")
+        self.last_step_error_m = float("nan")
+        self.last_ci_weight_prior = float("nan")
         self.last_fix_us = 0   # time of the last fused (or locking) map fix
 
     def _count(self, key: str) -> None:
@@ -103,8 +119,13 @@ class MapAnchor:
         dt = (t1_us - t0_us) * 1e-6
         v = np.asarray(v_ne, dtype=float)
         c = np.asarray(cov_ne, dtype=float)
-        if dt <= 0 or not np.isfinite(v).all() or not np.isfinite(c).all():
+        if dt <= 0 or v.shape != (2,) or not np.isfinite(v).all():
             self._count("BAD_VO_INTERVAL")
+            return
+        try:
+            c = _covariance(c, "скорость VO")
+        except ValueError:
+            self._count("BAD_VO_COVARIANCE")
             return
         psi = self.heading_offset_rad
         c_psi, s_psi = np.cos(psi), np.sin(psi)
@@ -126,6 +147,9 @@ class MapAnchor:
             self._t_us = t1_us
             return
         self._p = self._p + d
+        self._vo_since_fix += d
+        self._step_budget_m += ((self._scale_sigma + sigma_psi) * float(np.linalg.norm(d))
+                               + self._gap_speed * max(gap_s, 0.0))
         # Шум VO по паре + систематическая ошибка масштаба (доля пути);
         # за разрыв VO — неизвестное перемещение со скоростью до max_gap_speed.
         self._cov = (self._cov + c * dt * dt
@@ -139,6 +163,7 @@ class MapAnchor:
             # Без привязок слишком долго: положение больше не передается.
             self._p = None
             self._cov = None
+            self._last_map_z = None
             self._candidates.clear()
             self._count("LOCK_LOST_UNCERTAINTY")
             # Повторный захват — только по кинематически согласованным
@@ -185,6 +210,9 @@ class MapAnchor:
             # Положение известно только на конец последнего интервала VO.
             self._count("FIX_TIME_MISMATCH")
             return "FIX_TIME_MISMATCH"
+        if self._p is not None and t_us <= self.last_fix_us:
+            self._count("FIX_DUPLICATE_OR_OLD")
+            return "FIX_DUPLICATE_OR_OLD"
         if self._p is None:
             result = self._acquire(t_us, z)
             if result == "LOCK_ACQUIRED":
@@ -197,10 +225,19 @@ class MapAnchor:
         if not isfinite(nis) or nis > self._gate:
             self._count("FIX_REJECTED_NIS")
             return "FIX_REJECTED_NIS"
-        k = self._cov @ np.linalg.inv(s)
-        self._p = self._p + k @ y
-        self._cov = (np.eye(2) - k) @ self._cov
-        self._cov = 0.5 * (self._cov + self._cov.T)
+        # A wide marginal covariance must not hide a sudden georeference
+        # jump. Compare changes since the last accepted map fix with VO,
+        # retaining the same reference after every rejection. This is a
+        # configurable engineering bound, not a statistical integrity proof.
+        self.last_step_error_m = float(np.linalg.norm(z - self._last_map_z - self._vo_since_fix))
+        if self.last_step_error_m > self._step_limit + self._step_budget_m:
+            self._count("FIX_REJECTED_STEP")
+            return "FIX_REJECTED_STEP"
+        self._p, self._cov, self.last_ci_weight_prior = covariance_intersection_2d(
+            self._p, self._cov, z, self._r)
+        self._last_map_z = z.copy()
+        self._vo_since_fix = np.zeros(2)
+        self._step_budget_m = 0.0
         self._heading(heading_offset_rad)
         self.last_fix_us = t_us
         self._count("FIX_FUSED")
@@ -225,6 +262,9 @@ class MapAnchor:
             return "ACQUISITION_PENDING"
         self._p = z.copy()
         self._cov = self._r.copy()
+        self._last_map_z = z.copy()
+        self._vo_since_fix = np.zeros(2)
+        self._step_budget_m = 0.0
         self._candidates.clear()
         self.last_fix_us = t_us
         self._count("LOCK_ACQUIRED")
