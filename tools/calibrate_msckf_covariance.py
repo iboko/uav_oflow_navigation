@@ -41,7 +41,10 @@ def body_errors(flight_dir: Path, skip_s: float = 2.0):
     # started from the alignment and its covariance is the alignment's.
     gap = np.diff(t, prepend=-1e12) > 0.5e6
     start = np.maximum.accumulate(np.where(gap, t, -np.inf))
-    keep = t - start >= skip_s * 1e6
+    # Rows with a non-positive variance (logs before the 6-digit fix
+    # rounded calibrated variances to 0) cannot be normalised: dropped.
+    var_all = np.column_stack([rows[k] for k in ("var_x", "var_y", "var_z")])
+    keep = (t - start >= skip_s * 1e6) & np.all(var_all > 0, axis=1)
     t = t[keep]
     v_frd = np.column_stack([rows[k][keep] for k in ("vx", "vy", "vz")])
     var = np.column_stack([rows[k][keep] for k in ("var_x", "var_y", "var_z")])

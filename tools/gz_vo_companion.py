@@ -450,9 +450,13 @@ def main() -> None:
             sent += 1
             if log:
                 r = out.vo
-                log.write(",".join(str(round(v, 5)) for v in (
-                    out.time_us + pipeline.clock.offset_us, *out.velocity_frd, *out.variance_frd,
-                    r.vn_m_s, r.ve_m_s, out.vd_m_s)) + f",{r.inlier_count}\n")
+                # Variances with 6 significant digits: calibrated MSCKF
+                # variances are ~1e-5 m^2/s^2 and rounded to 0 at 5 decimals.
+                log.write(",".join([str(out.time_us + pipeline.clock.offset_us)]
+                                   + [str(round(v, 5)) for v in out.velocity_frd]
+                                   + [f"{v:.6g}" for v in out.variance_frd]
+                                   + [str(round(v, 5)) for v in (r.vn_m_s, r.ve_m_s, out.vd_m_s)])
+                          + f",{r.inlier_count}\n")
         # A frame waiting far too long has no autopilot data around it.
         while pending and now - pending[0][0] > 1_000_000:
             pending.pop(0)
