@@ -14,9 +14,13 @@ SIFT дал 0–5 точек. Устойчивее корреляция обла
   защита от повторяющихся структур;
 - патч целиком в кадре (иначе наклон слишком велик).
 
-Курс не измеряется: ошибка курса автопилота в несколько градусов
-ослабляет пик, но не смещает решение заметно. Ковариация — только из
-калибровки по отдельным полетам.
+Курс: лучший поворот из перебора (±12°, уточнение параболой) — это
+курс по карте (``yaw_rad``), на краю перебора — NaN. Прежняя оценка
+«систематический поворот −4° между съемками» была сделана при
+артефактном старте SITL (ошибка наклона и курса EKF2). После
+перезапуска EKF2 лучший поворот совпал с ошибкой курса автопилота.
+Точность курса и ковариация положения — только из калибровки по
+отдельным полетам.
 """
 from __future__ import annotations
 
@@ -35,7 +39,8 @@ class OrthoNccLocalizer:
                  mount: CameraMountCalibration, *, camera_offset_body_m=(0.0, 0.0, 0.0),
                  patch_m: float = 30.0, min_peak: float = 0.35, min_margin: float = 0.05,
                  exclusion_m: float = 3.0, max_tilt_rad: float = 0.12,
-                 yaw_search_deg=tuple(float(x) for x in range(-12, 13, 2))) -> None:
+                 yaw_search_deg=tuple(float(x) for x in range(-12, 13, 2)),
+                 map_clahe_tile_m: float = 8.75) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -68,6 +73,14 @@ class OrthoNccLocalizer:
         self.max_tilt = max_tilt_rad
         self.yaw_search = tuple(np.radians(yaw_search_deg))
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # The map is equalised once, with tiles of a fixed ground size. It
+        # was equalised per search window: the result then depended on the
+        # search radius (same place, 20 m window: peak 0.514, margin 0.086;
+        # 10 m window after lock: 0.466 and 0.047 -> ambiguous; swiss test).
+        # 8.75 m = the tile of the 20 m window used for the calibration.
+        tiles = (max(1, int(round(gray.shape[0] * self.gsd / map_clahe_tile_m))),
+                 max(1, int(round(gray.shape[1] * self.gsd / map_clahe_tile_m))))
+        self.map_eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=tiles).apply(gray)
         self.last_peak = float("nan")
         self.last_margin = float("nan")
 
@@ -115,7 +128,7 @@ class OrthoNccLocalizer:
         r0, c0 = int(round(row)) - rad, int(round(col)) - rad
         if r0 < 0 or c0 < 0 or r0 + 2 * rad > self.map.shape[0] or c0 + 2 * rad > self.map.shape[1]:
             return MapLocalizationFix(False, "OUTSIDE_MAP")
-        window = self.clahe.apply(self.map[r0:r0 + 2 * rad, c0:c0 + 2 * rad])
+        window = self.map_eq[r0:r0 + 2 * rad, c0:c0 + 2 * rad]
         # Search over heading offsets (+-12 deg): with a 4 deg autopilot
         # heading error the correlation lost its margin in SITL; at 6-7 deg the
         # +-6 deg search left the map unmatched after lock. The heading is a
@@ -123,6 +136,7 @@ class OrthoNccLocalizer:
         # systematic rotation between the 2019 and 2025 products).
         best = None
         envelope = None
+        peaks: dict[float, float] = {}
         for dyaw in self.yaw_search:
             patch, inside = self.ortho_patch(image, height_agl_m, roll_rad, pitch_rad, yaw_rad + dyaw)
             if not inside:
@@ -133,11 +147,12 @@ class OrthoNccLocalizer:
             r = cv2.matchTemplate(window, patch, cv2.TM_CCOEFF_NORMED)
             envelope = r.copy() if envelope is None else np.maximum(envelope, r)
             _, pk, _, lc = cv2.minMaxLoc(r)
+            peaks[dyaw] = float(pk)
             if best is None or pk > best[0]:
-                best = (pk, lc, r)
+                best = (pk, lc, r, dyaw)
         if best is None:
             return MapLocalizationFix(False, "NO_USABLE_ORTHO_PATCH")
-        peak, loc, res = best
+        peak, loc, res, best_dyaw = best
         # Compare all heading hypotheses: a different position at another
         # heading is also a competing map match. The selected surface alone
         # misses such ambiguity.
@@ -164,6 +179,24 @@ class OrthoNccLocalizer:
         cam_n = self.origin[0] - (r0 + y + self.npx / 2 - 0.5) * self.gsd
         cam_e = self.origin[1] + (c0 + x + self.npx / 2 - 0.5) * self.gsd
         north, east = cam_n - lever[0], cam_e - lever[1]
+        yaw = self._refined_yaw(yaw_rad, best_dyaw, peaks)
         return MapLocalizationFix(True, "NCC_ACCEPTED_UNVALIDATED", "ncc", float(north), float(east),
                                   0, int(round(100 * peak)), float(peak - second), float("nan"),
-                                  float("nan"), False, float("nan"), float(cam_n), float(cam_e))
+                                  float("nan"), False, yaw, float(cam_n), float(cam_e))
+
+    def _refined_yaw(self, yaw_rad: float, best_dyaw: float, peaks: dict[float, float]) -> float:
+        """Heading of the best rotation, refined by a parabola through the
+        neighbouring rotations. NaN at the edge of the search (the true
+        rotation may lie outside it) or without both neighbours. Its error
+        statistics need calibration on separate flights, like the position.
+        """
+        grid = sorted(self.yaw_search)
+        i = grid.index(best_dyaw)
+        if i == 0 or i == len(grid) - 1 or grid[i - 1] not in peaks or grid[i + 1] not in peaks:
+            return float("nan")
+        a, b, c = peaks[grid[i - 1]], peaks[best_dyaw], peaks[grid[i + 1]]
+        step = grid[i + 1] - best_dyaw
+        den = a - 2 * b + c
+        d = 0.5 * (a - c) / den * step if den < 0 else 0.0
+        y = yaw_rad + best_dyaw + d
+        return float(np.arctan2(np.sin(y), np.cos(y)))

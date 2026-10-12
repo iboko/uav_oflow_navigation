@@ -104,3 +104,26 @@ def test_ambiguity_at_another_heading_is_rejected(monkeypatch):
 def test_invalid_ncc_geometry_is_refused(kwargs):
     with pytest.raises(ValueError):
         OrthoNccLocalizer(_texture(), GEO, CAL, MOUNT, **kwargs)
+
+
+@pytest.mark.parametrize("heading_error_deg", [-7.0, 0.0, 5.0])
+def test_ncc_measures_heading_of_the_best_rotation(heading_error_deg):
+    world = _texture()
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT)
+    n, e, h, y = 5.0, 3.0, 40.0, math.radians(80)
+    frame = _render(world, n, e, h, 0.0, 0.0, y)
+    fix = loc.localize(frame, prior_ne_m=(n, e), radius_m=10.0, height_agl_m=h,
+                       roll_rad=0.0, pitch_rad=0.0, yaw_rad=y + math.radians(heading_error_deg))
+    assert fix.accepted
+    err = math.degrees(math.atan2(math.sin(fix.yaw_rad - y), math.cos(fix.yaw_rad - y)))
+    assert abs(err) < 1.0, err
+
+
+def test_ncc_heading_is_nan_at_the_edge_of_the_search():
+    world = _texture()
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(-2.0, 0.0, 2.0))
+    y = math.radians(80)
+    frame = _render(world, 0.0, 0.0, 40.0, 0.0, 0.0, y)
+    fix = loc.localize(frame, prior_ne_m=(0.0, 0.0), radius_m=10.0, height_agl_m=40.0,
+                       roll_rad=0.0, pitch_rad=0.0, yaw_rad=y + math.radians(6.0))
+    assert not math.isfinite(fix.yaw_rad) or not fix.accepted

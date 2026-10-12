@@ -24,6 +24,17 @@ def test_stop_targets_only_own_process_group(monkeypatch):
 
     instance.proc = Child()
     instance.cmd = lambda *args, **kwargs: "shutdown complete"
+    # A Gazebo server running before this instance (pid 500) is never
+    # touched; one started since (pid 600) is stopped.
+    instance._gz_before = {500}
+    alive = {500, 600}
+    monkeypatch.setattr("tools.gz_failure_scenarios._gz_server_pids", lambda: set(alive))
+    killed = []
+
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+        alive.discard(pid)
+    monkeypatch.setattr("tools.gz_failure_scenarios.os.kill", fake_kill)
     calls = []
     monkeypatch.setattr("tools.gz_failure_scenarios.os.killpg",
                         lambda pid, sig: calls.append((pid, sig)))
@@ -32,4 +43,5 @@ def test_stop_targets_only_own_process_group(monkeypatch):
     monkeypatch.setattr("tools.gz_failure_scenarios.subprocess.run", forbid_global_kill)
     instance.stop()
     assert calls == [(14321, signal.SIGTERM)]
+    assert killed == [(600, signal.SIGTERM)]
     assert instance.log.closed

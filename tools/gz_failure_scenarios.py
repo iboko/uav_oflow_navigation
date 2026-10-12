@@ -80,6 +80,21 @@ def install_textured_world(px4_dir: Path, seed: int = 7) -> None:
     (worlds / f"{TEXTURED_WORLD}.sdf").write_text(sdf, encoding="utf-8")
 
 
+def _gz_server_pids() -> set[int]:
+    """PIDs of running 'gz sim' processes (Linux /proc)."""
+    pids = set()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if any(a.endswith(b"gz") for a in argv[:2]) and b"sim" in argv[1:3]:
+            pids.add(int(d.name))
+    return pids
+
+
 class Px4:
     def __init__(self, px4_dir: Path, log: Path, world: str = "default",
                  params: dict[str, str] | None = None, model: str = "gz_x500_flow"):
@@ -90,6 +105,7 @@ class Px4:
         # Boot-time parameters (rcS: PX4_PARAM_<name>), set before modules start.
         env.update({f"PX4_PARAM_{k}": v for k, v in (params or {}).items()})
         self.log = log.open("w")
+        self._gz_before = _gz_server_pids()
         # Isolate the SITL/Gazebo process tree. Never terminate unrelated
         # Gazebo simulations running on the same development machine.
         self.proc = subprocess.Popen([str(self.build / "bin" / "px4"), "-d"], cwd=self.rootfs,
@@ -121,6 +137,23 @@ class Px4:
                 pass
             self.proc.wait(timeout=10)
         finally:
+            # The Gazebo server can leave PX4's process group and outlive it;
+            # the next start then attached to that stale world ("gazebo
+            # already running world"). Stop only the servers started since
+            # this instance began, never pre-existing ones.
+            for pid in _gz_server_pids() - self._gz_before:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            deadline = time.time() + 10
+            while (_gz_server_pids() - self._gz_before) and time.time() < deadline:
+                time.sleep(0.2)
+            for pid in _gz_server_pids() - self._gz_before:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             self.log.close()
 
 
