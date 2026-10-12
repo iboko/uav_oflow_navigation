@@ -168,3 +168,56 @@ def covariance_at_height(calibration: dict, height_m: float) -> np.ndarray:
         raise ValueError("Высота привязки и калибровки должна быть положительной")
     return _covariance(np.asarray(within, dtype=float) + np.asarray(between, dtype=float)
                        * (height_m / h_cal) ** 2, "ковариация привязки на высоте")
+
+
+def quality_covariance(floor_m2: float, k2: float, subpatch_cov_ne_m2) -> np.ndarray:
+    """Fix covariance from the match quality: floor * I + k2 * C_subpatch."""
+    c = np.asarray(subpatch_cov_ne_m2, dtype=float)
+    return floor_m2 * np.eye(2) + k2 * 0.5 * (c + c.T)
+
+
+def fit_quality_model(fit_errors: Sequence[np.ndarray], fit_subcov: Sequence[np.ndarray],
+                      holdout_errors: Sequence[np.ndarray], holdout_subcov: Sequence[np.ndarray],
+                      bias_ne_m) -> dict:
+    """Maximum likelihood (floor, k2) of R_i = floor*I + k2*C_i on the fit flights.
+
+    errors: per flight (n, 2) residuals [m] (bias is subtracted here);
+    subcov: per flight (n, 2, 2) sub-patch covariances of the same fixes.
+    Each flight has equal weight (mean log-likelihood per flight). Grid
+    search on a log grid: two parameters, no optimiser dependency. The
+    held-out flights are only evaluated (NEES, 95 % coverage).
+    """
+    b = np.asarray(bias_ne_m, dtype=float)
+    fit = [(np.asarray(e, float) - b, np.asarray(c, float)) for e, c in zip(fit_errors, fit_subcov)]
+    hold = [(np.asarray(e, float) - b, np.asarray(c, float)) for e, c in zip(holdout_errors, holdout_subcov)]
+    if not fit or any(len(e) != len(c) or len(e) < 10 for e, c in fit + hold):
+        raise ValueError("Нужны ошибки и ковариации четвертей для каждой привязки")
+
+    def terms(e, c, floor, k2):
+        cs = 0.5 * (c + np.transpose(c, (0, 2, 1)))
+        r = floor * np.eye(2)[None] + k2 * cs
+        det = r[:, 0, 0] * r[:, 1, 1] - r[:, 0, 1] ** 2
+        inv = np.stack([np.stack([r[:, 1, 1], -r[:, 0, 1]], -1), np.stack([-r[:, 1, 0], r[:, 0, 0]], -1)], -2) \
+            / det[:, None, None]
+        nees = np.einsum("ni,nij,nj->n", e, inv, e)
+        return np.log(det), nees
+
+    best = None
+    for floor in np.exp(np.linspace(np.log(1e-3), np.log(4.0), 60)):
+        for k2 in np.concatenate([[0.0], np.exp(np.linspace(np.log(1e-3), np.log(20.0), 70))]):
+            nll = 0.0
+            for e, c in fit:
+                ld, nees = terms(e, c, floor, k2)
+                nll += float(np.mean(ld + nees))
+            if best is None or nll < best[0]:
+                best = (nll, floor, k2)
+    _, floor, k2 = best
+    per = []
+    for e, c in hold:
+        _, nees = terms(e, c, floor, k2)
+        per.append(nees)
+    return {"floor_m2": float(floor), "k2": float(k2),
+            "fit_mean_nees": [round(float(np.mean(terms(e, c, floor, k2)[1])), 3) for e, c in fit],
+            "holdout_mean_nees": [round(float(np.mean(n)), 3) for n in per],
+            "holdout_coverage_95": [round(float(np.mean(n <= 5.991464547107979)), 3) for n in per],
+            "model": "R = floor_m2 * I + k2 * C_subpatch"}

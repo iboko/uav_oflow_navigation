@@ -40,7 +40,7 @@ from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E40
 from src.companion_map import MapAnchor  # noqa: E402
 from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
-from src.map_error_calibration import covariance_at_height  # noqa: E402
+from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
 from src.companion_vo import BodyVelocityMeasurement, CompanionVo  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
@@ -106,6 +106,23 @@ def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: Klt
                           float(cov_ne[0, 0]), float(cov_ne[0, 1]), float(cov_ne[1, 1]), start)
     return BodyVelocityMeasurement(t_frame, out.velocity_frd, out.variance_frd, vo, float(v_ne[2]),
                                    height, (roll, pitch, yaw))
+
+
+def flat(c) -> tuple[float, float, float]:
+    """(nn, ne, ee) of a 2x2 N/E covariance, NaN if absent."""
+    if c is None:
+        return (float("nan"),) * 3
+    return (round(c[0][0], 5), round(c[0][1], 5), round(c[1][1], 5))
+
+
+def fix_covariance(cal: dict, fix, height_m: float):
+    """Per-fix covariance: the match-quality model if calibrated and the
+    fix carries a sub-patch covariance, otherwise the calibrated one at
+    the frame height."""
+    q = cal.get("quality_model")
+    if q is not None and getattr(fix, "subpatch_cov_ne_m2", None) is not None:
+        return quality_covariance(q["floor_m2"], q["k2"], fix.subpatch_cov_ne_m2)
+    return covariance_at_height(cal, height_m)
 
 
 def stamp_us(header) -> int:
@@ -197,7 +214,8 @@ def main() -> None:
     map_log = args.map_log.open("w") if args.map_log else None
     if map_log:
         map_log.write("t_us,localizer_status,north_m,east_m,inliers,heading_offset_rad,height_m,"
-                      "injected_shift_n,injected_shift_e,anchor_result,nis,process_ms\n")
+                      "injected_shift_n,injected_shift_e,anchor_result,nis,process_ms,"
+                      "sub_nn,sub_ne,sub_ee,shape_nn,shape_ne,shape_ee,peak,margin\n")
 
     # MAVLink is read in its own thread: the MSCKF initialisation takes
     # 0.7-1.8 s, and a loop blocked that long overflowed the UDP buffer
@@ -365,7 +383,7 @@ def main() -> None:
                         if out is not None and out.vo.timestamp_us == t_frame:
                             psi = math.atan2(math.sin(fix.yaw_rad - state[2]), math.cos(fix.yaw_rad - state[2]))
                             result = anchor.fix(t_frame, fix.accepted, n, e, psi,
-                                                covariance_ne_m2=covariance_at_height(map_cal, state[3])
+                                                covariance_ne_m2=fix_covariance(map_cal, fix, state[3])
                                                 if fix.accepted else None)
                             nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS", "FIX_REJECTED_STEP") else nis
                         else:
@@ -375,7 +393,9 @@ def main() -> None:
                         map_log.write(",".join(str(v) for v in (
                             t_frame, fix.status, round(n, 4), round(e, 4), fix.inlier_points,
                             round(fix.yaw_rad - state[2], 4), round(state[3], 3), map_shift[0], map_shift[1],
-                            result, round(nis, 3), round(ms, 1))) + "\n")
+                            result, round(nis, 3), round(ms, 1), *flat(fix.subpatch_cov_ne_m2), *flat(fix.shape_ne_m2),
+                            round(float(getattr(localizer, "last_peak", float("nan"))), 4),
+                            round(float(getattr(localizer, "last_margin", float("nan"))), 4))) + "\n")
             if out is None:
                 continue
             # A late measurement is worse than none: EKF2 fuses it at its stamp

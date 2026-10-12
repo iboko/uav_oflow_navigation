@@ -49,7 +49,7 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.map_error_calibration import MapErrorFlight, calibrate_map_error  # noqa: E402
+from src.map_error_calibration import fit_quality_model, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
 
 # EV horizontal position + velocity. 5 m: at 3 m the camera sees the ground
 # at 1.6x the map resolution and ORB matching fails (checked offline).
@@ -194,6 +194,24 @@ def heading_calibration(dirs) -> dict | None:
             "holdout_within_2sd": round(float(np.mean(np.abs(hold - m) <= 2 * sd)), 3)}
 
 
+def quality_calibration(dirs, bias) -> dict | None:
+    """ML fit of R = floor*I + k2*C_subpatch on the 3 fit flights, NEES on
+    the 2 held-out ones. Fixes without a sub-patch covariance are left out
+    (counted)."""
+    errs, subs, dropped = [], [], []
+    for d in dirs:
+        f = json.loads((d / "map_errors.json").read_text())
+        if "subpatch_cov_ne_m2" not in f:
+            return None
+        e = np.asarray(f["errors_ne_m"], float)
+        c = np.asarray(f["subpatch_cov_ne_m2"], float)
+        ok = np.isfinite(c).all(axis=(1, 2))
+        errs.append(e[ok]); subs.append(c[ok]); dropped.append(int((~ok).sum()))
+    m = fit_quality_model(errs[:3], subs[:3], errs[3:], subs[3:], bias)
+    m["fixes_without_subpatch"] = dropped
+    return m
+
+
 def combine(args) -> None:
     flights, heights = [], []
     for d in args.flights:
@@ -239,6 +257,7 @@ def combine(args) -> None:
                                                  for f in flights[:3]])),
            "outlier_rule": f"|error - flight median| > {FALSE_FIX_M} m",
            "map_heading": heading_calibration(args.flights),
+           "quality_model": quality_calibration(args.flights, cal.bias_ne_m),
            "holdout_details": cal.holdout_flight_details,
            "independently_validated_for_flight": False,
            "note": "simulated flights (Gazebo, idealised camera)"}
@@ -555,6 +574,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         # estimated from the rest; the rate is reported, the flight is kept
         # (re-flying until no outlier would hide them).
         bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
+        sub = [tuple(float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")) for r in acc]
         false = int(np.sum(bad))
         e = e_all[~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
@@ -564,7 +584,11 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"],
                "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_])),
                # Map heading error of the same fixes (NaN: no heading from the search).
-               "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]]}
+               "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]],
+               # Sub-patch covariance of the same (inlier) fixes, for the
+               # match-quality covariance model (NaN rows: not available).
+               "subpatch_cov_ne_m2": [[[sub[k][0], sub[k][1]], [sub[k][1], sub[k][2]]]
+                                      for k in np.flatnonzero(sel)[~bad]]}
         (args.out / "map_errors.json").write_text(json.dumps(out, indent=1))
         report["flight_map_errors"] = {k: v for k, v in out.items() if k != "errors_ne_m"}
         report["analysis_ok"] = len(e) >= 30
@@ -617,6 +641,29 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
     report["fused_fix_count"] = len(fused)
     report["map_fix_error_ne_m"] = {"mean": err.mean(axis=0).round(3).tolist(),
                                    "std": err.std(axis=0).round(3).tolist()}
+    # Diagnostic: NEES of the bias-corrected fixes with the calibrated
+    # covariance (constant) and, if calibrated, the match-quality model.
+    if args.calibration:
+        cal = json.loads(args.calibration.read_text())
+        e = err - np.asarray(cal["bias_ne_m"])
+        c0 = np.asarray(cal["covariance_ne_m2"])
+        n0 = np.einsum("ni,ij,nj->n", e, np.linalg.inv(c0), e)
+        diag = {"constant_mean_nees": round(float(np.mean(n0)), 2),
+                "constant_coverage_95": round(float(np.mean(n0 <= 5.991)), 3)}
+        q = cal.get("quality_model")
+        if q:
+            nq = []
+            for r, ei in zip(acc, e):
+                c = [float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")]
+                if all(map(math.isfinite, c)):
+                    rq = quality_covariance(q["floor_m2"], q["k2"], [[c[0], c[1]], [c[1], c[2]]])
+                    nq.append(float(ei @ np.linalg.solve(rq, ei)))
+            if nq:
+                nq = np.asarray(nq)
+                diag.update({"quality_mean_nees": round(float(np.mean(nq)), 2),
+                             "quality_coverage_95": round(float(np.mean(nq <= 5.991)), 3), "quality_fixes": len(nq)})
+        report["map_fix_consistency"] = diag
+        print("MAP_FIX_CONSISTENCY", diag, flush=True)
 
 
 if __name__ == "__main__":

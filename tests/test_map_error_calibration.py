@@ -151,3 +151,22 @@ def test_fix_covariance_scales_tilt_part_with_height():
     assert np.allclose(covariance_at_height({"covariance_ne_m2": [[0.5, 0], [0, 0.5]]}, 80.0), 0.5 * np.eye(2))
     with pytest.raises(ValueError):
         covariance_at_height(cal, float("nan"))
+
+
+def test_quality_model_recovers_scale_of_subpatch_covariance():
+    from src.map_error_calibration import fit_quality_model, quality_covariance
+    rng = np.random.default_rng(3)
+
+    def flight(n=200):
+        s = rng.uniform(0.05, 1.5, n)                    # sub-patch scatter varies per fix
+        c = np.stack([np.diag([v, 0.3 * v]) for v in s])  # anisotropic
+        r = 0.04 * np.eye(2)[None] + 0.5 * c              # truth: floor 0.04, k2 0.5
+        e = np.stack([rng.multivariate_normal([0.2, -0.1], ri) for ri in r])
+        return e, c
+    fit = [flight() for _ in range(3)]
+    hold = [flight() for _ in range(2)]
+    m = fit_quality_model([f[0] for f in fit], [f[1] for f in fit], [h[0] for h in hold], [h[1] for h in hold],
+                          (0.2, -0.1))
+    assert 0.3 < m["k2"] < 0.8 and 0.01 < m["floor_m2"] < 0.1, m
+    assert all(1.5 < x < 2.6 for x in m["holdout_mean_nees"])
+    assert np.allclose(quality_covariance(0.04, 0.5, [[1, 0], [0, 0.3]]), [[0.54, 0], [0, 0.19]])

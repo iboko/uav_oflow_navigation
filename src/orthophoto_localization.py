@@ -83,6 +83,13 @@ class MapLocalizationFix:
     # Independent of the assumed attitude, unlike north_m/east_m.
     ground_north_m: float = float("nan")
     ground_east_m: float = float("nan")
+    # NCC only: shape of the correlation peak in N/E, (1 - peak) * (-H)^-1
+    # [m^2] (H: curvature of the correlation surface at the peak). Not a
+    # covariance by itself: its scale and a floor need calibration.
+    shape_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
+    # NCC only: sample covariance of the N/E offsets of the patch quadrants
+    # matched separately [m^2] (local geometric consistency of the match).
+    subpatch_cov_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
 
 
 @dataclass(frozen=True)
