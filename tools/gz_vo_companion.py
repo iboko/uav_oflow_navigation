@@ -156,6 +156,8 @@ def main() -> None:
         ap.error("--map-mode needs --orthophoto and --map-georef")
     if args.map_mode == "fuse" and not args.map_calibration:
         ap.error("--map-mode fuse needs --map-calibration (no uncalibrated map covariance)")
+    if not all(math.isfinite(x) and x > 0 for x in (args.max_fix_age_s, args.max_map_step_error_m)):
+        ap.error("--max-fix-age-s and --max-map-step-error-m must be finite and positive")
 
     clock_us = [0]          # companion clock = simulation time
     frames: queue.Queue = queue.Queue(maxsize=8)
@@ -384,21 +386,16 @@ def main() -> None:
             # Position only with a map lock: EKF2 stops position fusion on any
             # message without it, so it is sent with every velocity message.
             pos, pose_cov, quat = [nan, nan, nan], [nan] * 21, [nan, nan, nan, nan]
-            st = anchor.status() if anchor is not None else None
             # Only a map-backed position: without a fused fix for max_fix_age_s
             # the anchor is VO integrated with the autopilot heading, and EKF2
             # fusing it next to the VO velocity rotated the heading by 17 deg
             # after GNSS loss (swiss scene). Velocity only then.
-            fresh = anchor is not None and out.vo.timestamp_us - anchor.last_fix_us <= args.max_fix_age_s * 1e6
-            if st is not None and st.locked and fresh and math.isfinite(out.height_mid_m):
-                back_s = (out.vo.timestamp_us - out.time_us) * 1e-6  # anchor is at the frame time
-                pos = [st.position_ne_m[0] - out.vo.vn_m_s * back_s,
-                       st.position_ne_m[1] - out.vo.ve_m_s * back_s,
+            measurement = anchor.measurement_at(out.time_us, max_fix_age_s=args.max_fix_age_s) \
+                if anchor is not None else None
+            if measurement is not None and math.isfinite(out.height_mid_m):
+                pos = [*measurement.position_ne_m,
                        -out.height_mid_m]  # map datum = ground plane; EV height is not fused
-                pose_cov = [0.0] * 21
-                pose_cov[0], pose_cov[6] = st.covariance_ne_m2[0][0], st.covariance_ne_m2[1][1]
-                pose_cov[11] = 0.05 ** 2
-                pose_cov[15] = pose_cov[18] = pose_cov[20] = nan
+                pose_cov = list(measurement.mavlink_pose_covariance(0.05 ** 2))
                 if args.map_yaw and anchor.heading_known and all(map(math.isfinite, out.rpy_mid)):
                     # Heading = autopilot heading + offset measured by the map.
                     # EKF2 takes only the yaw of this quaternion (fuseYaw);
