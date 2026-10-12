@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from src.companion_map import MapAnchor
+from src.companion_map import AnchorMeasurement, MapAnchor
 
 R = ((0.05 ** 2, 0.0), (0.0, 0.05 ** 2))
 VO_COV = ((0.05 ** 2, 0.0), (0.0, 0.05 ** 2))
@@ -174,3 +174,80 @@ def test_bad_vo_covariance_does_not_change_anchor(bad):
 def test_step_limit_must_be_positive_and_finite(limit):
     with pytest.raises(ValueError):
         MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R, max_map_step_error_m=limit)
+
+
+def test_persistent_scale_uncertainty_is_independent_of_frame_partition():
+    covariances = []
+    for frames in (1, 100):
+        anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R,
+                           heading_sigma_unknown_rad=0.0, heading_sigma_known_rad=0.0,
+                           max_sigma_m=10.0)
+        _, _, t = _fly(anchor, 3, v=(0.0, 0.0))
+        dt_us = 1_000_000 // frames
+        for _ in range(frames):
+            anchor.propagate(t, t + dt_us, (10.0, 0.0), ((1e-12, 0.0), (0.0, 1e-12)))
+            t += dt_us
+        covariances.append(np.asarray(anchor.status().covariance_ne_m2))
+    # 5% constant scale error on 10 m: 0.5 m sigma, 0.25 m² variance.
+    expected = np.asarray(R) + np.eye(2) * 0.25
+    for cov in covariances:
+        assert np.allclose(cov, expected, rtol=0, atol=2e-12)
+
+
+def test_long_visual_outage_loses_lock_from_accumulated_scale_uncertainty():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R,
+                       heading_sigma_unknown_rad=0.0, max_sigma_m=0.4)
+    _, _, t = _fly(anchor, 3, v=(0.0, 0.0))
+    for _ in range(100):
+        anchor.propagate(t, t + 10_000, (10.0, 0.0), VO_COV)
+        t += 10_000
+    # The old sum of squared per-frame scale errors gave sigma ~0.07 m.
+    assert not anchor.locked
+    assert anchor.counts["LOCK_LOST_UNCERTAINTY"] == 1
+    assert anchor.measurement_at(t, max_fix_age_s=10.0) is None
+
+
+def test_midpoint_position_uses_heading_corrected_velocity():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R,
+                       heading_fixes_needed=1)
+    _, pos, t = _fly(anchor, 3, v=(0.0, 0.0), heading_error=np.pi / 2)
+    anchor.propagate(t, t + 100_000, (0.0, -2.0), VO_COV)
+    measurement = anchor.measurement_at(t + 50_000, max_fix_age_s=1.0)
+    assert measurement is not None
+    assert measurement.timestamp_us == t + 50_000
+    assert measurement.position_ne_m == pytest.approx((pos[0] + 0.1, pos[1]), abs=1e-12)
+    # Retiming must not make the position look more precise than the end state.
+    delta = np.asarray(measurement.covariance_ne_m2) - np.asarray(anchor.status().covariance_ne_m2)
+    assert np.linalg.eigvalsh(delta).min() >= 0
+
+
+def test_map_position_export_refuses_stale_and_extrapolated_timestamps():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, _, t = _fly(anchor, 3, v=(0.0, 0.0))
+    anchor.propagate(t, t + 200_000, (0.0, 0.0), VO_COV)
+    assert anchor.measurement_at(t - 1, max_fix_age_s=1.0) is None
+    assert anchor.measurement_at(t + 200_001, max_fix_age_s=1.0) is None
+    assert anchor.measurement_at(t + 100_000, max_fix_age_s=0.1) is None
+    assert anchor.measurement_at(t + 100_000, max_fix_age_s=1.0) is not None
+    anchor.last_fix_us = t + 300_000  # corrupt/future reference cannot pass freshness
+    assert anchor.measurement_at(t + 200_000, max_fix_age_s=1.0) is None
+
+
+@pytest.mark.parametrize("age", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_map_freshness_limit_is_refused(age):
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    with pytest.raises(ValueError):
+        anchor.measurement_at(0, max_fix_age_s=age)
+
+
+def test_mavlink_position_covariance_preserves_ne_correlation():
+    p = ((0.4, -0.1), (-0.1, 0.3))
+    measurement = AnchorMeasurement(1_000_000, (1.0, 2.0), p)
+    packed = measurement.mavlink_pose_covariance(0.02)
+    matrix = np.zeros((6, 6))
+    upper = np.triu_indices(6)
+    matrix[upper] = packed
+    matrix[(upper[1], upper[0])] = packed
+    assert np.allclose(matrix[:2, :2], p)
+    assert matrix[2, 2] == 0.02
+    assert np.isnan(np.diag(matrix)[3:]).all()

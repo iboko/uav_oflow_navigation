@@ -52,6 +52,23 @@ class AnchorStatus:
     heading_offset_rad: float = 0.0
 
 
+@dataclass(frozen=True)
+class AnchorMeasurement:
+    timestamp_us: int
+    position_ne_m: tuple[float, float]
+    covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]]
+
+    def mavlink_pose_covariance(self, height_variance_m2: float) -> tuple[float, ...]:
+        """Upper triangle of [N,E,D,roll,pitch,yaw], including the NE term."""
+        if not isfinite(height_variance_m2) or height_variance_m2 < 0:
+            raise ValueError("Некорректная дисперсия высоты")
+        p = _covariance(self.covariance_ne_m2, "положение для MAVLink")
+        values = [0.0] * 21
+        values[0], values[1], values[6], values[11] = p[0, 0], p[0, 1], p[1, 1], height_variance_m2
+        values[15] = values[18] = values[20] = float("nan")
+        return tuple(float(x) for x in values)
+
+
 class MapAnchor:
     def __init__(self, *, bias_ne_m: tuple[float, float],
                  covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]],
@@ -86,6 +103,11 @@ class MapAnchor:
         self._last_map_z: np.ndarray | None = None
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
+        self._drift_sigma_m = np.zeros(3)  # scale, heading, unobserved VO gaps
+        self._interval_start_us = 0
+        self._interval_velocity_ne = np.zeros(2)
+        self._interval_velocity_cov = np.eye(2)
+        self._interval_heading_sigma = 0.0
         # Heading of the autopilot (used by VO for N/E) relative to the map
         # frame, measured by the map fixes: magnetometer headings are off by
         # 5-10 deg, which rotates every VO displacement.
@@ -119,7 +141,7 @@ class MapAnchor:
         dt = (t1_us - t0_us) * 1e-6
         v = np.asarray(v_ne, dtype=float)
         c = np.asarray(cov_ne, dtype=float)
-        if dt <= 0 or v.shape != (2,) or not np.isfinite(v).all():
+        if not isfinite(dt) or dt <= 0 or v.shape != (2,) or not np.isfinite(v).all():
             self._count("BAD_VO_INTERVAL")
             return
         try:
@@ -137,6 +159,10 @@ class MapAnchor:
         if gap_s < -1e-3:
             self._count("BAD_VO_INTERVAL")
             return
+        self._interval_start_us = t0_us
+        self._interval_velocity_ne = rot @ v
+        self._interval_velocity_cov = c.copy()
+        self._interval_heading_sigma = sigma_psi
         if self._p is None:
             if self._candidates and gap_s > 1e-3:
                 # Перемещение за разрыв VO неизвестно: захват заново.
@@ -150,12 +176,16 @@ class MapAnchor:
         self._vo_since_fix += d
         self._step_budget_m += ((self._scale_sigma + sigma_psi) * float(np.linalg.norm(d))
                                + self._gap_speed * max(gap_s, 0.0))
-        # Шум VO по паре + систематическая ошибка масштаба (доля пути);
-        # за разрыв VO — неизвестное перемещение со скоростью до max_gap_speed.
-        self._cov = (self._cov + c * dt * dt
-                     + np.eye(2) * (self._scale_sigma * float(np.linalg.norm(d))) ** 2
-                     + np.eye(2) * (sigma_psi * float(np.linalg.norm(d))) ** 2
-                     + np.eye(2) * (self._gap_speed * max(gap_s, 0.0)) ** 2)
+        # Persistent scale/heading errors accumulate with total path, not
+        # with sqrt(number of frames). Add only the increment of the squared
+        # accumulated budgets; the same displacement split into more frames
+        # must not make its systematic uncertainty disappear.
+        old_drift_var = float(self._drift_sigma_m @ self._drift_sigma_m)
+        distance = float(np.linalg.norm(d))
+        self._drift_sigma_m += np.array([self._scale_sigma * distance, sigma_psi * distance,
+                                        self._gap_speed * max(gap_s, 0.0)])
+        drift_var = float(self._drift_sigma_m @ self._drift_sigma_m)
+        self._cov = self._cov + c * dt * dt + np.eye(2) * (drift_var - old_drift_var)
         if gap_s > 1e-3:
             self._count("VO_GAP_INFLATED")
         self._t_us = t1_us
@@ -238,6 +268,7 @@ class MapAnchor:
         self._last_map_z = z.copy()
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
+        self._drift_sigma_m[:] = 0.0
         self._heading(heading_offset_rad)
         self.last_fix_us = t_us
         self._count("FIX_FUSED")
@@ -265,6 +296,7 @@ class MapAnchor:
         self._last_map_z = z.copy()
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
+        self._drift_sigma_m[:] = 0.0
         self._candidates.clear()
         self.last_fix_us = t_us
         self._count("LOCK_ACQUIRED")
@@ -276,3 +308,31 @@ class MapAnchor:
         return AnchorStatus(True, (float(self._p[0]), float(self._p[1])),
                             tuple(tuple(float(v) for v in row) for row in self._cov), dict(self.counts),
                             self.heading_offset_rad)
+
+    def measurement_at(self, timestamp_us: int, *, max_fix_age_s: float) -> AnchorMeasurement | None:
+        """Map-backed position within the most recent VO interval only.
+
+        A midpoint VO message must use the same heading-corrected velocity
+        used by propagate(). No extrapolation outside the stored interval.
+        End-state covariance is retained and inflated for the backward
+        displacement with an unknown-cross-correlation bound; it is never
+        reduced by pretending this velocity is an independent observation.
+        """
+        if not isfinite(max_fix_age_s) or max_fix_age_s <= 0:
+            raise ValueError("Возраст привязки должен быть конечным и положительным")
+        if (self._p is None or not isfinite(timestamp_us)
+                or not self._interval_start_us <= timestamp_us <= self._t_us
+                or not 0 <= self._t_us - self.last_fix_us <= max_fix_age_s * 1e6):
+            return None
+        back_s = (self._t_us - timestamp_us) * 1e-6
+        back = self._interval_velocity_ne * back_s
+        cov = self._cov.copy()
+        if back_s > 0:
+            q = self._interval_velocity_cov * back_s ** 2 + np.eye(2) * (
+                self._scale_sigma ** 2 + self._interval_heading_sigma ** 2) * float(back @ back)
+            # ||C_p,d + C_d,p|| <= 2 sqrt(lambda_max(P) lambda_max(Q)).
+            cross_bound = 2 * np.sqrt(np.linalg.eigvalsh(cov).max() * np.linalg.eigvalsh(q).max())
+            cov += q + np.eye(2) * cross_bound
+        position = self._p - back
+        return AnchorMeasurement(int(timestamp_us), tuple(float(x) for x in position),
+                                 tuple(tuple(float(x) for x in row) for row in cov))
