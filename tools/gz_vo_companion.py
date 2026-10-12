@@ -40,6 +40,7 @@ from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E40
 from src.companion_map import MapAnchor  # noqa: E402
 from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
+from src.map_error_calibration import covariance_at_height  # noqa: E402
 from src.companion_vo import BodyVelocityMeasurement, CompanionVo  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
@@ -185,6 +186,7 @@ def main() -> None:
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
+    map_cal: dict | None = None
     map_shift = np.zeros(2)
     msckf: CompanionMsckf | None = None
     tracker: KltTracker | None = None
@@ -287,7 +289,7 @@ def main() -> None:
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                     camera_offset_body_m=tuple(args.camera_offset_frd))
             if args.map_mode == "fuse":
-                c = json.loads(args.map_calibration.read_text())
+                c = map_cal = json.loads(args.map_calibration.read_text())
                 anchor = MapAnchor(bias_ne_m=tuple(c["bias_ne_m"]),
                                    covariance_ne_m2=tuple(tuple(r) for r in c["covariance_ne_m2"]),
                                    max_map_step_error_m=args.max_map_step_error_m)
@@ -362,7 +364,9 @@ def main() -> None:
                         # Position is known at the end of the last VO interval only.
                         if out is not None and out.vo.timestamp_us == t_frame:
                             psi = math.atan2(math.sin(fix.yaw_rad - state[2]), math.cos(fix.yaw_rad - state[2]))
-                            result = anchor.fix(t_frame, fix.accepted, n, e, psi)
+                            result = anchor.fix(t_frame, fix.accepted, n, e, psi,
+                                                covariance_ne_m2=covariance_at_height(map_cal, state[3])
+                                                if fix.accepted else None)
                             nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS", "FIX_REJECTED_STEP") else nis
                         else:
                             result = "NO_VO_AT_FRAME"

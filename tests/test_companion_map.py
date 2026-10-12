@@ -251,3 +251,18 @@ def test_mavlink_position_covariance_preserves_ne_correlation():
     assert np.allclose(matrix[:2, :2], p)
     assert matrix[2, 2] == 0.02
     assert np.isnan(np.diag(matrix)[3:]).all()
+
+
+def test_fix_covariance_override_is_used_and_validated():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _fly(anchor, 3)
+    wide = ((1.0, 0.0), (0.0, 1.0))
+    t = anchor.status()
+    anchor.propagate(1_198_000, 1_264_000, (1.0, 0.0), VO_COV)
+    # 0.5 m off: rejected by NIS with the narrow covariance, accepted with the wide one.
+    p = np.asarray(anchor.status().position_ne_m)
+    assert anchor.fix(1_264_000, True, p[0] + 0.5, p[1], covariance_ne_m2=wide) == "FIX_FUSED"
+    anchor.propagate(1_264_000, 1_330_000, (1.0, 0.0), VO_COV)
+    bad = ((1.0, 2.0), (2.0, 1.0))
+    assert anchor.fix(1_330_000, True, 0.0, 0.0, covariance_ne_m2=bad) == "FIX_BAD_COVARIANCE"
+    assert t.locked

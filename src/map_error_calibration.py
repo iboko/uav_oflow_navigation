@@ -37,6 +37,12 @@ class MapErrorCalibration:
     holdout_false_fix_rate_among_accepted: float
     holdout_flight_details: dict
     independently_validated_for_flight: bool = False
+    # Decomposition of covariance_ne_m2 (= within + between): scatter of
+    # fixes around their own flight mean, and scatter of the flight means
+    # around the pooled bias (a per-flight systematic error, e.g. the tilt
+    # error of the attitude used for ortho-rectification).
+    within_flight_covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
+    between_flight_covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
 
 
 def _errors(flight: MapErrorFlight, *, min_samples: int) -> np.ndarray:
@@ -99,6 +105,9 @@ def calibrate_map_error(
         (x-bias).T @ (x-bias) / len(x) for x in train
     ]), axis=0)
     cov = _covariance(cov, "оцененная ковариация ошибок карты")
+    means = np.stack([np.mean(x, axis=0) for x in train])
+    between = np.mean(np.stack([np.outer(m - bias, m - bias) for m in means]), axis=0)
+    within_flight = cov - between
 
     details = {}
     flight_coverages = []
@@ -134,4 +143,28 @@ def calibrate_map_error(
         float(np.mean(flight_false_rates)),
         details,
         False,
+        tuple(tuple(float(v) for v in line) for line in within_flight),
+        tuple(tuple(float(v) for v in line) for line in between),
     )
+
+
+def covariance_at_height(calibration: dict, height_m: float) -> np.ndarray:
+    """Fix covariance at the frame height from a calibration JSON.
+
+    Without the decomposition: the calibrated covariance as is. With it:
+    within + between * (h / h_cal)^2. The between-flight part is taken as
+    a tilt error of the attitude used for ortho-rectification (the
+    nadir point moves by h * tilt; SWISSIMAGE series, ulogs). The
+    within-flight part (correlation noise, map vs scene) is kept as
+    calibrated. A model assumption: flights at other heights must check it.
+    """
+    total = np.asarray(calibration["covariance_ne_m2"], dtype=float)
+    within = calibration.get("within_flight_covariance_ne_m2")
+    between = calibration.get("between_flight_covariance_ne_m2")
+    h_cal = calibration.get("calibration_height_m")
+    if within is None or between is None or h_cal is None:
+        return total
+    if not (isfinite(height_m) and height_m > 0 and isfinite(h_cal) and h_cal > 0):
+        raise ValueError("Высота привязки и калибровки должна быть положительной")
+    return _covariance(np.asarray(within, dtype=float) + np.asarray(between, dtype=float)
+                       * (height_m / h_cal) ** 2, "ковариация привязки на высоте")

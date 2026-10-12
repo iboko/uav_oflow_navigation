@@ -105,7 +105,14 @@ def flags_and_validity(px4: gz.Px4) -> dict:
             "cs_opt_flow": flags.get("cs_opt_flow"), "xy_valid": lp.get("xy_valid")}
 
 
-def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_error_deg: float = 10.0) -> dict:
+def _roll_pitch_deg(att: dict) -> tuple[float, float]:
+    w, x, y, z = (float(att[f"q[{i}]"]) for i in range(4))
+    return (math.degrees(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))),
+            math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))))
+
+
+def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_error_deg: float = 10.0,
+                           max_tilt_error_deg: float = 0.5) -> dict:
     """Preflight gate from EKF2's own signals only (never ground truth).
 
     5 consecutive seconds: GNSS fused, magnetometer fused (heading or 3D) and
@@ -143,7 +150,23 @@ def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_er
     err = math.degrees(abs((state["yaw"] - truth + math.pi) % (2 * math.pi) - math.pi))
     if not err < max_heading_error_deg:
         raise SitlStartRejected(f"SITL start rejected: EKF2 heading {err:.1f} deg from simulator truth")
-    return {"heading_rad": state["yaw"], "heading_error_vs_truth_deg": round(err, 2)}
+    # Same for the tilt: the Gazebo IMU has no accelerometer bias, yet some
+    # starts leave EKF2 with a 0.2-0.35 m/s^2 accelerometer bias estimate
+    # and a matching 1-2.5 deg tilt error from the first seconds on the
+    # ground, constant for the whole flight (ulogs of the swiss series). At
+    # 40 m it shifted every ortho-rectified map fix by 1-2 m. 0.5 deg keeps
+    # a realistic AHRS tilt error in the test.
+    est = _roll_pitch_deg(topic(px4, "vehicle_attitude"))
+    gt = _roll_pitch_deg(topic(px4, "vehicle_attitude_groundtruth"))
+    tilt = (est[0] - gt[0], est[1] - gt[1])
+    bias = topic(px4, "estimator_sensor_bias")
+    accel_bias = [round(float(bias.get(f"accel_bias[{i}]", math.nan)), 3) for i in range(3)]
+    if not math.hypot(*tilt) < max_tilt_error_deg:
+        raise SitlStartRejected(f"SITL start rejected: EKF2 tilt error ({tilt[0]:.2f}, {tilt[1]:.2f}) deg "
+                                f"from simulator truth, accel bias estimate {accel_bias}")
+    return {"heading_rad": state["yaw"], "heading_error_vs_truth_deg": round(err, 2),
+            "tilt_error_vs_truth_deg": [round(tilt[0], 2), round(tilt[1], 2)],
+            "accel_bias_estimate_m_s2": accel_bias}
 
 
 class SitlStartRejected(RuntimeError):

@@ -164,17 +164,24 @@ def heading_phase(args, px4: gz.Px4, link, report: dict, check) -> None:
 
 
 def combine(args) -> None:
-    flights = []
+    flights, heights = [], []
     for d in args.flights:
         f = json.loads((d / "map_errors.json").read_text())
+        if "median_height_m" in f:
+            heights.append(float(f["median_height_m"]))
         flights.append(MapErrorFlight(f["name"], tuple(map(tuple, f["errors_ne_m"])), f["total_frames"],
                                       f["false_fixes"]))
+    heights = heights if len(heights) == len(args.flights) else []
     cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30,
                               outliers_removed_by_rule=f"|error - flight median| > {FALSE_FIX_M} m")
     cov = np.asarray(cal.covariance_ne_m2)
+    within = np.asarray(cal.within_flight_covariance_ne_m2)
+    between = np.asarray(cal.between_flight_covariance_ne_m2)
     holdout = {"coverage": cal.holdout_nees_coverage_95pct, "mean_nees": cal.holdout_mean_nees_2d}
     if args.isotropic:
         cov = np.eye(2) * np.trace(cov) / 2
+        within = np.eye(2) * np.trace(within) / 2
+        between = np.eye(2) * np.trace(between) / 2
         nees = []
         for f in flights[3:]:
             e = np.asarray(f.errors_ne_m) - np.asarray(cal.bias_ne_m)
@@ -186,6 +193,13 @@ def combine(args) -> None:
            "covariance_model": "isotropic trace/2" if args.isotropic else "empirical 2x2",
            "holdout_check": holdout,
            "sigma_ne_m": [math.sqrt(cov[i, i]) for i in (0, 1)],
+           # cov = within + between; the companion scales the between-flight
+           # (tilt) part with (h / calibration_height_m)^2 per fix.
+           "within_flight_covariance_ne_m2": within.tolist(),
+           "between_flight_covariance_ne_m2": between.tolist(),
+           "calibration_height_m": float(np.mean(heights[:3])) if heights else None,
+           "between_flight_tilt_sigma_deg": (math.degrees(math.sqrt(np.trace(between) / 2)
+                                                          / float(np.mean(heights[:3]))) if heights else None),
            "fit_flights": list(cal.fit_flights), "holdout_flights": list(cal.holdout_flights),
            "holdout_nees_coverage_95pct": cal.holdout_nees_coverage_95pct,
            "holdout_mean_nees_2d": cal.holdout_mean_nees_2d,
@@ -494,7 +508,8 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
                "std_error_ne_m": e.std(axis=0).round(4).tolist(),
-               "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"]}
+               "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"],
+               "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_]))}
         (args.out / "map_errors.json").write_text(json.dumps(out, indent=1))
         report["flight_map_errors"] = {k: v for k, v in out.items() if k != "errors_ne_m"}
         report["analysis_ok"] = len(e) >= 30
