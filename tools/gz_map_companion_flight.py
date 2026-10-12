@@ -283,6 +283,10 @@ def main() -> None:
                     help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
     ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
     ap.add_argument("--altitude", type=float, help="take-off altitude, m (default 5 textured, 40 swiss)")
+    ap.add_argument("--calib-direction-deg", type=float, default=0.0,
+                    help="calibrate: direction of the two legs (0: forward then right). Each calibration "
+                         "flight of a series uses its own (e.g. 72 deg apart) so the map error is "
+                         "sampled at different places, not the same three each time")
     ap.add_argument("--camera-hz", type=int, default=15)
     args = ap.parse_args()
     if args.mode in ("test", "heading") and not args.calibration:
@@ -391,7 +395,11 @@ def main() -> None:
 
         if args.mode == "calibrate":
             # One flight: three places over the map, slow motions in each.
-            for pitch, roll in ((0, 0), (stick, 0), (0, stick)):
+            a = math.radians(args.calib_direction_deg)
+            legs = ((0, 0), (round(stick * math.cos(a)), round(stick * math.sin(a))),
+                    (round(-stick * math.sin(a)), round(stick * math.cos(a))))
+            report["calib_direction_deg"] = args.calib_direction_deg
+            for pitch, roll in legs:
                 if pitch or roll:
                     move(pitch, roll, 4 if args.scene == "textured" else 8)
                     gz.sim_sleep(4)
