@@ -302,6 +302,10 @@ def main() -> None:
                     help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
     ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
     ap.add_argument("--altitude", type=float, help="take-off altitude, m (default 5 textured, 40 swiss)")
+    ap.add_argument("--calib-walk-seed", type=int,
+                    help="calibrate: random walk over the map with this seed (legs avoid the test-route quadrant)")
+    ap.add_argument("--calib-walk-legs", type=int, default=5)
+    ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
     ap.add_argument("--calib-direction-deg", type=float, default=0.0,
                     help="calibrate: direction of the two legs (0: forward then right). Each calibration "
                          "flight of a series uses its own (e.g. 72 deg apart) so the map error is "
@@ -414,13 +418,35 @@ def main() -> None:
 
         if args.mode == "calibrate":
             # One flight: three places over the map, slow motions in each.
-            a = math.radians(args.calib_direction_deg)
-            legs = ((0, 0), (round(stick * math.cos(a)), round(stick * math.sin(a))),
-                    (round(-stick * math.sin(a)), round(stick * math.cos(a))))
+            if args.calib_walk_seed is not None:
+                # Random walk over the map: the map error varies from place
+                # to place (series E/F: fix error on the test route twice the
+                # calibrated one), so the places must be a sample of the
+                # map, not of the start area. Directions avoid the quadrant
+                # of the test route (forward/right = east/south at the
+                # take-off heading): a in (90, 360) deg.
+                # Successive directions differ by at most +-45 deg, so the
+                # legs carry the vehicle away from the start instead of
+                # cancelling (independent directions: 11-30 m span, series G).
+                rng = np.random.default_rng(args.calib_walk_seed)
+                angles = [rng.uniform(90.0, 360.0)]
+                for _ in range(args.calib_walk_legs - 1):
+                    angles.append(float(np.clip(angles[-1] + rng.uniform(-45.0, 45.0), 90.0, 360.0)))
+                angles = np.asarray(angles)
+                legs = [(0, 0)] + [(round(stick * math.cos(math.radians(x))), round(stick * math.sin(math.radians(x))))
+                                   for x in angles]
+                leg_s = args.calib_walk_leg_s
+                report["calib_walk"] = {"seed": args.calib_walk_seed, "directions_deg": angles.round(1).tolist(),
+                                        "leg_s": leg_s}
+            else:
+                a = math.radians(args.calib_direction_deg)
+                legs = ((0, 0), (round(stick * math.cos(a)), round(stick * math.sin(a))),
+                        (round(-stick * math.sin(a)), round(stick * math.cos(a))))
+                leg_s = 4 if args.scene == "textured" else 8
             report["calib_direction_deg"] = args.calib_direction_deg
             for pitch, roll in legs:
                 if pitch or roll:
-                    move(pitch, roll, 4 if args.scene == "textured" else 8)
+                    move(pitch, roll, leg_s)
                     gz.sim_sleep(4)
                 for p, r in ((120, 0), (0, 120), (-120, 0), (0, -120)):
                     move(p, r, 2)
