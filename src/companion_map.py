@@ -226,15 +226,24 @@ class MapAnchor:
             self._psi_n += 1
 
     def fix(self, t_us: int, accepted: bool, north_m: float, east_m: float,
-            heading_offset_rad: float = float("nan")) -> str:
+            heading_offset_rad: float = float("nan"),
+            covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None) -> str:
         """Результат привязки на момент кадра t_us (после propagate до t_us).
 
         heading_offset_rad: курс по карте минус курс автопилота для этого кадра.
         Учитывается только у привязок, принятых проверками (захват, NIS).
+        covariance_ne_m2: ковариация этой привязки (например, пересчитанная
+        калибровочная на высоту кадра); по умолчанию — заданная при создании.
         """
         if not accepted or not (isfinite(north_m) and isfinite(east_m)):
             self._count("FIX_NOT_ACCEPTED_BY_LOCALIZER")
             return "FIX_NOT_ACCEPTED_BY_LOCALIZER"
+        if covariance_ne_m2 is not None:
+            try:
+                self._r = _covariance(np.asarray(covariance_ne_m2, dtype=float), "ковариация привязки")
+            except ValueError:
+                self._count("FIX_BAD_COVARIANCE")
+                return "FIX_BAD_COVARIANCE"
         z = np.array([north_m, east_m]) - self._bias
         if t_us != self._t_us:
             # Положение известно только на конец последнего интервала VO.

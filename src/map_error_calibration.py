@@ -37,6 +37,12 @@ class MapErrorCalibration:
     holdout_false_fix_rate_among_accepted: float
     holdout_flight_details: dict
     independently_validated_for_flight: bool = False
+    # Decomposition of covariance_ne_m2 (= within + between): scatter of
+    # fixes around their own flight mean, and scatter of the flight means
+    # around the pooled bias (a per-flight systematic error, e.g. the tilt
+    # error of the attitude used for ortho-rectification).
+    within_flight_covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
+    between_flight_covariance_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
 
 
 def _errors(flight: MapErrorFlight, *, min_samples: int) -> np.ndarray:
@@ -99,6 +105,9 @@ def calibrate_map_error(
         (x-bias).T @ (x-bias) / len(x) for x in train
     ]), axis=0)
     cov = _covariance(cov, "оцененная ковариация ошибок карты")
+    means = np.stack([np.mean(x, axis=0) for x in train])
+    between = np.mean(np.stack([np.outer(m - bias, m - bias) for m in means]), axis=0)
+    within_flight = cov - between
 
     details = {}
     flight_coverages = []
@@ -134,4 +143,81 @@ def calibrate_map_error(
         float(np.mean(flight_false_rates)),
         details,
         False,
+        tuple(tuple(float(v) for v in line) for line in within_flight),
+        tuple(tuple(float(v) for v in line) for line in between),
     )
+
+
+def covariance_at_height(calibration: dict, height_m: float) -> np.ndarray:
+    """Fix covariance at the frame height from a calibration JSON.
+
+    Without the decomposition: the calibrated covariance as is. With it:
+    within + between * (h / h_cal)^2. The between-flight part is taken as
+    a tilt error of the attitude used for ortho-rectification (the
+    nadir point moves by h * tilt; SWISSIMAGE series, ulogs). The
+    within-flight part (correlation noise, map vs scene) is kept as
+    calibrated. A model assumption: flights at other heights must check it.
+    """
+    total = np.asarray(calibration["covariance_ne_m2"], dtype=float)
+    within = calibration.get("within_flight_covariance_ne_m2")
+    between = calibration.get("between_flight_covariance_ne_m2")
+    h_cal = calibration.get("calibration_height_m")
+    if within is None or between is None or h_cal is None:
+        return total
+    if not (isfinite(height_m) and height_m > 0 and isfinite(h_cal) and h_cal > 0):
+        raise ValueError("Высота привязки и калибровки должна быть положительной")
+    return _covariance(np.asarray(within, dtype=float) + np.asarray(between, dtype=float)
+                       * (height_m / h_cal) ** 2, "ковариация привязки на высоте")
+
+
+def quality_covariance(floor_m2: float, k2: float, subpatch_cov_ne_m2) -> np.ndarray:
+    """Fix covariance from the match quality: floor * I + k2 * C_subpatch."""
+    c = np.asarray(subpatch_cov_ne_m2, dtype=float)
+    return floor_m2 * np.eye(2) + k2 * 0.5 * (c + c.T)
+
+
+def fit_quality_model(fit_errors: Sequence[np.ndarray], fit_subcov: Sequence[np.ndarray],
+                      holdout_errors: Sequence[np.ndarray], holdout_subcov: Sequence[np.ndarray],
+                      bias_ne_m) -> dict:
+    """Maximum likelihood (floor, k2) of R_i = floor*I + k2*C_i on the fit flights.
+
+    errors: per flight (n, 2) residuals [m] (bias is subtracted here);
+    subcov: per flight (n, 2, 2) sub-patch covariances of the same fixes.
+    Each flight has equal weight (mean log-likelihood per flight). Grid
+    search on a log grid: two parameters, no optimiser dependency. The
+    held-out flights are only evaluated (NEES, 95 % coverage).
+    """
+    b = np.asarray(bias_ne_m, dtype=float)
+    fit = [(np.asarray(e, float) - b, np.asarray(c, float)) for e, c in zip(fit_errors, fit_subcov)]
+    hold = [(np.asarray(e, float) - b, np.asarray(c, float)) for e, c in zip(holdout_errors, holdout_subcov)]
+    if not fit or any(len(e) != len(c) or len(e) < 10 for e, c in fit + hold):
+        raise ValueError("Нужны ошибки и ковариации четвертей для каждой привязки")
+
+    def terms(e, c, floor, k2):
+        cs = 0.5 * (c + np.transpose(c, (0, 2, 1)))
+        r = floor * np.eye(2)[None] + k2 * cs
+        det = r[:, 0, 0] * r[:, 1, 1] - r[:, 0, 1] ** 2
+        inv = np.stack([np.stack([r[:, 1, 1], -r[:, 0, 1]], -1), np.stack([-r[:, 1, 0], r[:, 0, 0]], -1)], -2) \
+            / det[:, None, None]
+        nees = np.einsum("ni,nij,nj->n", e, inv, e)
+        return np.log(det), nees
+
+    best = None
+    for floor in np.exp(np.linspace(np.log(1e-3), np.log(4.0), 60)):
+        for k2 in np.concatenate([[0.0], np.exp(np.linspace(np.log(1e-3), np.log(20.0), 70))]):
+            nll = 0.0
+            for e, c in fit:
+                ld, nees = terms(e, c, floor, k2)
+                nll += float(np.mean(ld + nees))
+            if best is None or nll < best[0]:
+                best = (nll, floor, k2)
+    _, floor, k2 = best
+    per = []
+    for e, c in hold:
+        _, nees = terms(e, c, floor, k2)
+        per.append(nees)
+    return {"floor_m2": float(floor), "k2": float(k2),
+            "fit_mean_nees": [round(float(np.mean(terms(e, c, floor, k2)[1])), 3) for e, c in fit],
+            "holdout_mean_nees": [round(float(np.mean(n)), 3) for n in per],
+            "holdout_coverage_95": [round(float(np.mean(n <= 5.991464547107979)), 3) for n in per],
+            "model": "R = floor_m2 * I + k2 * C_subpatch"}

@@ -49,7 +49,7 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.map_error_calibration import MapErrorFlight, calibrate_map_error  # noqa: E402
+from src.map_error_calibration import fit_quality_model, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
 
 # EV horizontal position + velocity. 5 m: at 3 m the camera sees the ground
 # at 1.6x the map resolution and ORB matching fails (checked offline).
@@ -118,6 +118,18 @@ def heading_error_deg(d: dict, t0_us: int) -> dict:
             "mean_deg": round(float(np.degrees(np.mean(err))), 2)}
 
 
+def map_heading_errors_deg(d: dict, rows: list[dict], t_us: np.ndarray) -> np.ndarray:
+    """(EKF2 heading + map heading offset) minus true heading at each fix [deg].
+
+    The offset is fix heading minus the autopilot heading used for that
+    frame; NaN where the NCC search gave no heading."""
+    a, g = d["vehicle_attitude"], d["vehicle_attitude_groundtruth"]
+    est = np.interp(t_us, a["timestamp"], np.unwrap(np.radians(yaw_deg(a))))
+    truth = np.interp(t_us, g["timestamp"], np.unwrap(np.radians(yaw_deg(g))))
+    off = np.array([float(r["heading_offset_rad"]) for r in rows])
+    return np.degrees((est + off - truth + np.pi) % (2 * np.pi) - np.pi)
+
+
 def interp(data, t_us: np.ndarray, keys=("x", "y")) -> np.ndarray:
     return np.column_stack([np.interp(t_us, data["timestamp"], data[k]) for k in keys])
 
@@ -163,18 +175,62 @@ def heading_phase(args, px4: gz.Px4, link, report: dict, check) -> None:
         print("INFO heading_without_ev_yaw", info, flush=True)
 
 
+def heading_calibration(dirs) -> dict | None:
+    """Map heading error: mean and SD on the 3 fit flights, coverage of
+    mean +- 2 SD on the 2 held-out flights (diagnostic; MapAnchor uses the
+    spread of its own fixes, floored at 0.05 rad)."""
+    per = []
+    for d in dirs:
+        f = json.loads((d / "map_errors.json").read_text())
+        h = np.asarray([x for x in f.get("heading_errors_deg", []) if x is not None and math.isfinite(x)])
+        per.append(h)
+    if len(per) < 5 or any(len(h) < 10 for h in per):
+        return None
+    fit = np.concatenate(per[:3])
+    m, sd = float(np.mean(fit)), float(np.std(fit))
+    hold = np.concatenate(per[3:])
+    return {"fit_mean_deg": round(m, 2), "fit_sd_deg": round(sd, 2),
+            "per_flight_mean_deg": [round(float(np.mean(h)), 2) for h in per],
+            "holdout_within_2sd": round(float(np.mean(np.abs(hold - m) <= 2 * sd)), 3)}
+
+
+def quality_calibration(dirs, bias) -> dict | None:
+    """ML fit of R = floor*I + k2*C_subpatch on the 3 fit flights, NEES on
+    the 2 held-out ones. Fixes without a sub-patch covariance are left out
+    (counted)."""
+    errs, subs, dropped = [], [], []
+    for d in dirs:
+        f = json.loads((d / "map_errors.json").read_text())
+        if "subpatch_cov_ne_m2" not in f:
+            return None
+        e = np.asarray(f["errors_ne_m"], float)
+        c = np.asarray(f["subpatch_cov_ne_m2"], float)
+        ok = np.isfinite(c).all(axis=(1, 2))
+        errs.append(e[ok]); subs.append(c[ok]); dropped.append(int((~ok).sum()))
+    m = fit_quality_model(errs[:3], subs[:3], errs[3:], subs[3:], bias)
+    m["fixes_without_subpatch"] = dropped
+    return m
+
+
 def combine(args) -> None:
-    flights = []
+    flights, heights = [], []
     for d in args.flights:
         f = json.loads((d / "map_errors.json").read_text())
+        if "median_height_m" in f:
+            heights.append(float(f["median_height_m"]))
         flights.append(MapErrorFlight(f["name"], tuple(map(tuple, f["errors_ne_m"])), f["total_frames"],
                                       f["false_fixes"]))
+    heights = heights if len(heights) == len(args.flights) else []
     cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30,
                               outliers_removed_by_rule=f"|error - flight median| > {FALSE_FIX_M} m")
     cov = np.asarray(cal.covariance_ne_m2)
+    within = np.asarray(cal.within_flight_covariance_ne_m2)
+    between = np.asarray(cal.between_flight_covariance_ne_m2)
     holdout = {"coverage": cal.holdout_nees_coverage_95pct, "mean_nees": cal.holdout_mean_nees_2d}
     if args.isotropic:
         cov = np.eye(2) * np.trace(cov) / 2
+        within = np.eye(2) * np.trace(within) / 2
+        between = np.eye(2) * np.trace(between) / 2
         nees = []
         for f in flights[3:]:
             e = np.asarray(f.errors_ne_m) - np.asarray(cal.bias_ne_m)
@@ -186,6 +242,13 @@ def combine(args) -> None:
            "covariance_model": "isotropic trace/2" if args.isotropic else "empirical 2x2",
            "holdout_check": holdout,
            "sigma_ne_m": [math.sqrt(cov[i, i]) for i in (0, 1)],
+           # cov = within + between; the companion scales the between-flight
+           # (tilt) part with (h / calibration_height_m)^2 per fix.
+           "within_flight_covariance_ne_m2": within.tolist(),
+           "between_flight_covariance_ne_m2": between.tolist(),
+           "calibration_height_m": float(np.mean(heights[:3])) if heights else None,
+           "between_flight_tilt_sigma_deg": (math.degrees(math.sqrt(np.trace(between) / 2)
+                                                          / float(np.mean(heights[:3]))) if heights else None),
            "fit_flights": list(cal.fit_flights), "holdout_flights": list(cal.holdout_flights),
            "holdout_nees_coverage_95pct": cal.holdout_nees_coverage_95pct,
            "holdout_mean_nees_2d": cal.holdout_mean_nees_2d,
@@ -193,6 +256,8 @@ def combine(args) -> None:
            "fit_false_fix_rate": float(np.mean([f.false_fixes / max(1, f.false_fixes + len(f.errors_ne_m))
                                                  for f in flights[:3]])),
            "outlier_rule": f"|error - flight median| > {FALSE_FIX_M} m",
+           "map_heading": heading_calibration(args.flights),
+           "quality_model": quality_calibration(args.flights, cal.bias_ne_m),
            "holdout_details": cal.holdout_flight_details,
            "independently_validated_for_flight": False,
            "note": "simulated flights (Gazebo, idealised camera)"}
@@ -215,7 +280,7 @@ def main() -> None:
     ap.add_argument("px4_dir", type=Path)
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
     ap.add_argument("--ev-yaw", action="store_true",
-                    help="heading: send the map-referenced heading to EKF2 (EKF2_EV_CTRL bit 3)")
+                    help="send the map-referenced heading to EKF2 (EKF2_EV_CTRL bit 3) in any mode")
     ap.add_argument("--mag-decl-error-deg", type=float, default=12.0,
                     help="heading: declination error from boot (EKF2_DECL_TYPE=0), e.g. a wrong "
                          "declination or a magnetic disturbance at the take-off site")
@@ -237,11 +302,15 @@ def main() -> None:
                     help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
     ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
     ap.add_argument("--altitude", type=float, help="take-off altitude, m (default 5 textured, 40 swiss)")
+    ap.add_argument("--calib-direction-deg", type=float, default=0.0,
+                    help="calibrate: direction of the two legs (0: forward then right). Each calibration "
+                         "flight of a series uses its own (e.g. 72 deg apart) so the map error is "
+                         "sampled at different places, not the same three each time")
     ap.add_argument("--camera-hz", type=int, default=15)
     args = ap.parse_args()
     if args.mode in ("test", "heading") and not args.calibration:
         ap.error("--mode test/heading needs --calibration")
-    params = dict(PARAMS, EKF2_EV_CTRL="13") if args.mode == "heading" and args.ev_yaw else dict(PARAMS)
+    params = dict(PARAMS, EKF2_EV_CTRL="13") if args.ev_yaw else dict(PARAMS)
     if args.mode == "heading":
         # A 3D magnetometer with estimated earth field absorbs a declination
         # change made in flight within minutes (checked): the error must be
@@ -345,7 +414,11 @@ def main() -> None:
 
         if args.mode == "calibrate":
             # One flight: three places over the map, slow motions in each.
-            for pitch, roll in ((0, 0), (stick, 0), (0, stick)):
+            a = math.radians(args.calib_direction_deg)
+            legs = ((0, 0), (round(stick * math.cos(a)), round(stick * math.sin(a))),
+                    (round(-stick * math.sin(a)), round(stick * math.cos(a))))
+            report["calib_direction_deg"] = args.calib_direction_deg
+            for pitch, roll in legs:
                 if pitch or roll:
                     move(pitch, roll, 4 if args.scene == "textured" else 8)
                     gz.sim_sleep(4)
@@ -354,7 +427,14 @@ def main() -> None:
                     gz.sim_sleep(2)
             report["segments"]["flight"] = [report["takeoff_us"] + 8_000_000, int(link.boot_s * 1e6)]
         else:
-            # 1: map lock while GNSS holds.
+            # 1: map lock while GNSS holds. The same small motions as in the
+            # calibration flights: hovering over one spot repeats one view,
+            # and over the swiss start point that view stayed ambiguous
+            # (a second NCC peak 5.5 m away at another heading, margin
+            # 0.04-0.09 against 0.05) for the whole check.
+            for p, r in ((120, 0), (0, 120), (-120, 0), (0, -120)):
+                move(p, r, 2)
+                gz.sim_sleep(2)
             locked = gz.wait(lambda: latest_status(clog_path).get("map_anchor", {}).get("locked"), 60, 1)
             gz.sim_sleep(3)
             f1 = vo_flight.flags_and_validity(px4)
@@ -479,6 +559,12 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                        float(r["east_m"]) - float(r["injected_shift_e"])] for r in acc])
     err = fixes - interp(truth, t)
     report["ekf2_tilt_error_deg"] = tilt_error_deg(d, report.get("takeoff_us", 0))
+    hdg = map_heading_errors_deg(d, acc, t)
+    ok_h = np.isfinite(hdg)
+    report["map_heading_error_deg"] = {
+        "fixes_with_heading": int(ok_h.sum()), "fixes": len(hdg),
+        "mean": round(float(np.mean(hdg[ok_h])), 2) if ok_h.any() else None,
+        "std": round(float(np.std(hdg[ok_h])), 2) if ok_h.any() else None}
     if args.mode == "calibrate":
         t0, t1 = report["segments"]["flight"]
         sel = (t >= t0) & (t <= t1)
@@ -488,13 +574,21 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         # estimated from the rest; the rate is reported, the flight is kept
         # (re-flying until no outlier would hide them).
         bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
+        sub = [tuple(float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")) for r in acc]
         false = int(np.sum(bad))
         e = e_all[~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
                "std_error_ne_m": e.std(axis=0).round(4).tolist(),
-               "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"]}
+               "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"],
+               "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_])),
+               # Map heading error of the same fixes (NaN: no heading from the search).
+               "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]],
+               # Sub-patch covariance of the same (inlier) fixes, for the
+               # match-quality covariance model (NaN rows: not available).
+               "subpatch_cov_ne_m2": [[[sub[k][0], sub[k][1]], [sub[k][1], sub[k][2]]]
+                                      for k in np.flatnonzero(sel)[~bad]]}
         (args.out / "map_errors.json").write_text(json.dumps(out, indent=1))
         report["flight_map_errors"] = {k: v for k, v in out.items() if k != "errors_ne_m"}
         report["analysis_ok"] = len(e) >= 30
@@ -510,8 +604,14 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         rejected = sum(r["anchor_result"] in ("FIX_REJECTED_NIS", "FIX_REJECTED_STEP") for r in shifted)
         fused_after = sum(r["anchor_result"] == "FIX_FUSED" for r in after)
         live = report.get("fault_live", {})
+        # Integrity: the vehicle is not pulled by the shifted map (true
+        # drift < 0.5 m). The absolute error during the fault includes the
+        # error the estimate already had: same limit as check 3 (it was a
+        # fixed 0.5 m, set for the 20-m scene with sigma 0.16 m).
+        abs_limit = report.get("route_error_limit_m", 0.5)
         ok = (fused_shifted == 0 and rejected >= 5 and fused_after > 0
-              and live.get("max_abs_error_during_fault_m", 9) < 0.5 and live.get("true_drift_during_fault_m", 9) < 0.5)
+              and live.get("max_abs_error_during_fault_m", 9) < abs_limit
+              and live.get("true_drift_during_fault_m", 9) < 0.5)
         report["checks"]["4_shifted_map_rejected"] = {
             "pass": ok, "shifted_fixes": len(shifted), "fused_shifted": fused_shifted,
             "rejected_total": rejected,
@@ -541,6 +641,29 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
     report["fused_fix_count"] = len(fused)
     report["map_fix_error_ne_m"] = {"mean": err.mean(axis=0).round(3).tolist(),
                                    "std": err.std(axis=0).round(3).tolist()}
+    # Diagnostic: NEES of the bias-corrected fixes with the calibrated
+    # covariance (constant) and, if calibrated, the match-quality model.
+    if args.calibration:
+        cal = json.loads(args.calibration.read_text())
+        e = err - np.asarray(cal["bias_ne_m"])
+        c0 = np.asarray(cal["covariance_ne_m2"])
+        n0 = np.einsum("ni,ij,nj->n", e, np.linalg.inv(c0), e)
+        diag = {"constant_mean_nees": round(float(np.mean(n0)), 2),
+                "constant_coverage_95": round(float(np.mean(n0 <= 5.991)), 3)}
+        q = cal.get("quality_model")
+        if q:
+            nq = []
+            for r, ei in zip(acc, e):
+                c = [float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")]
+                if all(map(math.isfinite, c)):
+                    rq = quality_covariance(q["floor_m2"], q["k2"], [[c[0], c[1]], [c[1], c[2]]])
+                    nq.append(float(ei @ np.linalg.solve(rq, ei)))
+            if nq:
+                nq = np.asarray(nq)
+                diag.update({"quality_mean_nees": round(float(np.mean(nq)), 2),
+                             "quality_coverage_95": round(float(np.mean(nq <= 5.991)), 3), "quality_fixes": len(nq)})
+        report["map_fix_consistency"] = diag
+        print("MAP_FIX_CONSISTENCY", diag, flush=True)
 
 
 if __name__ == "__main__":

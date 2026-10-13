@@ -27,6 +27,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,7 @@ from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E40
 from src.companion_map import MapAnchor  # noqa: E402
 from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
+from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
 from src.companion_vo import BodyVelocityMeasurement, CompanionVo  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
@@ -80,7 +82,8 @@ MSCKF_IMU_NOISE = ImuNoiseDensity(gyro_rad_s_sqrt_hz=0.004, accel_m_s2_sqrt_hz=0
 
 
 def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: KltTracker, t_frame: int,
-                      gray: np.ndarray, last_t: int, record=None) -> BodyVelocityMeasurement | None:
+                      gray: np.ndarray, last_t: int, record=None,
+                      variance_scale: tuple[float, float] | None = None) -> BodyVelocityMeasurement | None:
     """MSCKF output in the same form as the VO measurement (body-FRD velocity,
     N/E velocity in the autopilot heading frame for the map anchor)."""
     state = pipeline.state_at_camera_time(t_frame)
@@ -97,6 +100,9 @@ def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: Klt
     out = msckf.process(t_frame, feats, attitude_q=q, roll=roll, pitch=pitch, range_m=range_m)
     if out is None:
         return None
+    if variance_scale is not None:
+        sx, sz = variance_scale
+        out = replace(out, variance_frd=(sx * out.variance_frd[0], sx * out.variance_frd[1], sz * out.variance_frd[2]))
     r_nb = body_to_ned(roll, pitch, yaw)          # autopilot attitude, not the MSCKF heading
     v_ne = r_nb @ np.asarray(out.velocity_frd)
     cov_ne = r_nb @ np.diag(out.variance_frd) @ r_nb.T
@@ -105,6 +111,23 @@ def msckf_measurement(pipeline: CompanionVo, msckf: CompanionMsckf, tracker: Klt
                           float(cov_ne[0, 0]), float(cov_ne[0, 1]), float(cov_ne[1, 1]), start)
     return BodyVelocityMeasurement(t_frame, out.velocity_frd, out.variance_frd, vo, float(v_ne[2]),
                                    height, (roll, pitch, yaw))
+
+
+def flat(c) -> tuple[float, float, float]:
+    """(nn, ne, ee) of a 2x2 N/E covariance, NaN if absent."""
+    if c is None:
+        return (float("nan"),) * 3
+    return (round(c[0][0], 5), round(c[0][1], 5), round(c[1][1], 5))
+
+
+def fix_covariance(cal: dict, fix, height_m: float):
+    """Per-fix covariance: the match-quality model if calibrated and the
+    fix carries a sub-patch covariance, otherwise the calibrated one at
+    the frame height."""
+    q = cal.get("quality_model")
+    if q is not None and getattr(fix, "subpatch_cov_ne_m2", None) is not None:
+        return quality_covariance(q["floor_m2"], q["k2"], fix.subpatch_cov_ne_m2)
+    return covariance_at_height(cal, height_m)
 
 
 def stamp_us(header) -> int:
@@ -147,6 +170,8 @@ def main() -> None:
     ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo",
                     help="msckf: tightly coupled VIO on the autopilot IMU (HIGHRES_IMU), initialised "
                          "without GNSS from the rangefinder")
+    ap.add_argument("--msckf-calibration", type=Path,
+                    help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
     ap.add_argument("--msckf-record", type=Path,
                     help="JSON lines: IMU samples and per-frame MSCKF inputs (offline replay)")
     ap.add_argument("--log", type=Path)
@@ -180,11 +205,16 @@ def main() -> None:
     pending: list[tuple[int, np.ndarray]] = []
     log = args.log.open("w") if args.log else None
     record = args.msckf_record.open("w", buffering=1) if args.msckf_record else None
+    msckf_scale = None
+    if args.msckf_calibration:
+        mc = json.loads(args.msckf_calibration.read_text())
+        msckf_scale = (float(mc["horizontal"]["scale"]), float(mc["vertical"]["scale"]))
     if log:
         log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
+    map_cal: dict | None = None
     map_shift = np.zeros(2)
     msckf: CompanionMsckf | None = None
     tracker: KltTracker | None = None
@@ -195,7 +225,8 @@ def main() -> None:
     map_log = args.map_log.open("w") if args.map_log else None
     if map_log:
         map_log.write("t_us,localizer_status,north_m,east_m,inliers,heading_offset_rad,height_m,"
-                      "injected_shift_n,injected_shift_e,anchor_result,nis,process_ms\n")
+                      "injected_shift_n,injected_shift_e,anchor_result,nis,process_ms,"
+                      "sub_nn,sub_ne,sub_ee,shape_nn,shape_ne,shape_ee,peak,margin\n")
 
     # MAVLink is read in its own thread: the MSCKF initialisation takes
     # 0.7-1.8 s, and a loop blocked that long overflowed the UDP buffer
@@ -287,7 +318,7 @@ def main() -> None:
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                     camera_offset_body_m=tuple(args.camera_offset_frd))
             if args.map_mode == "fuse":
-                c = json.loads(args.map_calibration.read_text())
+                c = map_cal = json.loads(args.map_calibration.read_text())
                 anchor = MapAnchor(bias_ne_m=tuple(c["bias_ne_m"]),
                                    covariance_ne_m2=tuple(tuple(r) for r in c["covariance_ne_m2"]),
                                    max_map_step_error_m=args.max_map_step_error_m)
@@ -326,7 +357,7 @@ def main() -> None:
                 args.save_frames.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(args.save_frames / f"{t_frame}.png"), gray)
             if msckf is not None:
-                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t, record)
+                out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t, record, msckf_scale)
                 if out is not None:
                     last_msckf_t = t_frame
             else:
@@ -362,7 +393,9 @@ def main() -> None:
                         # Position is known at the end of the last VO interval only.
                         if out is not None and out.vo.timestamp_us == t_frame:
                             psi = math.atan2(math.sin(fix.yaw_rad - state[2]), math.cos(fix.yaw_rad - state[2]))
-                            result = anchor.fix(t_frame, fix.accepted, n, e, psi)
+                            result = anchor.fix(t_frame, fix.accepted, n, e, psi,
+                                                covariance_ne_m2=fix_covariance(map_cal, fix, state[3])
+                                                if fix.accepted else None)
                             nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS", "FIX_REJECTED_STEP") else nis
                         else:
                             result = "NO_VO_AT_FRAME"
@@ -371,7 +404,9 @@ def main() -> None:
                         map_log.write(",".join(str(v) for v in (
                             t_frame, fix.status, round(n, 4), round(e, 4), fix.inlier_points,
                             round(fix.yaw_rad - state[2], 4), round(state[3], 3), map_shift[0], map_shift[1],
-                            result, round(nis, 3), round(ms, 1))) + "\n")
+                            result, round(nis, 3), round(ms, 1), *flat(fix.subpatch_cov_ne_m2), *flat(fix.shape_ne_m2),
+                            round(float(getattr(localizer, "last_peak", float("nan"))), 4),
+                            round(float(getattr(localizer, "last_margin", float("nan"))), 4))) + "\n")
             if out is None:
                 continue
             # A late measurement is worse than none: EKF2 fuses it at its stamp
@@ -415,9 +450,13 @@ def main() -> None:
             sent += 1
             if log:
                 r = out.vo
-                log.write(",".join(str(round(v, 5)) for v in (
-                    out.time_us + pipeline.clock.offset_us, *out.velocity_frd, *out.variance_frd,
-                    r.vn_m_s, r.ve_m_s, out.vd_m_s)) + f",{r.inlier_count}\n")
+                # Variances with 6 significant digits: calibrated MSCKF
+                # variances are ~1e-5 m^2/s^2 and rounded to 0 at 5 decimals.
+                log.write(",".join([str(out.time_us + pipeline.clock.offset_us)]
+                                   + [str(round(v, 5)) for v in out.velocity_frd]
+                                   + [f"{v:.6g}" for v in out.variance_frd]
+                                   + [str(round(v, 5)) for v in (r.vn_m_s, r.ve_m_s, out.vd_m_s)])
+                          + f",{r.inlier_count}\n")
         # A frame waiting far too long has no autopilot data around it.
         while pending and now - pending[0][0] > 1_000_000:
             pending.pop(0)

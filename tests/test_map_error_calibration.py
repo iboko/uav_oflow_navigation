@@ -125,3 +125,48 @@ def test_holdout_flights_weighted_equally_independent_of_camera_frame_rate():
         result.holdout_flight_details["H1"]["fraction_within_chi2_2_95"]
     ) / 2.0
     assert result.holdout_nees_coverage_95pct == pytest.approx(expected_cover)
+
+
+def test_covariance_splits_into_within_and_between_flight_parts():
+    # Per-flight offsets (an attitude tilt error at the calibration height)
+    # appear in the between-flight part only.
+    tr = [flight("T0", bias=(1.0, 0.0)), flight("T1", bias=(-1.0, 0.0), phase=.1),
+          flight("T2", bias=(0.0, 0.0), phase=.2)]
+    va = [flight(f"H{i}", phase=.25 + i * .13) for i in range(2)]
+    r = calibrate_map_error(tr, va)
+    total, within, between = (np.asarray(x) for x in (r.covariance_ne_m2, r.within_flight_covariance_ne_m2,
+                                                      r.between_flight_covariance_ne_m2))
+    assert np.allclose(total, within + between)
+    assert np.isclose(between[0, 0], 2 / 3, atol=0.01)
+    assert within[0, 0] < 0.2
+
+
+def test_fix_covariance_scales_tilt_part_with_height():
+    from src.map_error_calibration import covariance_at_height
+    cal = {"covariance_ne_m2": [[0.5, 0], [0, 0.5]], "within_flight_covariance_ne_m2": [[0.1, 0], [0, 0.1]],
+           "between_flight_covariance_ne_m2": [[0.4, 0], [0, 0.4]], "calibration_height_m": 40.0}
+    assert np.allclose(covariance_at_height(cal, 40.0), [[0.5, 0], [0, 0.5]])
+    assert np.allclose(covariance_at_height(cal, 80.0), [[1.7, 0], [0, 1.7]])
+    # Old calibration files without the decomposition: unchanged.
+    assert np.allclose(covariance_at_height({"covariance_ne_m2": [[0.5, 0], [0, 0.5]]}, 80.0), 0.5 * np.eye(2))
+    with pytest.raises(ValueError):
+        covariance_at_height(cal, float("nan"))
+
+
+def test_quality_model_recovers_scale_of_subpatch_covariance():
+    from src.map_error_calibration import fit_quality_model, quality_covariance
+    rng = np.random.default_rng(3)
+
+    def flight(n=200):
+        s = rng.uniform(0.05, 1.5, n)                    # sub-patch scatter varies per fix
+        c = np.stack([np.diag([v, 0.3 * v]) for v in s])  # anisotropic
+        r = 0.04 * np.eye(2)[None] + 0.5 * c              # truth: floor 0.04, k2 0.5
+        e = np.stack([rng.multivariate_normal([0.2, -0.1], ri) for ri in r])
+        return e, c
+    fit = [flight() for _ in range(3)]
+    hold = [flight() for _ in range(2)]
+    m = fit_quality_model([f[0] for f in fit], [f[1] for f in fit], [h[0] for h in hold], [h[1] for h in hold],
+                          (0.2, -0.1))
+    assert 0.3 < m["k2"] < 0.8 and 0.01 < m["floor_m2"] < 0.1, m
+    assert all(1.5 < x < 2.6 for x in m["holdout_mean_nees"])
+    assert np.allclose(quality_covariance(0.04, 0.5, [[1, 0], [0, 0.3]]), [[0.54, 0], [0, 0.19]])

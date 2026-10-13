@@ -28,6 +28,7 @@ import json
 import math
 import signal
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -105,7 +106,14 @@ def flags_and_validity(px4: gz.Px4) -> dict:
             "cs_opt_flow": flags.get("cs_opt_flow"), "xy_valid": lp.get("xy_valid")}
 
 
-def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_error_deg: float = 10.0) -> dict:
+def _roll_pitch_deg(att: dict) -> tuple[float, float]:
+    w, x, y, z = (float(att[f"q[{i}]"]) for i in range(4))
+    return (math.degrees(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))),
+            math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))))
+
+
+def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_error_deg: float = 10.0,
+                           max_tilt_error_deg: float = 0.5, restart_estimator: bool = True) -> dict:
     """Preflight gate from EKF2's own signals only (never ground truth).
 
     5 consecutive seconds: GNSS fused, magnetometer fused (heading or 3D) and
@@ -116,6 +124,25 @@ def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_er
     (seen in the ulogs). A consistent magnetometer heading can still be
     5-10 deg off in SITL, as on a real vehicle.
     """
+    # Restart EKF2 once on the ground, at rest with GNSS: the first SITL
+    # alignment takes the start-up transient of the simulation (a 0.2-0.4
+    # m/s^2 accelerometer bias estimate with a matching 1-2.5 deg tilt
+    # error, or a heading tens of degrees off) and keeps it for the flight.
+    # The restarted filter aligns on steady data (probe: tilt -1.1/-1.6 deg
+    # -> 0.0/0.0, heading 103 -> 6 deg). EKF2 signals only, a preflight
+    # procedure a real vehicle can do too.
+    def gnss_and_rest() -> bool:
+        f = topic(px4, "estimator_status_flags")
+        lp = topic(px4, "vehicle_local_position")
+        return (f.get("cs_gnss_pos", f.get("cs_gps")) == "True"
+                and all(abs(float(lp.get(k, 9.0))) < 0.1 for k in ("vx", "vy", "vz")))
+    if restart_estimator:
+        if not gz.wait(gnss_and_rest, timeout_s, 1):
+            raise SitlStartRejected("EKF2 without GNSS or not at rest on the ground before the restart")
+        gz.sim_sleep(5)
+        px4.cmd("ekf2", "stop")
+        gz.sim_sleep(1)
+        px4.cmd("ekf2", "start")
     state = {"n": 0, "yaw": None}
 
     def settled() -> bool:
@@ -143,7 +170,24 @@ def wait_estimator_settled(px4: gz.Px4, timeout_s: float = 180.0, max_heading_er
     err = math.degrees(abs((state["yaw"] - truth + math.pi) % (2 * math.pi) - math.pi))
     if not err < max_heading_error_deg:
         raise SitlStartRejected(f"SITL start rejected: EKF2 heading {err:.1f} deg from simulator truth")
-    return {"heading_rad": state["yaw"], "heading_error_vs_truth_deg": round(err, 2)}
+    # Same for the tilt: the Gazebo IMU has no accelerometer bias, yet some
+    # starts leave EKF2 with a 0.2-0.35 m/s^2 accelerometer bias estimate
+    # and a matching 1-2.5 deg tilt error from the first seconds on the
+    # ground, constant for the whole flight (ulogs of the swiss series). At
+    # 40 m it shifted every ortho-rectified map fix by 1-2 m. 0.5 deg keeps
+    # a realistic AHRS tilt error in the test.
+    est = _roll_pitch_deg(topic(px4, "vehicle_attitude"))
+    gt = _roll_pitch_deg(topic(px4, "vehicle_attitude_groundtruth"))
+    tilt = (est[0] - gt[0], est[1] - gt[1])
+    bias = topic(px4, "estimator_sensor_bias")
+    accel_bias = [round(float(bias.get(f"accel_bias[{i}]", math.nan)), 3) for i in range(3)]
+    if not math.hypot(*tilt) < max_tilt_error_deg:
+        raise SitlStartRejected(f"SITL start rejected: EKF2 tilt error ({tilt[0]:.2f}, {tilt[1]:.2f}) deg "
+                                f"from simulator truth, accel bias estimate {accel_bias}")
+    return {"heading_rad": state["yaw"], "heading_error_vs_truth_deg": round(err, 2),
+            "estimator_restarted": restart_estimator,
+            "tilt_error_vs_truth_deg": [round(tilt[0], 2), round(tilt[1], 2)],
+            "accel_bias_estimate_m_s2": accel_bias}
 
 
 class SitlStartRejected(RuntimeError):
@@ -157,6 +201,8 @@ def main() -> None:
     ap.add_argument("--world", default=gz.TEXTURED_WORLD)
     ap.add_argument("--estimator", choices=("vo", "msckf"), default="vo")
     ap.add_argument("--altitude", type=float, default=3.0)
+    ap.add_argument("--msckf-calibration", type=Path,
+                    help="variance scales for the MSCKF (calibrate_msckf_covariance.py, separate flights)")
     ap.add_argument("--companion-python", default=sys.executable,
                     help="interpreter with gz.transport13 / gz.msgs10, numpy, cv2, pymavlink")
     args = ap.parse_args()
@@ -164,11 +210,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     args.out.mkdir(parents=True, exist_ok=True)
     px4_dir = args.px4_dir.resolve()
+    started_wall = time.time()
     if args.world == gz.TEXTURED_WORLD:
         gz.install_textured_world(px4_dir)
     install_vehicle(px4_dir)
     report: dict = {"type": "PX4_SITL_GAZEBO_GNSS_LOSS_COMPANION_VO", "world": args.world,
-                    "params": PARAMS, "estimator": args.estimator, "altitude": args.altitude, "checks": {}, "samples": []}
+                    "params": PARAMS, "estimator": args.estimator, "altitude": args.altitude,
+                    "msckf_calibration": str(args.msckf_calibration) if args.msckf_calibration else None,
+                    "checks": {}, "samples": []}
     params = dict(PARAMS, MIS_TAKEOFF_ALT=f"{args.altitude:.1f}")
     px4 = gz.Px4(px4_dir, args.out / "px4_gz.log", args.world, params, model=f"gz_{MODEL}")
     link = gz.Link()
@@ -195,7 +244,8 @@ def main() -> None:
             [args.companion_python, str(Path(__file__).with_name("gz_vo_companion.py")), "--world", args.world,
              "--camera-topic", CAMERA_TOPIC, "--log", str(args.out / "companion_vo.csv"),
              "--estimator", args.estimator]
-            + (["--msckf-record", str(args.out / "msckf_inputs.jsonl")] if args.estimator == "msckf" else []),
+            + (["--msckf-record", str(args.out / "msckf_inputs.jsonl")] if args.estimator == "msckf" else [])
+            + (["--msckf-calibration", str(args.msckf_calibration.resolve())] if args.msckf_calibration else []),
             stdout=companion_log, stderr=subprocess.STDOUT)
         # On the ground the camera is ~0.2 m above the texture and VO has no
         # track: the takeoff is GNSS-aided, VO fusion is checked in the air.
@@ -320,6 +370,10 @@ def main() -> None:
     status = [json.loads(line) for line in log_text.splitlines() if line.startswith("{\"sim_s\"")]
     report["companion_final_status"] = status[-1] if status else None
     report["passed"] = ok_all
+    logs = sorted((px4_dir / "build" / "px4_sitl_default" / "rootfs" / "log").glob("*/*.ulg"),
+                  key=lambda p: p.stat().st_mtime)
+    logs = [p for p in logs if p.stat().st_mtime >= started_wall]
+    report["ulog"] = str(logs[-1]) if logs else None
     (args.out / "gz_vo_companion_flight.json").write_text(json.dumps(report, indent=2))
     raise SystemExit(0 if ok_all else 1)
 
