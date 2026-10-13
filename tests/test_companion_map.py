@@ -266,3 +266,37 @@ def test_fix_covariance_override_is_used_and_validated():
     bad = ((1.0, 2.0), (2.0, 1.0))
     assert anchor.fix(1_330_000, True, 0.0, 0.0, covariance_ne_m2=bad) == "FIX_BAD_COVARIANCE"
     assert t.locked
+
+
+def test_relock_after_loss_rejects_a_self_consistent_false_place():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R, max_sigma_m=0.5)
+    _fly(anchor, 3)                                   # locked
+    # No fixes for a while: lock lost by uncertainty, dead reckoning kept.
+    t = 1_198_000
+    for _ in range(200):
+        anchor.propagate(t, t + DT, (1.0, 0.0), VO_COV)
+        t += DT
+    assert not anchor.locked and anchor.counts.get("LOCK_LOST_UNCERTAINTY") == 1
+    truth_n = 0.066 * 203  # 1 m/s for 203 intervals
+    # A wrong place 20 m off, consistent with VO from fix to fix: rejected.
+    for k in range(4):
+        anchor.propagate(t, t + DT, (1.0, 0.0), VO_COV)
+        t += DT
+        r = anchor.fix(t, True, truth_n + 0.066 * (k + 1) + 20.0, 0.0)
+        assert r == "ACQUISITION_REJECTED_PRIOR"
+    # The true place: reacquired.
+    results = []
+    for k in range(4, 7):
+        anchor.propagate(t, t + DT, (1.0, 0.0), VO_COV)
+        t += DT
+        results.append(anchor.fix(t, True, truth_n + 0.066 * (k + 1), 0.0))
+    assert results[-1] == "LOCK_ACQUIRED", results
+
+
+def test_first_lock_is_gated_by_an_independent_prior():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    anchor.set_acquisition_prior((0.0, 0.0), ((9.0, 0.0), (0.0, 9.0)))
+    anchor.propagate(1_000_000, 1_066_000, (0.0, 0.0), VO_COV)
+    assert anchor.fix(1_066_000, True, 15.0, 0.0) == "ACQUISITION_REJECTED_PRIOR"
+    anchor.propagate(1_066_000, 1_132_000, (0.0, 0.0), VO_COV)
+    assert anchor.fix(1_132_000, True, 1.0, 0.0) == "ACQUISITION_PENDING"

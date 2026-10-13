@@ -221,3 +221,48 @@ def fit_quality_model(fit_errors: Sequence[np.ndarray], fit_subcov: Sequence[np.
             "holdout_mean_nees": [round(float(np.mean(n)), 3) for n in per],
             "holdout_coverage_95": [round(float(np.mean(n <= 5.991464547107979)), 3) for n in per],
             "model": "R = floor_m2 * I + k2 * C_subpatch"}
+
+
+def place_outlier_rule(errors_ne_m, positions_ne_m, *, cell_m: float = 20.0, false_place_m: float = 3.0,
+                       false_fix_m: float = 1.0, min_fixes_per_place: int = 5) -> dict:
+    """Split one flight's fix errors into inliers, false fixes and false places.
+
+    The map error is a per-place offset plus small noise (series H: 36
+    places of 20 m, within-place SD 0.2 m, place offsets mostly < 2 m and
+    3 places 4-21 m off with self-consistent fixes). A flight-wide median
+    rule mixes those. Here: places = cells of ``cell_m`` along the
+    flown positions; a place whose median error is more than
+    ``false_place_m`` from the flight's median of place medians is a
+    false place (all its fixes are counted, not fitted); within a place a
+    fix more than ``false_fix_m`` from the place median is a false fix.
+    Places with fewer than ``min_fixes_per_place`` fixes are left out.
+    Thresholds are fixed before use; they are not fitted.
+    """
+    e = np.asarray(errors_ne_m, dtype=float)
+    p = np.asarray(positions_ne_m, dtype=float)
+    if e.shape != p.shape or e.ndim != 2 or e.shape[1] != 2:
+        raise ValueError("Ошибки и положения должны совпадать по форме (n, 2)")
+    key = np.floor(p / cell_m).astype(int)
+    cells = {}
+    for i, k in enumerate(map(tuple, key)):
+        cells.setdefault(k, []).append(i)
+    places = {k: np.asarray(v) for k, v in cells.items() if len(v) >= min_fixes_per_place}
+    inlier = np.zeros(len(e), bool)
+    false_fix = np.zeros(len(e), bool)
+    false_place = np.zeros(len(e), bool)
+    if not places:
+        return {"inlier": inlier, "false_fix": false_fix, "false_place": false_place,
+                "places": 0, "false_places": 0}
+    medians = {k: np.median(e[idx], axis=0) for k, idx in places.items()}
+    centre = np.median(np.stack(list(medians.values())), axis=0)
+    n_false_places = 0
+    for k, idx in places.items():
+        if np.linalg.norm(medians[k] - centre) > false_place_m:
+            false_place[idx] = True
+            n_false_places += 1
+            continue
+        far = np.linalg.norm(e[idx] - medians[k], axis=1) > false_fix_m
+        false_fix[idx[far]] = True
+        inlier[idx[~far]] = True
+    return {"inlier": inlier, "false_fix": false_fix, "false_place": false_place,
+            "places": len(places), "false_places": n_false_places}

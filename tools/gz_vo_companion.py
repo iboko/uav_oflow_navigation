@@ -152,6 +152,8 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
+    ap.add_argument("--acquisition-prior-sigma-m", type=float, default=3.0,
+                    help="first map lock: autopilot (GNSS) position as prior with this sigma per axis")
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
                     help="send the anchor position only this long after the last fused map fix")
     ap.add_argument("--max-map-step-error-m", type=float, default=1.0,
@@ -274,6 +276,10 @@ def main() -> None:
                                              "a": list(reading.specific_force_body_m_s2)}) + "\n")
             elif t == "LOCAL_POSITION_NED":
                 local_ne = np.array([msg.x, msg.y])
+                # Before the first lock nothing of ours is fused yet: the
+                # autopilot position is GNSS-aided and independent of the map.
+                if anchor is not None and not anchor.counts.get("LOCK_ACQUIRED"):
+                    anchor.set_acquisition_prior(local_ne, np.eye(2) * args.acquisition_prior_sigma_m ** 2)
                 if record and pipeline.clock.valid:
                     record.write(json.dumps({"lpos": msg.time_boot_ms * 1000 - pipeline.clock.offset_us,
                                              "v": [msg.vx, msg.vy, msg.vz]}) + "\n")

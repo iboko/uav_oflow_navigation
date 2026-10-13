@@ -49,7 +49,7 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.map_error_calibration import fit_quality_model, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
+from src.map_error_calibration import fit_quality_model, place_outlier_rule, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
 
 # EV horizontal position + velocity. 5 m: at 3 m the camera sees the ground
 # at 1.6x the map resolution and ORB matching fails (checked offline).
@@ -221,8 +221,12 @@ def combine(args) -> None:
         flights.append(MapErrorFlight(f["name"], tuple(map(tuple, f["errors_ne_m"])), f["total_frames"],
                                       f["false_fixes"]))
     heights = heights if len(heights) == len(args.flights) else []
+    raw = [json.loads((d / "map_errors.json").read_text()) for d in args.flights]
+    rule = raw[0].get("outlier_rule", f"|error - flight median| > {FALSE_FIX_M} m")
+    if rule == "place":
+        rule = "place rule: 20 m places, place > 3 m off = false place, fix > 1 m from place median = false fix"
     cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30,
-                              outliers_removed_by_rule=f"|error - flight median| > {FALSE_FIX_M} m")
+                              outliers_removed_by_rule=rule)
     cov = np.asarray(cal.covariance_ne_m2)
     within = np.asarray(cal.within_flight_covariance_ne_m2)
     between = np.asarray(cal.between_flight_covariance_ne_m2)
@@ -255,7 +259,8 @@ def combine(args) -> None:
            "holdout_false_fix_rate": cal.holdout_false_fix_rate_among_accepted,
            "fit_false_fix_rate": float(np.mean([f.false_fixes / max(1, f.false_fixes + len(f.errors_ne_m))
                                                  for f in flights[:3]])),
-           "outlier_rule": f"|error - flight median| > {FALSE_FIX_M} m",
+           "outlier_rule": rule,
+           "places": [f.get("places") for f in raw],
            "map_heading": heading_calibration(args.flights),
            "quality_model": quality_calibration(args.flights, cal.bias_ne_m),
            "holdout_details": cal.holdout_flight_details,
@@ -599,15 +604,31 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         # FALSE_FIX_M from the flight median is a false fix. The covariance is
         # estimated from the rest; the rate is reported, the flight is kept
         # (re-flying until no outlier would hide them).
-        bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
+        places = None
+        if report.get("calib_walk"):
+            # Flights over many places (random walk): the place rule
+            # (map_error_calibration.place_outlier_rule, thresholds fixed
+            # before series H was re-analysed): 20 m places, a place more
+            # than 3 m off is a false place, a fix more than 1 m from its
+            # place median is a false fix.
+            places = place_outlier_rule(e_all, interp(truth, t)[sel])
+            bad = ~places["inlier"]
+        else:
+            bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
         sub = [tuple(float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")) for r in acc]
-        false = int(np.sum(bad))
+        false = int(np.sum(bad)) if places is None else int(np.sum(places["false_fix"]))
         e = e_all[~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
                "std_error_ne_m": e.std(axis=0).round(4).tolist(),
                "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"],
+               "outlier_rule": "place" if places is not None else f"|error - flight median| > {FALSE_FIX_M} m",
+               "places": None if places is None else {
+                   "places": places["places"], "false_places": places["false_places"],
+                   "false_place_fixes": int(np.sum(places["false_place"])),
+                   "fixes_in_small_places": int(np.sum(~(places["inlier"] | places["false_fix"]
+                                                          | places["false_place"])))},
                "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_])),
                # Map heading error of the same fixes (NaN: no heading from the search).
                "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]],

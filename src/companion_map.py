@@ -104,6 +104,8 @@ class MapAnchor:
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
         self._drift_sigma_m = np.zeros(3)  # scale, heading, unobserved VO gaps
+        self._prior_p: np.ndarray | None = None
+        self._prior_cov: np.ndarray | None = None
         self._interval_start_us = 0
         self._interval_velocity_ne = np.zeros(2)
         self._interval_velocity_cov = np.eye(2)
@@ -164,6 +166,15 @@ class MapAnchor:
         self._interval_velocity_cov = c.copy()
         self._interval_heading_sigma = sigma_psi
         if self._p is None:
+            if self._prior_p is not None:
+                # Dead reckoning of the acquisition prior: VO noise, the
+                # path-proportional scale/heading error (conservatively as
+                # independent increments) and unknown motion over VO gaps.
+                dist = float(np.linalg.norm(d))
+                self._prior_p = self._prior_p + d
+                self._prior_cov = (self._prior_cov + c * dt * dt
+                                   + np.eye(2) * ((self._scale_sigma + sigma_psi) * dist) ** 2
+                                   + np.eye(2) * (self._gap_speed * max(gap_s, 0.0)) ** 2)
             if self._candidates and gap_s > 1e-3:
                 # Перемещение за разрыв VO неизвестно: захват заново.
                 self._candidates.clear()
@@ -191,6 +202,10 @@ class MapAnchor:
         self._t_us = t1_us
         if np.max(np.linalg.eigvalsh(self._cov)) > self._max_var:
             # Без привязок слишком долго: положение больше не передается.
+            # Оценка остается априорной для повторного захвата: ложное место
+            # карты (серия H: 3 из 36 мест сдвинуты на 4-21 м, привязки
+            # внутри места согласованы) иначе захватывалось бы заново.
+            self._prior_p, self._prior_cov = self._p.copy(), self._cov.copy()
             self._p = None
             self._cov = None
             self._last_map_z = None
@@ -283,7 +298,25 @@ class MapAnchor:
         self._count("FIX_FUSED")
         return "FIX_FUSED"
 
+    def set_acquisition_prior(self, position_ne_m, covariance_ne_m2) -> None:
+        """Independent prior for the next acquisition (e.g. the GNSS-aided
+        autopilot position before the first lock). Ignored while locked."""
+        if self._p is not None:
+            return
+        p = np.asarray(position_ne_m, dtype=float)
+        if p.shape != (2,) or not np.isfinite(p).all():
+            return
+        self._prior_p = p.copy()
+        self._prior_cov = _covariance(np.asarray(covariance_ne_m2, dtype=float), "априорное положение")
+
     def _acquire(self, t_us: int, z: np.ndarray) -> str:
+        if self._prior_p is not None:
+            y = z - self._prior_p
+            nis = float(y @ np.linalg.solve(self._prior_cov + self._r, y))
+            if not nis <= self._gate:
+                self._candidates.clear()
+                self._count("ACQUISITION_REJECTED_PRIOR")
+                return "ACQUISITION_REJECTED_PRIOR"
         if self._candidates:
             t_prev, z_prev = self._candidates[-1]
             moved_vo = self._vo_since_candidate
@@ -307,6 +340,7 @@ class MapAnchor:
         self._step_budget_m = 0.0
         self._drift_sigma_m[:] = 0.0
         self._candidates.clear()
+        self._prior_p = self._prior_cov = None
         self.last_fix_us = t_us
         self._count("LOCK_ACQUIRED")
         return "LOCK_ACQUIRED"
