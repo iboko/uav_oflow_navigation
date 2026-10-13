@@ -425,8 +425,14 @@ def main() -> None:
                 # map, not of the start area. Directions avoid the quadrant
                 # of the test route (forward/right = east/south at the
                 # take-off heading): a in (90, 360) deg.
+                # Successive directions differ by at most +-45 deg, so the
+                # legs carry the vehicle away from the start instead of
+                # cancelling (independent directions: 11-30 m span, series G).
                 rng = np.random.default_rng(args.calib_walk_seed)
-                angles = rng.uniform(90.0, 360.0, args.calib_walk_legs)
+                angles = [rng.uniform(90.0, 360.0)]
+                for _ in range(args.calib_walk_legs - 1):
+                    angles.append(float(np.clip(angles[-1] + rng.uniform(-45.0, 45.0), 90.0, 360.0)))
+                angles = np.asarray(angles)
                 legs = [(0, 0)] + [(round(stick * math.cos(math.radians(x))), round(stick * math.sin(math.radians(x))))
                                    for x in angles]
                 leg_s = args.calib_walk_leg_s
