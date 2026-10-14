@@ -124,6 +124,9 @@ def fix_covariance(cal: dict, fix, height_m: float):
     """Per-fix covariance: the match-quality model if calibrated and the
     fix carries a sub-patch covariance, otherwise the calibrated one at
     the frame height."""
+    per_source = cal.get("per_source_covariance_ne_m2")
+    if per_source and getattr(fix, "map_source", None) in per_source:
+        return per_source[fix.map_source]
     q = cal.get("quality_model")
     if q is not None and getattr(fix, "subpatch_cov_ne_m2", None) is not None:
         return quality_covariance(q["floor_m2"], q["k2"], fix.subpatch_cov_ne_m2)
@@ -148,6 +151,9 @@ def main() -> None:
     ap.add_argument("--map-mode", choices=("off", "observe", "fuse"), default="off",
                     help="observe: log orthophoto fixes only; fuse: send map-anchored position")
     ap.add_argument("--orthophoto", type=Path, help="map image (uint8 gray)")
+    ap.add_argument("--orthophoto-fallback", type=Path,
+                    help="ncc: second map tried when the first gives no fix (e.g. the full orthophoto behind "
+                         "a ground-only map); each fix carries its source for the calibration")
     ap.add_argument("--map-georef", type=Path, help="JSON: origin_ne_m, matrix_ne_m_per_px")
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
@@ -217,6 +223,8 @@ def main() -> None:
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
     map_cal: dict | None = None
+    fallback = None
+    source = "primary"
     map_shift = np.zeros(2)
     msckf: CompanionMsckf | None = None
     tracker: KltTracker | None = None
@@ -228,7 +236,7 @@ def main() -> None:
     if map_log:
         map_log.write("t_us,localizer_status,north_m,east_m,inliers,heading_offset_rad,height_m,"
                       "injected_shift_n,injected_shift_e,anchor_result,nis,process_ms,"
-                      "sub_nn,sub_ne,sub_ee,shape_nn,shape_ne,shape_ee,peak,margin\n")
+                      "sub_nn,sub_ne,sub_ee,shape_nn,shape_ne,shape_ee,peak,margin,map_source\n")
 
     # MAVLink is read in its own thread: the MSCKF initialisation takes
     # 0.7-1.8 s, and a loop blocked that long overflowed the UDP buffer
@@ -319,13 +327,17 @@ def main() -> None:
                 if args.map_method == "ncc":
                     localizer = OrthoNccLocalizer(map_gray, geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                   camera_offset_body_m=tuple(args.camera_offset_frd))
+                    if args.orthophoto_fallback:
+                        fallback = OrthoNccLocalizer(cv2.imread(str(args.orthophoto_fallback), cv2.IMREAD_GRAYSCALE),
+                                                     geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
+                                                     camera_offset_body_m=tuple(args.camera_offset_frd))
                 else:
                     tile = OrthophotoTile("orthophoto", clahe.apply(map_gray), geo)
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                     camera_offset_body_m=tuple(args.camera_offset_frd))
             if args.map_mode == "fuse":
                 c = map_cal = json.loads(args.map_calibration.read_text())
-                anchor = MapAnchor(bias_ne_m=tuple(c["bias_ne_m"]),
+                anchor = MapAnchor(bias_ne_m=(0.0, 0.0) if c.get("per_source_bias_ne_m") else tuple(c["bias_ne_m"]),
                                    covariance_ne_m2=tuple(tuple(r) for r in c["covariance_ne_m2"]),
                                    max_map_step_error_m=args.max_map_step_error_m)
             pending.append((t0, first))
@@ -389,18 +401,29 @@ def main() -> None:
                             prior, radius = local_ne, 20.0
                         fix = localizer.localize(gray, prior_ne_m=prior, radius_m=radius, height_agl_m=state[3],
                                                  roll_rad=state[0], pitch_rad=state[1], yaw_rad=state[2])
+                        source = "primary"
+                        if not fix.accepted and fallback is not None:
+                            fix2 = fallback.localize(gray, prior_ne_m=prior, radius_m=radius, height_agl_m=state[3],
+                                                     roll_rad=state[0], pitch_rad=state[1], yaw_rad=state[2])
+                            if fix2.accepted:
+                                fix, source = fix2, "fallback"
                     else:
                         fix = localizer.localize(clahe.apply(gray), height_agl_m=state[3], roll_rad=state[0],
                                                  pitch_rad=state[1], yaw_rad=state[2])
                     ms = (time.perf_counter() - t_start) * 1e3
                     n, e = fix.north_m + map_shift[0], fix.east_m + map_shift[1]
+                    # Per-source bias (calibrated separately); the anchor then has a zero bias.
+                    if map_cal and map_cal.get("per_source_bias_ne_m") and source in map_cal["per_source_bias_ne_m"]:
+                        bs = map_cal["per_source_bias_ne_m"][source]
+                        n, e = n - bs[0], e - bs[1]
                     result, nis = "", float("nan")
                     if anchor is not None:
                         # Position is known at the end of the last VO interval only.
                         if out is not None and out.vo.timestamp_us == t_frame:
                             psi = math.atan2(math.sin(fix.yaw_rad - state[2]), math.cos(fix.yaw_rad - state[2]))
                             result = anchor.fix(t_frame, fix.accepted, n, e, psi,
-                                                covariance_ne_m2=fix_covariance(map_cal, fix, state[3])
+                                                covariance_ne_m2=fix_covariance(
+                                                    map_cal, replace(fix, map_source=source), state[3])
                                                 if fix.accepted else None)
                             nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS", "FIX_REJECTED_STEP") else nis
                         else:
@@ -412,7 +435,7 @@ def main() -> None:
                             round(fix.yaw_rad - state[2], 4), round(state[3], 3), map_shift[0], map_shift[1],
                             result, round(nis, 3), round(ms, 1), *flat(fix.subpatch_cov_ne_m2), *flat(fix.shape_ne_m2),
                             round(float(getattr(localizer, "last_peak", float("nan"))), 4),
-                            round(float(getattr(localizer, "last_margin", float("nan"))), 4))) + "\n")
+                            round(float(getattr(localizer, "last_margin", float("nan"))), 4), source)) + "\n")
             if out is None:
                 continue
             # A late measurement is worse than none: EKF2 fuses it at its stamp
