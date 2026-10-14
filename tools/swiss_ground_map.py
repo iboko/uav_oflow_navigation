@@ -53,7 +53,11 @@ def object_heights_on_map(dsm: np.ndarray, dtm: np.ndarray, georef: dict, shape:
 
 
 def elevated_mask(heights: np.ndarray, gsd: float, *, h_min: float = 2.0, k: float = 0.5) -> np.ndarray:
-    """Elevated objects dilated by k * height (per height class)."""
+    """Elevated objects dilated by k * (lower bound of the height class).
+
+    Classes: > h_min, > 5, > 10, > 20, > 40 m. An object of 20 m is in the
+    (10, 20] class and gets k * 10 m: the dilation is the lower bound of
+    k * height, not an upper one."""
     mask = np.zeros(heights.shape, bool)
     for h in (h_min, 5.0, 10.0, 20.0, 40.0):
         sel = heights > h
