@@ -306,6 +306,8 @@ def main() -> None:
     ap.add_argument("--scene", choices=("textured", "swiss"), default="textured",
                     help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
     ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
+    ap.add_argument("--map-image", default="orthophoto.png",
+                    help="swiss: map image in --swiss-dir (e.g. orthophoto_ground.png from swiss_ground_map.py)")
     ap.add_argument("--altitude", type=float, help="take-off altitude, m (default 5 textured, 40 swiss)")
     ap.add_argument("--calib-walk-seed", type=int,
                     help="calibrate: random walk over the map with this seed (legs avoid the test-route quadrant)")
@@ -344,7 +346,7 @@ def main() -> None:
     vo_flight.install_vehicle(px4_dir, rate_hz=args.camera_hz)
     if args.scene == "swiss":
         # Ground: SWISSIMAGE 2025; map: SWISSIMAGE 2019, exact LV95 georef.
-        map_png, georef = args.swiss_dir / "orthophoto.png", args.swiss_dir / "orthophoto_georef.json"
+        map_png, georef = args.swiss_dir / args.map_image, args.swiss_dir / "orthophoto_georef.json"
         args.georef_error = (0.0, 0.0)
     else:
         gz.install_textured_world(px4_dir)
