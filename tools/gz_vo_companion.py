@@ -151,6 +151,9 @@ def main() -> None:
     ap.add_argument("--map-mode", choices=("off", "observe", "fuse"), default="off",
                     help="observe: log orthophoto fixes only; fuse: send map-anchored position")
     ap.add_argument("--orthophoto", type=Path, help="map image (uint8 gray)")
+    ap.add_argument("--surface", type=Path,
+                    help="ncc: surface model on the map grid (.npy, metres up; swiss_scene_3d.py): the frame is "
+                         "projected onto it instead of a flat ground")
     ap.add_argument("--orthophoto-fallback", type=Path,
                     help="ncc: second map tried when the first gives no fix (e.g. the full orthophoto behind "
                          "a ground-only map); each fix carries its source for the calibration")
@@ -325,12 +328,15 @@ def main() -> None:
                                       tuple(tuple(r) for r in georef["matrix_ne_m_per_px"]))
                 map_gray = cv2.imread(str(args.orthophoto), cv2.IMREAD_GRAYSCALE)
                 if args.map_method == "ncc":
+                    surface = np.load(args.surface) if args.surface else None
                     localizer = OrthoNccLocalizer(map_gray, geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
-                                                  camera_offset_body_m=tuple(args.camera_offset_frd))
+                                                  camera_offset_body_m=tuple(args.camera_offset_frd),
+                                                  surface_m=surface)
                     if args.orthophoto_fallback:
                         fallback = OrthoNccLocalizer(cv2.imread(str(args.orthophoto_fallback), cv2.IMREAD_GRAYSCALE),
                                                      geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
-                                                     camera_offset_body_m=tuple(args.camera_offset_frd))
+                                                     camera_offset_body_m=tuple(args.camera_offset_frd),
+                                                     surface_m=surface)
                 else:
                     tile = OrthophotoTile("orthophoto", clahe.apply(map_gray), geo)
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),

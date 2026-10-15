@@ -342,6 +342,8 @@ def main() -> None:
                          "(the long swiss route shows the natural VO drift, and NCC needs the true scale)")
     ap.add_argument("--georef-error", type=float, nargs=2, default=(0.15, -0.10))
     ap.add_argument("--companion-python", default=sys.executable)
+    ap.add_argument("--dsm-surface", action="store_true",
+                    help="swiss: project frames onto orthophoto_surface.npy in --swiss-dir (DSM) in the localizer")
     ap.add_argument("--world-3d", action="store_true",
                     help="swiss: fly in ofnav_swiss3d (DSM mesh, tools/swiss_scene_3d.py) instead of the flat plane")
     ap.add_argument("--scene", choices=("textured", "swiss"), default="textured",
@@ -439,6 +441,8 @@ def main() -> None:
             cmd += ["--map-yaw"]
         if args.scene == "swiss":
             cmd += ["--map-method", "ncc"]
+            if args.dsm_surface:
+                cmd += ["--surface", str(args.swiss_dir / "orthophoto_surface.npy")]
             if args.map_image_fallback:
                 cmd += ["--orthophoto-fallback", str(args.swiss_dir / args.map_image_fallback)]
         # The companion starts after the preflight gate: its start-up load
