@@ -42,7 +42,8 @@ class OrthoNccLocalizer:
                  yaw_search_deg=tuple(float(x) for x in range(-12, 13, 2)),
                  map_clahe_tile_m: float = 8.75, shape_radius_m: float = 1.0,
                  subpatch_search_m: float = 3.0, surface_m: np.ndarray | None = None,
-                 occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1) -> None:
+                 occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1,
+                 refine_radius_m: float = 0.0, refine_min_shift_m: float = 1.0) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -80,6 +81,7 @@ class OrthoNccLocalizer:
         self.surface = None if surface_m is None else np.asarray(surface_m, dtype=np.float32)
         self.occlusion_tolerance_m = occlusion_tolerance_m
         self.max_outside_fraction = max_outside_fraction
+        self.refine_radius_m, self.refine_min_shift_m = refine_radius_m, refine_min_shift_m
         self.last_hidden_fraction = 0.0
         self.exclusion_px = max(1, int(round(exclusion_m / self.gsd)))
         self.max_tilt = max_tilt_rad
@@ -161,6 +163,22 @@ class OrthoNccLocalizer:
 
     def localize(self, image: np.ndarray, *, prior_ne_m, radius_m: float, height_agl_m: float,
                  roll_rad: float, pitch_rad: float, yaw_rad: float) -> MapLocalizationFix:
+        fix = self._localize(image, prior_ne_m=prior_ne_m, radius_m=radius_m, height_agl_m=height_agl_m,
+                             roll_rad=roll_rad, pitch_rad=pitch_rad, yaw_rad=yaw_rad)
+        # With a surface model the frame was projected around the prior; a fix
+        # far from it is re-projected around itself (edges of buildings move
+        # with the assumed camera position) and matched in a small window.
+        if (self.surface is not None and fix.accepted and self.refine_radius_m > 0
+                and np.hypot(fix.north_m - prior_ne_m[0], fix.east_m - prior_ne_m[1]) > self.refine_min_shift_m):
+            refined = self._localize(image, prior_ne_m=np.array([fix.north_m, fix.east_m]),
+                                     radius_m=self.refine_radius_m, height_agl_m=height_agl_m,
+                                     roll_rad=roll_rad, pitch_rad=pitch_rad, yaw_rad=yaw_rad)
+            if refined.accepted:
+                return refined
+        return fix
+
+    def _localize(self, image: np.ndarray, *, prior_ne_m, radius_m: float, height_agl_m: float,
+                  roll_rad: float, pitch_rad: float, yaw_rad: float) -> MapLocalizationFix:
         if not all(isfinite(x) for x in (height_agl_m, roll_rad, pitch_rad, yaw_rad, radius_m)):
             return MapLocalizationFix(False, "NONFINITE_INPUT")
         if prior_ne_m is None or not np.isfinite(prior_ne_m).all():
