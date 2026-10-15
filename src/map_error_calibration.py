@@ -229,7 +229,8 @@ def place_outlier_rule(errors_ne_m, positions_ne_m, *, cell_m: float = 20.0, fal
 
     The map error is a per-place offset plus small noise (series H: 36
     places of 20 m, within-place SD 0.2 m, place offsets mostly < 2 m and
-    3 places 4-21 m off with self-consistent fixes). A flight-wide median
+    a place 21 m off with self-consistent fixes; two more "false places"
+    were at the scene edge). A flight-wide median
     rule mixes those. Here: places = cells of ``cell_m`` along the
     flown positions; a place whose median error is more than
     ``false_place_m`` from the flight's median of place medians is a
