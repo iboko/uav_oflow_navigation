@@ -251,6 +251,9 @@ def place_diagnostics(dirs, raw) -> dict | None:
     v = model["covariance_ne_m2"][0][0]
     model["holdout_mean_nees"] = [round(float(np.mean(np.sum((e - b) ** 2, axis=1)) / v), 2) for e in errs[3:]]
     model["cross_validation_3_fit"] = cross_validated_nees(errs, pos, fit_flights=3)
+    if len(errs) > 5:
+        # More places in the fit: does the holdout consistency improve?
+        model[f"cross_validation_{len(errs) - 2}_fit"] = cross_validated_nees(errs, pos, fit_flights=len(errs) - 2)
     return model
 
 
