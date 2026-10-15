@@ -4,7 +4,8 @@ import json
 import numpy as np
 import pytest
 
-from src.map_error_calibration import MapErrorFlight, calibrate_map_error
+from src.map_error_calibration import (MapErrorFlight, calibrate_map_error, cross_validated_nees,
+                                       place_weighted_error_model)
 from src.run_map_error_calibration import run_map_calibration
 
 
@@ -184,3 +185,41 @@ def test_place_rule_separates_false_places_and_false_fixes():
     assert r["false_place"][90:120].all() and not r["false_place"][:90].any()
     assert r["false_fix"][5] and r["false_fix"].sum() == 1
     assert r["inlier"].sum() == 180 - 30 - 1
+
+
+def _place_flights(seed, n_flights=5, places=6, per_place=(5, 60), sigma_place=0.6, sigma_within=0.15):
+    rng = np.random.default_rng(seed)
+    errs, poss = [], []
+    for f in range(n_flights):
+        e, p = [], []
+        for k in range(places):
+            off = rng.normal(0.0, sigma_place, 2)
+            n = int(rng.integers(*per_place))
+            centre = np.array([20.0 * (f * places + k) + 10.0, 10.0])
+            e.append(off + rng.normal(0.0, sigma_within, (n, 2)))
+            p.append(centre + rng.uniform(-5, 5, (n, 2)))
+        errs.append(np.concatenate(e))
+        poss.append(np.concatenate(p))
+    return errs, poss
+
+
+def test_place_weighted_model_recovers_place_and_within_variance():
+    errs, poss = _place_flights(1, n_flights=20)
+    m = place_weighted_error_model(errs, poss)
+    assert m["places"] == 120
+    assert np.sqrt(m["place_variance_m2"]) == pytest.approx(0.6, rel=0.12)
+    assert np.sqrt(m["within_place_variance_m2"]) == pytest.approx(0.15, rel=0.05)
+    assert m["covariance_ne_m2"][0][0] == pytest.approx(m["place_variance_m2"] + m["within_place_variance_m2"])
+    with pytest.raises(ValueError):
+        place_weighted_error_model([errs[0][:4]], [poss[0][:4]])
+
+
+def test_cross_validation_place_weighting_is_not_dominated_by_large_places():
+    # Places with many fixes have no special offset: both estimators should be
+    # near NEES 2 on average when the place offsets are Gaussian.
+    errs, poss = _place_flights(2)
+    cv = cross_validated_nees(errs, poss, fit_flights=3)
+    assert cv["place_weighted"]["holdouts"] == cv["per_fix"]["holdouts"] == 20
+    assert 1.0 < cv["place_weighted"]["mean"] < 4.0
+    with pytest.raises(ValueError):
+        cross_validated_nees(errs, poss, fit_flights=5)

@@ -49,7 +49,9 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.map_error_calibration import fit_quality_model, place_outlier_rule, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
+from src.map_error_calibration import (MapErrorFlight, calibrate_map_error, cross_validated_nees,  # noqa: E402
+                                       fit_quality_model, place_outlier_rule, place_weighted_error_model,
+                                       quality_covariance)
 
 # EV horizontal position + velocity. 5 m: at 3 m the camera sees the ground
 # at 1.6x the map resolution and ORB matching fails (checked offline).
@@ -236,6 +238,49 @@ def quality_calibration(dirs, bias) -> dict | None:
     return m
 
 
+def place_diagnostics(dirs, raw) -> dict | None:
+    """Place-weighted model on the fit flights and the cross-validated
+    holdout NEES of both estimators (diagnostic: covariance_ne_m2 stays the
+    per-fix estimate). Only for calibrations over many places (walk)."""
+    if not all(r.get("outlier_rule") == "place" for r in raw):
+        return None
+    errs = [np.asarray(r["errors_ne_m"]) for r in raw]
+    pos = [flight_positions(d, r) for d, r in zip(dirs, raw)]
+    model = place_weighted_error_model(errs[:3], pos[:3])
+    b = np.asarray(model["bias_ne_m"])
+    v = model["covariance_ne_m2"][0][0]
+    model["holdout_mean_nees"] = [round(float(np.mean(np.sum((e - b) ** 2, axis=1)) / v), 2) for e in errs[3:]]
+    model["cross_validation_3_fit"] = cross_validated_nees(errs, pos, fit_flights=3)
+    return model
+
+
+def flight_positions(d: Path, f: dict) -> np.ndarray:
+    """True positions of the inlier fixes of a calibration flight.
+
+    Stored in map_errors.json since series M; for older flights recomputed
+    from the flight's ulog and map log with the same place rule, and
+    checked against the stored errors."""
+    if "positions_ne_m" in f:
+        return np.asarray(f["positions_ne_m"], dtype=float)
+    from pyulog import ULog
+    rep = json.loads((d / "gz_map_companion_calibrate.json").read_text())
+    truth = ULog(rep["ulog"], ["vehicle_local_position_groundtruth"]).data_list[0].data
+    rows = read_map_log(d / "companion_map.csv")
+    offset = int(rep["companion_final_status"].get("time_offset_us") or 0)
+    acc = [r for r in rows if r["localizer_status"].endswith("ACCEPTED_UNVALIDATED")]
+    t = np.array([int(r["t_us"]) + offset for r in acc])
+    fx = np.array([[float(r["north_m"]) - float(r["injected_shift_n"]),
+                    float(r["east_m"]) - float(r["injected_shift_e"])] for r in acc])
+    t0, t1 = rep["segments"]["flight"]
+    sel = (t >= t0) & (t <= t1)
+    pos = interp(truth, t)[sel]
+    e = fx[sel] - pos
+    inl = place_outlier_rule(e, pos)["inlier"]
+    if not np.allclose(e[inl], np.asarray(f["errors_ne_m"]), atol=1e-3):
+        raise RuntimeError(f"{d}: recomputed fixes differ from map_errors.json")
+    return pos[inl]
+
+
 def combine(args) -> None:
     flights, heights = [], []
     for d in args.flights:
@@ -298,6 +343,7 @@ def combine(args) -> None:
            "outlier_rule": rule,
            "places": [f.get("places") for f in raw],
            "map_heading": heading_calibration(args.flights),
+           "place_model": place_diagnostics(args.flights, raw),
            "quality_model": quality_calibration(args.flights, cal.bias_ne_m),
            "per_source_bias_ne_m": per_source["bias"] if per_source else None,
            "per_source_covariance_ne_m2": per_source["cov"] if per_source else None,
@@ -699,6 +745,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         sub = [tuple(float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")) for r in acc]
         false = int(np.sum(bad)) if places is None else int(np.sum(places["false_fix"]))
         e = e_all[~bad]
+        pos_inl = interp(truth, t)[sel][~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
@@ -714,6 +761,8 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                # Map heading error of the same fixes (NaN: no heading from the search).
                "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]],
                "map_source": src_all[~bad].tolist(),
+               # True positions of the same fixes: places for the place-weighted model.
+               "positions_ne_m": pos_inl.round(2).tolist(),
                # Sub-patch covariance of the same (inlier) fixes, for the
                # match-quality covariance model (NaN rows: not available).
                "subpatch_cov_ne_m2": [[[sub[k][0], sub[k][1]], [sub[k][1], sub[k][2]]]
