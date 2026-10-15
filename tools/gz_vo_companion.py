@@ -38,7 +38,8 @@ from pymavlink import mavutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E402
-from src.companion_map import MapAnchor  # noqa: E402
+from src.attitude_time_alignment import quaternion_to_rpy  # noqa: E402
+from src.companion_map import GyroHeading, MapAnchor  # noqa: E402
 from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
 from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
@@ -233,6 +234,9 @@ def main() -> None:
     tracker: KltTracker | None = None
     last_msckf_t = 0
     local_ne = np.array([np.nan, np.nan])
+    # With map heading sent to EKF2: offsets relative to a gyro-integrated
+    # heading, which the EV yaw fusion does not rotate (no feedback loop).
+    gyro = GyroHeading() if args.map_yaw else None
     last_map_t, last_control, frame_no = 0, 0.0, 0
     map_counts: dict[str, int] = {}
     map_log = args.map_log.open("w") if args.map_log else None
@@ -278,6 +282,9 @@ def main() -> None:
                 pipeline.clock.add(msg.ts1 // 1000, msg.tc1 // 1000, arrival)
             elif t == "ATTITUDE_QUATERNION":
                 pipeline.attitude.add(msg.time_boot_ms * 1000, (msg.q1, msg.q2, msg.q3, msg.q4))
+                if gyro is not None:
+                    gyro.add(msg.time_boot_ms * 1000, *quaternion_to_rpy(np.array([msg.q1, msg.q2, msg.q3, msg.q4])),
+                             (msg.rollspeed, msg.pitchspeed, msg.yawspeed))
             elif t == "HIGHRES_IMU" and msckf is not None and pipeline.clock.valid:
                 reading = ImuReading(int(msg.time_usec) - pipeline.clock.offset_us,
                                      (msg.xgyro, msg.ygyro, msg.zgyro), (msg.xacc, msg.yacc, msg.zacc))
@@ -388,8 +395,13 @@ def main() -> None:
                 out = pipeline.process(t_frame, gray)
             if out is not None and anchor is not None:
                 r = out.vo
+                ref = 0.0
+                if gyro is not None:
+                    d = gyro.at(out.time_us + pipeline.clock.offset_us) - out.rpy_mid[2]
+                    ref = math.atan2(math.sin(d), math.cos(d)) if math.isfinite(d) else float("nan")
                 anchor.propagate(r.interval_start_us, r.timestamp_us, (r.vn_m_s, r.ve_m_s),
-                                 ((r.velocity_cov_nn, r.velocity_cov_ne), (r.velocity_cov_ne, r.velocity_cov_ee)))
+                                 ((r.velocity_cov_nn, r.velocity_cov_ne), (r.velocity_cov_ne, r.velocity_cov_ee)),
+                                 reference_minus_autopilot_rad=ref)
             if localizer is not None and t_frame - last_map_t >= 1e6 / args.map_rate_hz:
                 state = pipeline.state_at_camera_time(t_frame)
                 if state is not None:
@@ -426,7 +438,8 @@ def main() -> None:
                     if anchor is not None:
                         # Position is known at the end of the last VO interval only.
                         if out is not None and out.vo.timestamp_us == t_frame:
-                            psi = math.atan2(math.sin(fix.yaw_rad - state[2]), math.cos(fix.yaw_rad - state[2]))
+                            ref_yaw = state[2] if gyro is None else gyro.at(t_frame + pipeline.clock.offset_us)
+                            psi = math.atan2(math.sin(fix.yaw_rad - ref_yaw), math.cos(fix.yaw_rad - ref_yaw))
                             result = anchor.fix(t_frame, fix.accepted, n, e, psi,
                                                 covariance_ne_m2=fix_covariance(
                                                     map_cal, replace(fix, map_source=source), state[3])
@@ -466,11 +479,15 @@ def main() -> None:
                 pos = [*measurement.position_ne_m,
                        -out.height_mid_m]  # map datum = ground plane; EV height is not fused
                 pose_cov = list(measurement.mavlink_pose_covariance(0.05 ** 2))
-                if args.map_yaw and anchor.heading_known and all(map(math.isfinite, out.rpy_mid)):
-                    # Heading = autopilot heading + offset measured by the map.
+                r, p_, y = out.rpy_mid
+                if gyro is not None:
+                    # Not the autopilot heading: EKF2 turns it towards what
+                    # we send, and the offset would be added a second time.
+                    y = gyro.at(out.time_us + pipeline.clock.offset_us)
+                if args.map_yaw and anchor.heading_known and all(map(math.isfinite, (r, p_, y))):
+                    # Heading = reference heading + offset measured by the map.
                     # EKF2 takes only the yaw of this quaternion (fuseYaw);
                     # roll and pitch are the autopilot's own.
-                    r, p_, y = out.rpy_mid
                     y += anchor.heading_offset_rad
                     cr, sr, cp, sp, cy, sy = (math.cos(r / 2), math.sin(r / 2), math.cos(p_ / 2),
                                               math.sin(p_ / 2), math.cos(y / 2), math.sin(y / 2))

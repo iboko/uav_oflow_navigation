@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from src.companion_map import AnchorMeasurement, MapAnchor
+from src.companion_map import AnchorMeasurement, GyroHeading, MapAnchor
 
 R = ((0.05 ** 2, 0.0), (0.0, 0.05 ** 2))
 VO_COV = ((0.05 ** 2, 0.0), (0.0, 0.05 ** 2))
@@ -300,3 +300,48 @@ def test_first_lock_is_gated_by_an_independent_prior():
     assert anchor.fix(1_066_000, True, 15.0, 0.0) == "ACQUISITION_REJECTED_PRIOR"
     anchor.propagate(1_066_000, 1_132_000, (0.0, 0.0), VO_COV)
     assert anchor.fix(1_132_000, True, 1.0, 0.0) == "ACQUISITION_PENDING"
+
+
+def test_gyro_heading_integrates_body_rates_and_ignores_attitude_yaw():
+    g = GyroHeading()
+    t = 1_000_000
+    # Level, 0.1 rad/s for 10 s; the attitude yaw is jumped by an "EKF2 reset"
+    # in the middle and must not enter the integrated heading.
+    for k in range(1001):
+        yaw = 0.3 + (0.5 if k > 500 else 0.0)
+        g.add(t + k * 10_000, 0.0, 0.0, yaw, (0.0, 0.0, 0.1))
+    assert g.at(t + 10_000_000) == pytest.approx(0.3 + 1.0, abs=1e-6)
+    assert np.isnan(g.at(t + 10_000_001)) and np.isnan(g.at(t - 1))
+    # Banked turn: yaw rate = (q sin(phi) + r cos(phi)) / cos(theta).
+    g2 = GyroHeading()
+    phi = np.radians(20.0)
+    for k in range(101):
+        g2.add(t + k * 10_000, phi, 0.0, 0.0, (0.0, 0.1 * np.sin(phi), 0.1 * np.cos(phi)))
+    assert g2.at(t + 1_000_000) == pytest.approx(0.1, abs=1e-6)
+    g2.add(t + 2_000_000, phi, 0.0, 0.0, (0.0, 0.1 * np.sin(phi), 0.1 * np.cos(phi)))
+    assert g2.gaps == 1
+
+
+def _heading_loop(use_gyro: bool, steps: int = 400) -> float:
+    """EKF2 heading pulled towards the yaw we send (EV yaw); true heading 0,
+    autopilot starts 10 deg off, map fixes every 8 intervals measure 0."""
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    psi_ap = psi_g = np.radians(10.0)       # gyro heading starts at the autopilot heading
+    t = 1_000_000
+    for k in range(steps):
+        ref = psi_g - psi_ap if use_gyro else 0.0
+        anchor.propagate(t, t + DT, (0.0, 0.0), VO_COV, reference_minus_autopilot_rad=ref)
+        t += DT
+        if k % 8 == 0:
+            anchor.fix(t, True, 0.0, 0.0, 0.0 - (psi_g if use_gyro else psi_ap))
+        if anchor.heading_known:
+            sent = (psi_g if use_gyro else psi_ap) + anchor.heading_offset_rad
+            psi_ap += 0.3 * np.arctan2(np.sin(sent - psi_ap), np.cos(sent - psi_ap))
+    return float(np.degrees(psi_ap))
+
+
+def test_gyro_reference_breaks_the_ev_yaw_feedback_loop():
+    # Offset against the autopilot heading: applied again after EKF2 has
+    # already turned, the heading runs past the truth (test M: 48 deg).
+    assert abs(_heading_loop(use_gyro=False)) > 2.0
+    assert abs(_heading_loop(use_gyro=True)) < 0.1
