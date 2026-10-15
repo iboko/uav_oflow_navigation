@@ -357,6 +357,8 @@ def main() -> None:
     ap.add_argument("--calib-walk-seed", type=int,
                     help="calibrate: random walk over the map with this seed (legs avoid the test-route quadrant)")
     ap.add_argument("--calib-walk-legs", type=int, default=5)
+    ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
+                    help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
     ap.add_argument("--calib-direction-deg", type=float, default=0.0,
                     help="calibrate: direction of the two legs (0: forward then right). Each calibration "
@@ -502,7 +504,21 @@ def main() -> None:
             report["calib_direction_deg"] = args.calib_direction_deg
             for pitch, roll in legs:
                 if pitch or roll:
-                    move(pitch, roll, leg_s)
+                    if args.calib_walk_seed is not None:
+                        # Stay over the scene: a leg ends early beyond
+                        # calib_walk_bound_m from the centre (GNSS-aided
+                        # position; series M flight 5 left the 400 m scene).
+                        link.pitch, link.roll = pitch, roll
+                        t_leg = link.boot_s
+                        while link.boot_s - t_leg < leg_s:
+                            gz.sim_sleep(1)
+                            if math.hypot(link.state["x"], link.state["y"]) > args.calib_walk_bound_m:
+                                report.setdefault("calib_walk_bounded_legs", 0)
+                                report["calib_walk_bounded_legs"] += 1
+                                break
+                        link.pitch = link.roll = 0
+                    else:
+                        move(pitch, roll, leg_s)
                     gz.sim_sleep(4)
                 for p, r in ((120, 0), (0, 120), (-120, 0), (0, -120)):
                     move(p, r, 2)
