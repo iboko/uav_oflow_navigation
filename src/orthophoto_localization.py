@@ -90,6 +90,8 @@ class MapLocalizationFix:
     # NCC only: sample covariance of the N/E offsets of the patch quadrants
     # matched separately [m^2] (local geometric consistency of the match).
     subpatch_cov_ne_m2: tuple[tuple[float, float], tuple[float, float]] | None = None
+    # Which map produced the fix when a fallback map is used ("primary"/"fallback").
+    map_source: str = "primary"
 
 
 @dataclass(frozen=True)

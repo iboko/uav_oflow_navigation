@@ -41,7 +41,8 @@ class OrthoNccLocalizer:
                  exclusion_m: float = 3.0, max_tilt_rad: float = 0.12,
                  yaw_search_deg=tuple(float(x) for x in range(-12, 13, 2)),
                  map_clahe_tile_m: float = 8.75, shape_radius_m: float = 1.0,
-                 subpatch_search_m: float = 3.0) -> None:
+                 subpatch_search_m: float = 3.0, surface_m: np.ndarray | None = None,
+                 occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -72,6 +73,14 @@ class OrthoNccLocalizer:
         self.min_peak, self.min_margin = min_peak, min_margin
         self.shape_radius_px = max(1, int(round(shape_radius_m / self.gsd)))
         self.subpatch_search_px = max(1, int(round(subpatch_search_m / self.gsd)))
+        # Surface model (DSM) on the map grid [m, up, any common datum]: the
+        # frame is projected onto it instead of a flat ground.
+        if surface_m is not None and np.asarray(surface_m).shape != gray.shape:
+            raise ValueError("Модель поверхности должна совпадать с картой по размеру")
+        self.surface = None if surface_m is None else np.asarray(surface_m, dtype=np.float32)
+        self.occlusion_tolerance_m = occlusion_tolerance_m
+        self.max_outside_fraction = max_outside_fraction
+        self.last_hidden_fraction = 0.0
         self.exclusion_px = max(1, int(round(exclusion_m / self.gsd)))
         self.max_tilt = max_tilt_rad
         self.yaw_search = tuple(np.radians(yaw_search_deg))
@@ -91,8 +100,18 @@ class OrthoNccLocalizer:
         # n = origin_n - gsd*row ; e = origin_e + gsd*col
         return (e - self.origin[1]) / self.gsd, (self.origin[0] - n) / self.gsd
 
-    def ortho_patch(self, frame: np.ndarray, height_agl_m: float, roll: float, pitch: float, yaw: float):
-        """North-up patch centred below the camera; returns (patch, fully_inside)."""
+    def ortho_patch(self, frame: np.ndarray, height_agl_m: float, roll: float, pitch: float, yaw: float,
+                    center_ne_m=None):
+        """North-up patch centred below the camera; returns (patch, fully_inside).
+
+        Without a surface model: every patch cell is a point of a flat ground
+        ``height_agl_m`` below the camera. With one (``surface_m``, heights on
+        the map grid) and the camera's ground position ``center_ne_m``: the
+        cell is the surface point (N, E, z(N, E)); the camera is
+        ``height_agl_m`` (rangefinder: distance to the surface below) above
+        z at its nadir. Cells hidden from the camera by a nearer surface
+        (z-buffer in the image) take the mean of the visible cells.
+        """
         r_nb = body_to_ned(roll, pitch, yaw)
         r_nc = r_nb @ self.r_bc
         js, is_ = np.meshgrid(np.arange(self.npx), np.arange(self.npx))
@@ -102,14 +121,43 @@ class OrthoNccLocalizer:
         camera_height = height_agl_m - (r_nb @ self.offset)[2]
         if camera_height <= 0:
             return None, False
-        pts = np.stack([dn, de, np.full_like(dn, camera_height)], -1)
+        depth = np.full_like(dn, camera_height)
+        use_surface = self.surface is not None and center_ne_m is not None
+        if use_surface:
+            cn, ce = float(center_ne_m[0]), float(center_ne_m[1])
+            z_cells = self._surface_at(cn + dn, ce + de)
+            z_nadir = float(self._surface_at(np.array([[cn]]), np.array([[ce]]))[0, 0])
+            depth = camera_height + z_nadir - z_cells
+        pts = np.stack([dn, de, depth], -1)
         pc = pts @ r_nc
         uv = pc @ self.k.T
         mx = (uv[..., 0] / uv[..., 2]).astype(np.float32)
         my = (uv[..., 1] / uv[..., 2]).astype(np.float32)
         h, w = frame.shape
-        inside = bool(np.all((mx >= 0) & (mx < w - 1) & (my >= 0) & (my < h - 1) & (pc[..., 2] > 0)))
-        return cv2.remap(frame, mx, my, cv2.INTER_LINEAR), inside
+        in_frame = (mx >= 0) & (mx < w - 1) & (my >= 0) & (my < h - 1) & (pc[..., 2] > 0)
+        # With relief, roof cells come closer to the camera and can leave the
+        # frame: up to max_outside_fraction of the cells are allowed out
+        # (filled like hidden cells); a flat ground needs the whole patch.
+        inside = bool(in_frame.all()) if not use_surface else float(in_frame.mean()) >= 1 - self.max_outside_fraction
+        patch = cv2.remap(frame, mx, my, cv2.INTER_LINEAR)
+        if use_surface and inside:
+            # Occlusion: the nearest cell wins each image pixel.
+            px = np.clip(np.round(mx).astype(int), 0, w - 1)
+            py = np.clip(np.round(my).astype(int), 0, h - 1)
+            zbuf = np.full((h, w), np.inf)
+            sel = in_frame.ravel()
+            np.minimum.at(zbuf, (py.ravel()[sel], px.ravel()[sel]), pc[..., 2].ravel()[sel])
+            hidden = (pc[..., 2] > zbuf[py, px] + self.occlusion_tolerance_m) | ~in_frame
+            if hidden.any() and not hidden.all():
+                patch = patch.copy()
+                patch[hidden] = np.uint8(round(float(patch[~hidden].mean())))
+            self.last_hidden_fraction = float(hidden.mean())
+        return patch, inside
+
+    def _surface_at(self, north: np.ndarray, east: np.ndarray) -> np.ndarray:
+        col = ((east - self.origin[1]) / self.gsd).astype(np.float32)
+        row = ((self.origin[0] - north) / self.gsd).astype(np.float32)
+        return cv2.remap(self.surface, col, row, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
     def localize(self, image: np.ndarray, *, prior_ne_m, radius_m: float, height_agl_m: float,
                  roll_rad: float, pitch_rad: float, yaw_rad: float) -> MapLocalizationFix:
@@ -142,7 +190,8 @@ class OrthoNccLocalizer:
         peaks: dict[float, float] = {}
         locs: dict[float, tuple[int, int]] = {}
         for dyaw in self.yaw_search:
-            patch, inside = self.ortho_patch(image, height_agl_m, roll_rad, pitch_rad, yaw_rad + dyaw)
+            patch, inside = self.ortho_patch(image, height_agl_m, roll_rad, pitch_rad, yaw_rad + dyaw,
+                                             center_ne_m=cam_prior)
             if not inside:
                 continue
             patch = self.clahe.apply(patch)

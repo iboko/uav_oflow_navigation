@@ -170,3 +170,17 @@ def test_quality_model_recovers_scale_of_subpatch_covariance():
     assert 0.3 < m["k2"] < 0.8 and 0.01 < m["floor_m2"] < 0.1, m
     assert all(1.5 < x < 2.6 for x in m["holdout_mean_nees"])
     assert np.allclose(quality_covariance(0.04, 0.5, [[1, 0], [0, 0.3]]), [[0.54, 0], [0, 0.19]])
+
+
+def test_place_rule_separates_false_places_and_false_fixes():
+    from src.map_error_calibration import place_outlier_rule
+    rng = np.random.default_rng(1)
+    pos = np.column_stack([np.repeat(np.arange(6) * 20.0 + 10, 30), np.zeros(180)])
+    offs = np.array([[0.5, 0], [0.8, 0.2], [-0.3, 0.1], [12.0, -5.0], [0.2, -0.4], [1.0, 0.0]])
+    e = np.repeat(offs, 30, axis=0) + rng.normal(0, 0.15, (180, 2))
+    e[5] += (3.0, 0.0)                          # a single false fix in place 0
+    r = place_outlier_rule(e, pos)
+    assert r["places"] == 6 and r["false_places"] == 1
+    assert r["false_place"][90:120].all() and not r["false_place"][:90].any()
+    assert r["false_fix"][5] and r["false_fix"].sum() == 1
+    assert r["inlier"].sum() == 180 - 30 - 1

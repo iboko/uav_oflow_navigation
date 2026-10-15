@@ -49,7 +49,7 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.map_error_calibration import fit_quality_model, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
+from src.map_error_calibration import fit_quality_model, place_outlier_rule, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
 
 # EV horizontal position + velocity. 5 m: at 3 m the camera sees the ground
 # at 1.6x the map resolution and ORB matching fails (checked offline).
@@ -194,6 +194,30 @@ def heading_calibration(dirs) -> dict | None:
             "holdout_within_2sd": round(float(np.mean(np.abs(hold - m) <= 2 * sd)), 3)}
 
 
+def source_calibration(dirs) -> dict | None:
+    """Per map source (primary / fallback): bias and isotropic covariance on
+    the 3 fit flights (equal weight), NEES and coverage on the held-out ones."""
+    raw = [json.loads((d / "map_errors.json").read_text()) for d in dirs]
+    if not all("map_source" in r for r in raw) or len({s_ for r in raw for s_ in r["map_source"]}) < 2:
+        return None
+    out = {"bias": {}, "cov": {}, "check": {}}
+    for src in sorted({s_ for r in raw for s_ in r["map_source"]}):
+        per = [np.asarray(r["errors_ne_m"], float)[np.asarray(r["map_source"]) == src] for r in raw]
+        fit = [e for e in per[:3] if len(e) >= 10]
+        if not fit:
+            continue
+        b = np.mean([e.mean(axis=0) for e in fit], axis=0)
+        var = float(np.mean([np.mean(np.sum((e - b) ** 2, axis=1)) / 2 for e in fit]))
+        nees = [np.sum((e - b) ** 2, axis=1) / var for e in per[3:] if len(e)]
+        out["bias"][src] = b.round(4).tolist()
+        out["cov"][src] = [[var, 0.0], [0.0, var]]
+        out["check"][src] = {"fit_fixes": [len(e) for e in per[:3]], "holdout_fixes": [len(e) for e in per[3:]],
+                             "sigma_m": round(math.sqrt(var), 3),
+                             "holdout_mean_nees": [round(float(np.mean(n)), 2) for n in nees],
+                             "holdout_coverage_95": [round(float(np.mean(n <= 5.991)), 3) for n in nees]}
+    return out
+
+
 def quality_calibration(dirs, bias) -> dict | None:
     """ML fit of R = floor*I + k2*C_subpatch on the 3 fit flights, NEES on
     the 2 held-out ones. Fixes without a sub-patch covariance are left out
@@ -221,8 +245,24 @@ def combine(args) -> None:
         flights.append(MapErrorFlight(f["name"], tuple(map(tuple, f["errors_ne_m"])), f["total_frames"],
                                       f["false_fixes"]))
     heights = heights if len(heights) == len(args.flights) else []
+    raw = [json.loads((d / "map_errors.json").read_text()) for d in args.flights]
+    rule = raw[0].get("outlier_rule", f"|error - flight median| > {FALSE_FIX_M} m")
+    if rule == "place":
+        rule = "place rule: 20 m places, place > 3 m off = false place, fix > 1 m from place median = false fix"
     cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30,
-                              outliers_removed_by_rule=f"|error - flight median| > {FALSE_FIX_M} m")
+                              outliers_removed_by_rule=rule)
+    per_source = source_calibration(args.flights)
+    if per_source:
+        # Fixes pre-corrected by their source's bias in the companion: the
+        # pooled calibration is redone on per-source-corrected errors.
+        corrected = []
+        for d, f in zip(args.flights, flights):
+            r = json.loads((d / "map_errors.json").read_text())
+            b = np.array([per_source["bias"][s_] for s_ in r["map_source"]])
+            corrected.append(MapErrorFlight(f.name, tuple(map(tuple, np.asarray(f.errors_ne_m) - b)),
+                                            f.total_frames, f.false_fixes))
+        flights = corrected
+        cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30, outliers_removed_by_rule=rule)
     cov = np.asarray(cal.covariance_ne_m2)
     within = np.asarray(cal.within_flight_covariance_ne_m2)
     between = np.asarray(cal.between_flight_covariance_ne_m2)
@@ -255,9 +295,13 @@ def combine(args) -> None:
            "holdout_false_fix_rate": cal.holdout_false_fix_rate_among_accepted,
            "fit_false_fix_rate": float(np.mean([f.false_fixes / max(1, f.false_fixes + len(f.errors_ne_m))
                                                  for f in flights[:3]])),
-           "outlier_rule": f"|error - flight median| > {FALSE_FIX_M} m",
+           "outlier_rule": rule,
+           "places": [f.get("places") for f in raw],
            "map_heading": heading_calibration(args.flights),
            "quality_model": quality_calibration(args.flights, cal.bias_ne_m),
+           "per_source_bias_ne_m": per_source["bias"] if per_source else None,
+           "per_source_covariance_ne_m2": per_source["cov"] if per_source else None,
+           "per_source_check": per_source["check"] if per_source else None,
            "holdout_details": cal.holdout_flight_details,
            "independently_validated_for_flight": False,
            "note": "simulated flights (Gazebo, idealised camera)"}
@@ -298,9 +342,17 @@ def main() -> None:
                          "(the long swiss route shows the natural VO drift, and NCC needs the true scale)")
     ap.add_argument("--georef-error", type=float, nargs=2, default=(0.15, -0.10))
     ap.add_argument("--companion-python", default=sys.executable)
+    ap.add_argument("--dsm-surface", action="store_true",
+                    help="swiss: project frames onto orthophoto_surface.npy in --swiss-dir (DSM) in the localizer")
+    ap.add_argument("--world-3d", action="store_true",
+                    help="swiss: fly in ofnav_swiss3d (DSM mesh, tools/swiss_scene_3d.py) instead of the flat plane")
     ap.add_argument("--scene", choices=("textured", "swiss"), default="textured",
                     help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
     ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
+    ap.add_argument("--map-image-fallback",
+                    help="swiss: second map in --swiss-dir tried when the first gives no fix (per-source calibration)")
+    ap.add_argument("--map-image", default="orthophoto.png",
+                    help="swiss: map image in --swiss-dir (e.g. orthophoto_ground.png from swiss_ground_map.py)")
     ap.add_argument("--altitude", type=float, help="take-off altitude, m (default 5 textured, 40 swiss)")
     ap.add_argument("--calib-walk-seed", type=int,
                     help="calibrate: random walk over the map with this seed (legs avoid the test-route quadrant)")
@@ -330,7 +382,7 @@ def main() -> None:
     if args.focal_error is None:
         args.focal_error = 0.0 if args.scene == "swiss" else 0.05
     params["MIS_TAKEOFF_ALT"] = f"{altitude:.1f}"
-    world = "ofnav_swiss" if args.scene == "swiss" else gz.TEXTURED_WORLD
+    world = ("ofnav_swiss3d" if args.world_3d else "ofnav_swiss") if args.scene == "swiss" else gz.TEXTURED_WORLD
     # Route scale: legs long enough to cross several camera footprints.
     stick, leg_s, sample_s = (400, 15, 3) if args.scene == "swiss" else (300, 4, 2)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
@@ -339,7 +391,7 @@ def main() -> None:
     vo_flight.install_vehicle(px4_dir, rate_hz=args.camera_hz)
     if args.scene == "swiss":
         # Ground: SWISSIMAGE 2025; map: SWISSIMAGE 2019, exact LV95 georef.
-        map_png, georef = args.swiss_dir / "orthophoto.png", args.swiss_dir / "orthophoto_georef.json"
+        map_png, georef = args.swiss_dir / args.map_image, args.swiss_dir / "orthophoto_georef.json"
         args.georef_error = (0.0, 0.0)
     else:
         gz.install_textured_world(px4_dir)
@@ -389,6 +441,10 @@ def main() -> None:
             cmd += ["--map-yaw"]
         if args.scene == "swiss":
             cmd += ["--map-method", "ncc"]
+            if args.dsm_surface:
+                cmd += ["--surface", str(args.swiss_dir / "orthophoto_surface.npy")]
+            if args.map_image_fallback:
+                cmd += ["--orthophoto-fallback", str(args.swiss_dir / args.map_image_fallback)]
         # The companion starts after the preflight gate: its start-up load
         # (orthophoto features) during EKF2 initialisation coincided with
         # failed magnetometer alignment in SITL.
@@ -599,18 +655,49 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         # FALSE_FIX_M from the flight median is a false fix. The covariance is
         # estimated from the rest; the rate is reported, the flight is kept
         # (re-flying until no outlier would hide them).
-        bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
+        places = None
+        src_all = np.array([r.get("map_source") or "primary" for r in acc])[sel]
+        if report.get("calib_walk") and len(set(src_all)) > 1:
+            # Two maps (primary ground-only, fallback full): the place rule per
+            # source, since their offsets differ (relief displacement).
+            pos = interp(truth, t)[sel]
+            inl = np.zeros(len(e_all), bool); ff = np.zeros(len(e_all), bool); fp = np.zeros(len(e_all), bool)
+            n_pl = n_fpl = 0
+            for src in sorted(set(src_all)):
+                k = src_all == src
+                pr = place_outlier_rule(e_all[k], pos[k])
+                inl[k], ff[k], fp[k] = pr["inlier"], pr["false_fix"], pr["false_place"]
+                n_pl += pr["places"]; n_fpl += pr["false_places"]
+            places = {"inlier": inl, "false_fix": ff, "false_place": fp, "places": n_pl, "false_places": n_fpl}
+            bad = ~inl
+        elif report.get("calib_walk"):
+            # Flights over many places (random walk): the place rule
+            # (map_error_calibration.place_outlier_rule, thresholds fixed
+            # before series H was re-analysed): 20 m places, a place more
+            # than 3 m off is a false place, a fix more than 1 m from its
+            # place median is a false fix.
+            places = place_outlier_rule(e_all, interp(truth, t)[sel])
+            bad = ~places["inlier"]
+        else:
+            bad = np.linalg.norm(e_all - np.median(e_all, axis=0), axis=1) > FALSE_FIX_M
         sub = [tuple(float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")) for r in acc]
-        false = int(np.sum(bad))
+        false = int(np.sum(bad)) if places is None else int(np.sum(places["false_fix"]))
         e = e_all[~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
                "std_error_ne_m": e.std(axis=0).round(4).tolist(),
                "ekf2_tilt_error_deg": report["ekf2_tilt_error_deg"],
+               "outlier_rule": "place" if places is not None else f"|error - flight median| > {FALSE_FIX_M} m",
+               "places": None if places is None else {
+                   "places": places["places"], "false_places": places["false_places"],
+                   "false_place_fixes": int(np.sum(places["false_place"])),
+                   "fixes_in_small_places": int(np.sum(~(places["inlier"] | places["false_fix"]
+                                                          | places["false_place"])))},
                "median_height_m": float(np.median([float(r["height_m"]) for r, s_ in zip(acc, sel) if s_])),
                # Map heading error of the same fixes (NaN: no heading from the search).
                "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]],
+               "map_source": src_all[~bad].tolist(),
                # Sub-patch covariance of the same (inlier) fixes, for the
                # match-quality covariance model (NaN rows: not available).
                "subpatch_cov_ne_m2": [[[sub[k][0], sub[k][1]], [sub[k][1], sub[k][2]]]
