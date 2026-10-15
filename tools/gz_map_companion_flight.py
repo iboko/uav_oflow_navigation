@@ -342,6 +342,8 @@ def main() -> None:
                          "(the long swiss route shows the natural VO drift, and NCC needs the true scale)")
     ap.add_argument("--georef-error", type=float, nargs=2, default=(0.15, -0.10))
     ap.add_argument("--companion-python", default=sys.executable)
+    ap.add_argument("--world-3d", action="store_true",
+                    help="swiss: fly in ofnav_swiss3d (DSM mesh, tools/swiss_scene_3d.py) instead of the flat plane")
     ap.add_argument("--scene", choices=("textured", "swiss"), default="textured",
                     help="swiss: real SWISSIMAGE ground and onboard map (tools/swiss_scene.py)")
     ap.add_argument("--swiss-dir", type=Path, help="output of tools/swiss_scene.py (orthophoto + georef)")
@@ -378,7 +380,7 @@ def main() -> None:
     if args.focal_error is None:
         args.focal_error = 0.0 if args.scene == "swiss" else 0.05
     params["MIS_TAKEOFF_ALT"] = f"{altitude:.1f}"
-    world = "ofnav_swiss" if args.scene == "swiss" else gz.TEXTURED_WORLD
+    world = ("ofnav_swiss3d" if args.world_3d else "ofnav_swiss") if args.scene == "swiss" else gz.TEXTURED_WORLD
     # Route scale: legs long enough to cross several camera footprints.
     stick, leg_s, sample_s = (400, 15, 3) if args.scene == "swiss" else (300, 4, 2)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))

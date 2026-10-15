@@ -127,3 +127,45 @@ def test_ncc_heading_is_nan_at_the_edge_of_the_search():
     fix = loc.localize(frame, prior_ne_m=(0.0, 0.0), radius_m=10.0, height_agl_m=40.0,
                        roll_rad=0.0, pitch_rad=0.0, yaw_rad=y + math.radians(6.0))
     assert not math.isfinite(fix.yaw_rad) or not fix.accepted
+
+
+def _render_surface(world, surface, n, e, h_cam_up, roll, pitch, yaw, steps=400):
+    """Ray-marched camera frame of a textured height field (surface: map grid, up)."""
+    r_nc = body_to_ned(roll, pitch, yaw) @ np.asarray(MOUNT.body_from_camera)
+    k_inv = np.linalg.inv(np.array([[CAL.focal_x_px, 0, CAL.center_x_px], [0, CAL.focal_y_px, CAL.center_y_px],
+                                    [0, 0, 1.0]]))
+    us, vs = np.meshgrid(np.arange(320), np.arange(240))
+    rays = np.stack([us, vs, np.ones_like(us)], -1).astype(float) @ k_inv.T @ r_nc.T
+    rays /= rays[..., 2:3]                           # unit down component
+    hit = np.full(us.shape, np.nan)
+    for s in np.linspace(0.0, h_cam_up + 5.0, steps):
+        gn, ge = n + s * rays[..., 0], e + s * rays[..., 1]
+        col = ((ge - GEO.origin_ne_m[1]) / GSD).astype(np.float32)
+        row = ((GEO.origin_ne_m[0] - gn) / GSD).astype(np.float32)
+        z = cv2.remap(surface, col, row, cv2.INTER_LINEAR)
+        new = np.isnan(hit) & (h_cam_up - s <= z)
+        hit[new] = s
+    gn, ge = n + hit * rays[..., 0], e + hit * rays[..., 1]
+    col = ((ge - GEO.origin_ne_m[1]) / GSD).astype(np.float32)
+    row = ((GEO.origin_ne_m[0] - gn) / GSD).astype(np.float32)
+    return cv2.remap(world, col, row, cv2.INTER_LINEAR)
+
+
+def test_dsm_projection_removes_building_parallax():
+    world = _texture(seed=3)
+    surface = np.zeros(world.shape, np.float32)
+    # A 15 m block 8-18 m east of the camera, 12 m wide: strong parallax at 40 m.
+    r0, c0 = int((100.0 - 6.0) / GSD), int((8.0 + 100.0) / GSD)
+    surface[r0:r0 + 48, c0:c0 + 40] = 15.0
+    # Roof texture distinct from the ground below it (as on a real map).
+    world[r0:r0 + 48, c0:c0 + 40] = np.clip(world[r0:r0 + 48, c0:c0 + 40].astype(int) + 60, 0, 255).astype(np.uint8)
+    n, e, h, y = 0.0, 0.0, 40.0, math.radians(80)
+    frame = _render_surface(world, surface, n, e, h, 0.0, 0.0, y)
+    flat = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(0.0,))
+    dsm = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(0.0,), surface_m=surface)
+    kw = dict(prior_ne_m=(n, e), radius_m=8.0, height_agl_m=h, roll_rad=0.0, pitch_rad=0.0, yaw_rad=y)
+    f_flat, f_dsm = flat.localize(frame, **kw), dsm.localize(frame, **kw)
+    assert f_dsm.accepted
+    err_dsm = math.hypot(f_dsm.north_m - n, f_dsm.east_m - e)
+    err_flat = math.hypot(f_flat.north_m - n, f_flat.east_m - e) if f_flat.accepted else float("inf")
+    assert err_dsm < 0.25 and dsm.last_peak > flat.last_peak, (err_dsm, err_flat, dsm.last_peak, flat.last_peak)
