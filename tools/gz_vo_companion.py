@@ -122,14 +122,19 @@ def flat(c) -> tuple[float, float, float]:
 
 
 def fix_covariance(cal: dict, fix, height_m: float):
-    """Per-fix covariance: the match-quality model if calibrated and the
-    fix carries a sub-patch covariance, otherwise the calibrated one at
-    the frame height."""
+    """Per-fix covariance: the match-quality model if the calibration
+    selects it (use_quality_model) and the fix carries a sub-patch
+    covariance, otherwise the calibrated one at the frame height.
+
+    The quality model is always fitted as a diagnostic; until series M it
+    was used whenever present, so the R of those tests was the quality
+    model, not covariance_ne_m2."""
     per_source = cal.get("per_source_covariance_ne_m2")
     if per_source and getattr(fix, "map_source", None) in per_source:
         return per_source[fix.map_source]
     q = cal.get("quality_model")
-    if q is not None and getattr(fix, "subpatch_cov_ne_m2", None) is not None:
+    if (q is not None and cal.get("use_quality_model") is True
+            and getattr(fix, "subpatch_cov_ne_m2", None) is not None):
         return quality_covariance(q["floor_m2"], q["k2"], fix.subpatch_cov_ne_m2)
     return covariance_at_height(cal, height_m)
 
