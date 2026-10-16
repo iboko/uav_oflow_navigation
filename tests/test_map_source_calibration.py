@@ -48,7 +48,7 @@ def test_combine_place_weighted_with_more_fit_flights(tmp_path):
             "map_source": ["primary"] * len(e)}))
         dirs.append(d)
     args = argparse.Namespace(flights=dirs, out=tmp_path / "cal", fit_flights=4, isotropic=True,
-                              place_weighted=True, quality_model=False)
+                              place_weighted=True, quality_model=False, exclude_test_zone=False)
     mf.combine(args)
     cal = json.loads((tmp_path / "cal" / "map_calibration.json").read_text())
     assert cal["covariance_model"] == "place-weighted isotropic"
@@ -57,3 +57,35 @@ def test_combine_place_weighted_with_more_fit_flights(tmp_path):
     assert cal["covariance_ne_m2"] == cal["place_model"]["covariance_ne_m2"]
     assert len(cal["holdout_check"]["per_flight_mean_nees"]) == 2
     assert "cross_validation_4_fit" in cal["place_model"]
+
+
+def test_combine_leaves_out_fixes_in_the_test_zone(tmp_path):
+    import argparse
+    import gz_map_companion_flight as mf
+    rng = np.random.default_rng(4)
+    dirs = []
+    for i in range(5):
+        d = tmp_path / f"f{i + 1}"
+        d.mkdir()
+        # Half of the places in the test zone (north < 10, east > -10) with a
+        # large offset: they must not enter the calibration.
+        e, p = [], []
+        for k in range(6):
+            in_zone = k % 2 == 0
+            centre = np.array([-30.0, 20.0 + 25 * k]) if in_zone else np.array([50.0, -50.0 - 20 * k])
+            n = 20
+            e.append((np.array([3.0, 0.0]) if in_zone else rng.normal(0, 0.3, 2)) + rng.normal(0, 0.05, (n, 2)))
+            p.append(centre + rng.uniform(-4, 4, (n, 2)))
+        e, p = np.concatenate(e), np.concatenate(p)
+        (d / "map_errors.json").write_text(json.dumps({
+            "name": d.name, "errors_ne_m": e.tolist(), "positions_ne_m": p.tolist(),
+            "total_frames": len(e), "false_fixes": 0, "outlier_rule": "place"}))
+        dirs.append(d)
+    args = argparse.Namespace(flights=dirs, out=tmp_path / "cal", fit_flights=3, isotropic=True,
+                              place_weighted=False, quality_model=False, exclude_test_zone=True)
+    mf.combine(args)
+    cal = json.loads((tmp_path / "cal" / "map_calibration.json").read_text())
+    assert cal["excluded_test_zone_fixes"] == {"fixes_per_flight": [60] * 5, "dropped_flights": []}
+    assert abs(cal["bias_ne_m"][0]) < 0.5           # the 3 m zone offset is not in the bias
+    assert cal["place_model"]["places"] == 9
+    assert mf.in_test_zone(-30.0, 20.0) and not mf.in_test_zone(40.0, -40.0)

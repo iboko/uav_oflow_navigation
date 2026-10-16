@@ -196,10 +196,10 @@ def heading_calibration(dirs, nf: int = 3) -> dict | None:
             "holdout_within_2sd": round(float(np.mean(np.abs(hold - m) <= 2 * sd)), 3)}
 
 
-def source_calibration(dirs, nf: int = 3) -> dict | None:
+def source_calibration(dirs, nf: int = 3, raw=None) -> dict | None:
     """Per map source (primary / fallback): bias and isotropic covariance on
     the nf fit flights (equal weight), NEES and coverage on the held-out ones."""
-    raw = [json.loads((d / "map_errors.json").read_text()) for d in dirs]
+    raw = raw if raw is not None else [json.loads((d / "map_errors.json").read_text()) for d in dirs]
     if not all("map_source" in r for r in raw) or len({s_ for r in raw for s_ in r["map_source"]}) < 2:
         return None
     out = {"bias": {}, "cov": {}, "check": {}}
@@ -220,13 +220,13 @@ def source_calibration(dirs, nf: int = 3) -> dict | None:
     return out
 
 
-def quality_calibration(dirs, bias, nf: int = 3) -> dict | None:
+def quality_calibration(dirs, bias, nf: int = 3, raw=None) -> dict | None:
     """ML fit of R = floor*I + k2*C_subpatch on the nf fit flights, NEES on
     the held-out ones. Fixes without a sub-patch covariance are left out
     (counted)."""
     errs, subs, dropped = [], [], []
-    for d in dirs:
-        f = json.loads((d / "map_errors.json").read_text())
+    raw = raw if raw is not None else [json.loads((d / "map_errors.json").read_text()) for d in dirs]
+    for f in raw:
         if "subpatch_cov_ne_m2" not in f:
             return None
         e = np.asarray(f["errors_ne_m"], float)
@@ -261,6 +261,22 @@ def place_diagnostics(dirs, raw, fit_flights: int = 3) -> dict | None:
     return model
 
 
+# The test routes (forward = east, right = south at the take-off heading)
+# and their start lie here, in local N/E: calibration fixes inside are not
+# used (combine), and the calibration walk ends a leg on entering it.
+TEST_ZONE = "north < 10 m and east > -10 m"
+TEST_ROUTES = {
+    # Legs of the test box as (pitch, roll) stick fractions; all stay in TEST_ZONE.
+    "box": ((1, 0), (0, 1), (1, 0), (0, 1)),
+    "box_rf": ((0, 1), (1, 0), (0, 1), (1, 0)),
+    "diag": ((0.7, 0.7), (1, 0), (0.7, 0.7), (0, 1)),
+}
+
+
+def in_test_zone(north_m, east_m):
+    return (np.asarray(north_m) < 10.0) & (np.asarray(east_m) > -10.0)
+
+
 def flight_positions(d: Path, f: dict) -> np.ndarray:
     """True positions of the inlier fixes of a calibration flight.
 
@@ -291,26 +307,44 @@ def flight_positions(d: Path, f: dict) -> np.ndarray:
 def combine(args) -> None:
     nf = args.fit_flights
     flights, heights = [], []
-    for d in args.flights:
-        f = json.loads((d / "map_errors.json").read_text())
+    raw = [json.loads((d / "map_errors.json").read_text()) for d in args.flights]
+    excluded = None
+    if getattr(args, "exclude_test_zone", False):
+        # Calibration independent of the test area: drop the fixes (and
+        # their per-fix fields) inside TEST_ZONE.
+        excluded = []
+        for d, f in zip(args.flights, raw):
+            pos = flight_positions(d, f)
+            keep = ~in_test_zone(pos[:, 0], pos[:, 1])
+            excluded.append(int((~keep).sum()))
+            for k in ("errors_ne_m", "map_source", "subpatch_cov_ne_m2"):
+                if k in f:
+                    f[k] = [x for x, m in zip(f[k], keep) if m]
+            f["positions_ne_m"] = pos[keep].tolist()
+        # Flights with fewer than 30 fixes left are dropped (the
+        # calibration's own minimum), order kept; fit = the first nf.
+        kept = [i for i, f in enumerate(raw) if len(f["errors_ne_m"]) >= 30]
+        dropped_flights = [raw[i]["name"] for i in range(len(raw)) if i not in kept]
+        args.flights = [args.flights[i] for i in kept]
+        raw = [raw[i] for i in kept]
+        excluded = {"fixes_per_flight": [excluded[i] for i in kept], "dropped_flights": dropped_flights}
+    for f in raw:
         if "median_height_m" in f:
             heights.append(float(f["median_height_m"]))
         flights.append(MapErrorFlight(f["name"], tuple(map(tuple, f["errors_ne_m"])), f["total_frames"],
                                       f["false_fixes"]))
     heights = heights if len(heights) == len(args.flights) else []
-    raw = [json.loads((d / "map_errors.json").read_text()) for d in args.flights]
     rule = raw[0].get("outlier_rule", f"|error - flight median| > {FALSE_FIX_M} m")
     if rule == "place":
         rule = "place rule: 20 m places, place > 3 m off = false place, fix > 1 m from place median = false fix"
     cal = calibrate_map_error(flights[:nf], flights[nf:], min_samples_per_flight=30,
                               outliers_removed_by_rule=rule)
-    per_source = source_calibration(args.flights, nf)
+    per_source = source_calibration(args.flights, nf, raw)
     if per_source:
         # Fixes pre-corrected by their source's bias in the companion: the
         # pooled calibration is redone on per-source-corrected errors.
         corrected = []
-        for d, f in zip(args.flights, flights):
-            r = json.loads((d / "map_errors.json").read_text())
+        for r, f in zip(raw, flights):
             b = np.array([per_source["bias"][s_] for s_ in r["map_source"]])
             corrected.append(MapErrorFlight(f.name, tuple(map(tuple, np.asarray(f.errors_ne_m) - b)),
                                             f.total_frames, f.false_fixes))
@@ -366,7 +400,9 @@ def combine(args) -> None:
            "places": [f.get("places") for f in raw],
            "map_heading": heading_calibration(args.flights, nf),
            "place_model": place_model,
-           "quality_model": quality_calibration(args.flights, cal.bias_ne_m, nf),
+           "quality_model": quality_calibration(args.flights, cal.bias_ne_m, nf, raw),
+           "excluded_test_zone_fixes": excluded,
+           "test_zone": TEST_ZONE if excluded is not None else None,
            # The companion uses quality_model only if this is true.
            "use_quality_model": bool(args.quality_model),
            "per_source_bias_ne_m": per_source["bias"] if per_source else None,
@@ -402,6 +438,10 @@ def main() -> None:
                     help="heading: declination PX4 derives from WMM at the Gazebo world origin")
     ap.add_argument("--flights", type=Path, nargs="*", default=(),
                     help="combine: calibration flight directories, --fit-flights fit then the rest held out")
+    ap.add_argument("--test-route", choices=sorted(TEST_ROUTES), default="box",
+                    help="test: legs of the absolute-error route (all inside TEST_ZONE)")
+    ap.add_argument("--exclude-test-zone", action="store_true",
+                    help=f"combine: leave out calibration fixes in the test zone ({TEST_ZONE})")
     ap.add_argument("--fit-flights", type=int, default=3,
                     help="combine: the first N flights are fitted, the rest held out")
     ap.add_argument("--quality-model", action="store_true",
@@ -594,6 +634,13 @@ def main() -> None:
                                 report.setdefault("calib_walk_bounded_legs", 0)
                                 report["calib_walk_bounded_legs"] += 1
                                 break
+                            # Nor over the test routes (their fixes are not
+                            # used in combine anyway): beyond the start area.
+                            if (in_test_zone(link.state["x"], link.state["y"])
+                                    and math.hypot(link.state["x"], link.state["y"]) > 25.0):
+                                report.setdefault("calib_walk_test_zone_legs", 0)
+                                report["calib_walk_test_zone_legs"] += 1
+                                break
                         link.pitch = link.roll = 0
                     else:
                         move(pitch, roll, leg_s)
@@ -629,7 +676,9 @@ def main() -> None:
                 heading_phase(args, px4, link, report, check)
             # 3: box pattern, absolute error.
             errors, legs = [], []
-            for pitch, roll in ((stick, 0), (0, stick), (stick, 0), (0, stick)):
+            report["test_route"] = args.test_route
+            for fp, fr in TEST_ROUTES[args.test_route]:
+                pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
                 t_leg = link.boot_s
                 while link.boot_s - t_leg < leg_s:
