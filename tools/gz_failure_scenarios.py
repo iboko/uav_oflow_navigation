@@ -162,7 +162,7 @@ class Link:
 
     def __init__(self):
         self.m = mavutil.mavlink_connection("udpin:0.0.0.0:14550", source_system=255)
-        self.state = {"armed": False, "main": 0, "sub": 0, "z": 0., "landed": 0}
+        self.state = {"armed": False, "main": 0, "sub": 0, "z": 0., "landed": 0, "x": 0., "y": 0.}
         self.boot_s = 0.  # PX4 (lockstep = simulation) time from MAVLink
         self.throttle = 500
         self.pitch = 0  # MANUAL_CONTROL x: + forward
@@ -198,6 +198,7 @@ class Link:
                 self.state["sub"] = (msg.custom_mode >> 24) & 0xFF
             elif t == "LOCAL_POSITION_NED":
                 self.state["z"] = -msg.z
+                self.state["x"], self.state["y"] = msg.x, msg.y
             elif t == "EXTENDED_SYS_STATE":
                 self.state["landed"] = msg.landed_state
 

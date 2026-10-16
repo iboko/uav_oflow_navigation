@@ -26,6 +26,13 @@
 принятым привязкам поворачивает перемещения VO, пока она не набрана —
 неопределенность курса входит в ковариацию.
 
+С курсом по карте в EKF2 (EV yaw) курс автопилота сам поворачивается к
+отправленному: поправка «карта минус автопилот», прибавленная к новому
+курсу автопилота, повторяется (обратная связь; тест M: курс ушел на
+48°). Тогда поправка берется относительно курса по гироскопу
+(`GyroHeading`), на который EKF2 не влияет, а `propagate` получает
+разность «гироскоп минус автопилот».
+
 CI не исправляет неверную калибровку и не исключает двойной учет VO:
 EKF2 получает и это положение, и скорость VO. Ковариация положения
 при распространении растет по модели ошибок VO. Проверка скачка
@@ -138,8 +145,13 @@ class MapAnchor:
         return self._p is not None
 
     def propagate(self, t0_us: int, t1_us: int, v_ne: tuple[float, float],
-                  cov_ne: tuple[tuple[float, float], tuple[float, float]]) -> None:
-        """VO-перемещение за [t0, t1]; интервалы идут подряд по времени."""
+                  cov_ne: tuple[tuple[float, float], tuple[float, float]],
+                  reference_minus_autopilot_rad: float = 0.0) -> None:
+        """VO-перемещение за [t0, t1]; интервалы идут подряд по времени.
+
+        reference_minus_autopilot_rad: курс, относительно которого измерена
+        поправка (например, по гироскопу), минус курс автопилота, по
+        которому VO перевела скорость в N/E; 0 — поправка от автопилота."""
         dt = (t1_us - t0_us) * 1e-6
         v = np.asarray(v_ne, dtype=float)
         c = np.asarray(cov_ne, dtype=float)
@@ -152,6 +164,9 @@ class MapAnchor:
             self._count("BAD_VO_COVARIANCE")
             return
         psi = self.heading_offset_rad
+        if self.heading_known and isfinite(reference_minus_autopilot_rad):
+            # Until measured the offset is 0 against the autopilot heading itself.
+            psi += reference_minus_autopilot_rad
         c_psi, s_psi = np.cos(psi), np.sin(psi)
         rot = np.array([[c_psi, -s_psi], [s_psi, c_psi]])
         d = rot @ (v * dt)
@@ -203,7 +218,7 @@ class MapAnchor:
         if np.max(np.linalg.eigvalsh(self._cov)) > self._max_var:
             # Без привязок слишком долго: положение больше не передается.
             # Оценка остается априорной для повторного захвата: ложное место
-            # карты (серия H: 3 из 36 мест сдвинуты на 4-21 м, привязки
+            # карты (серия H: место сдвинуто на 21 м, привязки
             # внутри места согласованы) иначе захватывалось бы заново.
             self._prior_p, self._prior_cov = self._p.copy(), self._cov.copy()
             self._p = None
@@ -379,3 +394,61 @@ class MapAnchor:
         position = self._p - back
         return AnchorMeasurement(int(timestamp_us), tuple(float(x) for x in position),
                                  tuple(tuple(float(x) for x in row) for row in cov))
+
+
+class GyroHeading:
+    """Курс, проинтегрированный по угловым скоростям автопилота.
+
+    Скорости (ATTITUDE_QUATERNION: rollspeed/pitchspeed/yawspeed, FRD)
+    не меняются, когда EKF2 исправляет курс (слияние EV yaw, сброс по
+    магнитометру), поэтому поправка курса по карте относительно этого
+    курса не участвует в обратной связи. Уходит со смещением гироскопа
+    (медленно; поправка по карте — скользящее среднее). Начало —
+    курс автопилота в первом отсчете.
+
+    ψ' = (q sin φ + r cos φ) / cos θ; трапеции между отсчетами;
+    в разрыве больше max_gap_us — скорость последнего отсчета (счетчик gaps).
+    """
+
+    def __init__(self, max_gap_us: int = 200_000, keep_us: int = 5_000_000) -> None:
+        self._t: list[int] = []
+        self._psi: list[float] = []
+        self._last_rate = 0.0
+        self._max_gap = max_gap_us
+        self._keep = keep_us
+        self.gaps = 0
+
+    @staticmethod
+    def _rate(roll: float, pitch: float, rates_frd) -> float:
+        _, q, r = rates_frd
+        return (q * np.sin(roll) + r * np.cos(roll)) / max(np.cos(pitch), 0.1)
+
+    def add(self, t_us: int, roll: float, pitch: float, yaw: float, rates_frd) -> None:
+        if not all(map(isfinite, (roll, pitch, yaw, *rates_frd))):
+            return
+        rate = float(self._rate(roll, pitch, rates_frd))
+        if not self._t:
+            self._t.append(t_us)
+            self._psi.append(float(yaw))
+            self._last_rate = rate
+            return
+        dt_us = t_us - self._t[-1]
+        if dt_us <= 0:
+            return
+        if dt_us > self._max_gap:
+            self.gaps += 1
+            step = self._last_rate * dt_us * 1e-6
+        else:
+            step = 0.5 * (self._last_rate + rate) * dt_us * 1e-6
+        self._t.append(t_us)
+        self._psi.append(self._psi[-1] + step)
+        self._last_rate = rate
+        while self._t[0] < t_us - self._keep:
+            self._t.pop(0)
+            self._psi.pop(0)
+
+    def at(self, t_us: int) -> float:
+        """Курс в момент t_us (часы автопилота), без экстраполяции; NaN вне истории."""
+        if not self._t or t_us < self._t[0] or t_us > self._t[-1]:
+            return float("nan")
+        return float(np.interp(t_us, self._t, self._psi))

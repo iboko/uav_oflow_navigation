@@ -229,7 +229,8 @@ def place_outlier_rule(errors_ne_m, positions_ne_m, *, cell_m: float = 20.0, fal
 
     The map error is a per-place offset plus small noise (series H: 36
     places of 20 m, within-place SD 0.2 m, place offsets mostly < 2 m and
-    3 places 4-21 m off with self-consistent fixes). A flight-wide median
+    a place 21 m off with self-consistent fixes; two more "false places"
+    were at the scene edge). A flight-wide median
     rule mixes those. Here: places = cells of ``cell_m`` along the
     flown positions; a place whose median error is more than
     ``false_place_m`` from the flight's median of place medians is a
@@ -266,3 +267,72 @@ def place_outlier_rule(errors_ne_m, positions_ne_m, *, cell_m: float = 20.0, fal
         inlier[idx[~far]] = True
     return {"inlier": inlier, "false_fix": false_fix, "false_place": false_place,
             "places": len(places), "false_places": n_false_places}
+
+
+def place_groups(positions_ne_m, *, cell_m: float = 20.0, min_fixes_per_place: int = 5) -> list[np.ndarray]:
+    """Indices of the fixes in each place (``cell_m`` cells of the flown
+    position, as in ``place_outlier_rule``); small places left out."""
+    p = np.asarray(positions_ne_m, dtype=float)
+    if p.ndim != 2 or p.shape[1] != 2:
+        raise ValueError("Положения должны иметь форму (n, 2)")
+    cells: dict = {}
+    for i, k in enumerate(map(tuple, np.floor(p / cell_m).astype(int))):
+        cells.setdefault(k, []).append(i)
+    return [np.asarray(v) for v in cells.values() if len(v) >= min_fixes_per_place]
+
+
+def place_weighted_error_model(errors_by_flight: Sequence, positions_by_flight: Sequence, *,
+                               cell_m: float = 20.0, min_fixes_per_place: int = 5) -> dict:
+    """Map error = bias + place offset + noise, each place weighted once.
+
+    Fixes in one place are not independent (series M: within-place SD
+    0.17 m against 0.59 m between places): weighting every fix lets the
+    places with many fixes dominate. Isotropic: the place offsets are too
+    few for a 2x2 estimate. Returns bias, the between-place and the
+    within-place variance and the per-fix covariance (their sum).
+    """
+    offsets, within, n_fix = [], [], 0
+    for e, p in zip(errors_by_flight, positions_by_flight):
+        e = np.asarray(e, dtype=float)
+        for idx in place_groups(p, cell_m=cell_m, min_fixes_per_place=min_fixes_per_place):
+            offsets.append(e[idx].mean(axis=0))
+            within.append(float(np.mean(np.sum((e[idx] - offsets[-1]) ** 2, axis=1))) / 2)
+            n_fix += len(idx)
+    if len(offsets) < 3:
+        raise ValueError("Недостаточно мест для оценки смещений по местам")
+    m = np.stack(offsets)
+    bias = m.mean(axis=0)
+    var_place = float(np.sum((m - bias) ** 2)) / (2 * (len(m) - 1))
+    var_within = float(np.mean(within))
+    return {"bias_ne_m": bias.tolist(), "place_variance_m2": var_place, "within_place_variance_m2": var_within,
+            "covariance_ne_m2": (np.eye(2) * (var_place + var_within)).tolist(),
+            "places": len(m), "fixes": n_fix}
+
+
+def cross_validated_nees(errors_by_flight: Sequence, positions_by_flight: Sequence, *, fit_flights: int = 3,
+                         cell_m: float = 20.0) -> dict:
+    """Holdout fix NEES over every split into fit_flights / the rest.
+
+    Two isotropic estimators: per-fix with equal flight weights (as
+    ``calibrate_map_error`` with the isotropic trace/2) and place-weighted.
+    Each split fits on its fit flights only. A diagnostic of how much the
+    holdout check depends on which flights are held out; not a fit."""
+    from itertools import combinations
+    n = len(errors_by_flight)
+    if not 2 <= fit_flights < n:
+        raise ValueError("Недопустимое число обучающих полетов")
+    errs = [np.asarray(e, dtype=float) for e in errors_by_flight]
+    out = {"per_fix": [], "place_weighted": []}
+    for fit in combinations(range(n), fit_flights):
+        b = np.mean([errs[i].mean(axis=0) for i in fit], axis=0)
+        v = float(np.mean([np.mean(np.sum((errs[i] - b) ** 2, axis=1)) for i in fit])) / 2
+        pm = place_weighted_error_model([errs[i] for i in fit], [positions_by_flight[i] for i in fit],
+                                        cell_m=cell_m)
+        bp = np.asarray(pm["bias_ne_m"])
+        vp = pm["covariance_ne_m2"][0][0]
+        for j in (j for j in range(n) if j not in fit):
+            out["per_fix"].append(float(np.mean(np.sum((errs[j] - b) ** 2, axis=1)) / v))
+            out["place_weighted"].append(float(np.mean(np.sum((errs[j] - bp) ** 2, axis=1)) / vp))
+    return {k: {"median": float(np.median(x)), "mean": float(np.mean(x)),
+                "fraction_above_3": float(np.mean(np.asarray(x) > 3.0)), "holdouts": len(x)}
+            for k, x in out.items()}

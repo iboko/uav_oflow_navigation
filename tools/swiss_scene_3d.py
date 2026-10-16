@@ -6,9 +6,9 @@ it: the camera sees no parallax of buildings and the rangefinder always
 measures the ground. Projecting a frame onto a surface model can only be
 tested where the world has relief. Here the ground is a mesh of
 swissSURFACE3D Raster (DSM, 2018, 0.5 m) sampled every ``step_m``, heights
-relative to the ground at the world origin. Collision: a 20 x 20 m plane at
-the take-off point only (a collision mesh of this size broke the physics);
-buildings are not obstacles, the flights stay above them.
+relative to the ground at the world origin. Collision: the terrain without
+buildings (DTM) every 5 m - a collision mesh of the full DSM broke the
+physics; buildings are not obstacles, the flights stay above them.
 
 Limitation: the texture is the 2025 orthophoto, which is not a true
 orthophoto: roof pixels in it are displaced from the roofs of the mesh by
@@ -59,7 +59,8 @@ def write_obj(path: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray, u: np.nda
         f.write("".join(f"f {i}/{i}/{i} {j}/{j}/{j} {k}/{k}/{k}\n" for i, j, k in tris))
 
 
-def build(px4_dir: Path, dsm_path: Path, dtm_path: Path, scene_json: Path, *, step_m: float = 1.0) -> dict:
+def build(px4_dir: Path, dsm_path: Path, dtm_path: Path, scene_json: Path, *, step_m: float = 1.0,
+          collision_step_m: float = 5.0) -> dict:
     import tifffile
     scene = json.loads(scene_json.read_text())
     size = float(scene["size_m"])
@@ -77,6 +78,15 @@ def build(px4_dir: Path, dsm_path: Path, dtm_path: Path, scene_json: Path, *, st
     u = (ee - tl_e) / size
     v = (nn - (tl_n - size)) / size                         # OBJ v grows upwards (north)
     write_obj(obj, ee - e0, nn - n0, z, u, v, f"{scene['world']}.png")
+    # Collision: the terrain without buildings (DTM), coarse enough for the
+    # physics engine; landings anywhere on the route end on the ground.
+    kc = int(round(size / collision_step_m)) + 1
+    ec = tl_e + np.arange(kc) * collision_step_m
+    nc = (tl_n - size) + np.arange(kc) * collision_step_m
+    eec, nnc = np.meshgrid(ec, nc)
+    zc = sample(dtm, eec, nnc) - ground0
+    obj_c = worlds / f"{WORLD_3D}_collision.obj"
+    write_obj(obj_c, eec - e0, nnc - n0, zc, np.zeros_like(zc), np.zeros_like(zc), f"{scene['world']}.png")
     sdf = (worlds / "default.sdf").read_text(encoding="utf-8-sig")
     sdf = sdf.replace('<world name="default">', f'<world name="{WORLD_3D}">', 1)
     start = sdf.index('<model name="ground_plane">')
@@ -84,7 +94,7 @@ def build(px4_dir: Path, dsm_path: Path, dtm_path: Path, scene_json: Path, *, st
     sdf = sdf[:start] + f"""<model name="ground_plane">
       <static>true</static>
       <link name="link">
-        <collision name="collision"><geometry><plane><normal>0 0 1</normal><size>20 20</size></plane></geometry></collision>
+        <collision name="collision"><geometry><mesh><uri>{obj_c}</uri></mesh></geometry></collision>
         <visual name="visual"><geometry><mesh><uri>{obj}</uri></mesh></geometry></visual>
       </link>
     </model>""" + sdf[end:]

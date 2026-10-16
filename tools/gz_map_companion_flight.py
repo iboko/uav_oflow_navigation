@@ -49,7 +49,9 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.map_error_calibration import fit_quality_model, place_outlier_rule, quality_covariance, MapErrorFlight, calibrate_map_error  # noqa: E402
+from src.map_error_calibration import (MapErrorFlight, calibrate_map_error, cross_validated_nees,  # noqa: E402
+                                       fit_quality_model, place_outlier_rule, place_weighted_error_model,
+                                       quality_covariance)
 
 # EV horizontal position + velocity. 5 m: at 3 m the camera sees the ground
 # at 1.6x the map resolution and ORB matching fails (checked offline).
@@ -175,9 +177,9 @@ def heading_phase(args, px4: gz.Px4, link, report: dict, check) -> None:
         print("INFO heading_without_ev_yaw", info, flush=True)
 
 
-def heading_calibration(dirs) -> dict | None:
-    """Map heading error: mean and SD on the 3 fit flights, coverage of
-    mean +- 2 SD on the 2 held-out flights (diagnostic; MapAnchor uses the
+def heading_calibration(dirs, nf: int = 3) -> dict | None:
+    """Map heading error: mean and SD on the nf fit flights, coverage of
+    mean +- 2 SD on the held-out flights (diagnostic; MapAnchor uses the
     spread of its own fixes, floored at 0.05 rad)."""
     per = []
     for d in dirs:
@@ -186,41 +188,41 @@ def heading_calibration(dirs) -> dict | None:
         per.append(h)
     if len(per) < 5 or any(len(h) < 10 for h in per):
         return None
-    fit = np.concatenate(per[:3])
+    fit = np.concatenate(per[:nf])
     m, sd = float(np.mean(fit)), float(np.std(fit))
-    hold = np.concatenate(per[3:])
+    hold = np.concatenate(per[nf:])
     return {"fit_mean_deg": round(m, 2), "fit_sd_deg": round(sd, 2),
             "per_flight_mean_deg": [round(float(np.mean(h)), 2) for h in per],
             "holdout_within_2sd": round(float(np.mean(np.abs(hold - m) <= 2 * sd)), 3)}
 
 
-def source_calibration(dirs) -> dict | None:
+def source_calibration(dirs, nf: int = 3) -> dict | None:
     """Per map source (primary / fallback): bias and isotropic covariance on
-    the 3 fit flights (equal weight), NEES and coverage on the held-out ones."""
+    the nf fit flights (equal weight), NEES and coverage on the held-out ones."""
     raw = [json.loads((d / "map_errors.json").read_text()) for d in dirs]
     if not all("map_source" in r for r in raw) or len({s_ for r in raw for s_ in r["map_source"]}) < 2:
         return None
     out = {"bias": {}, "cov": {}, "check": {}}
     for src in sorted({s_ for r in raw for s_ in r["map_source"]}):
         per = [np.asarray(r["errors_ne_m"], float)[np.asarray(r["map_source"]) == src] for r in raw]
-        fit = [e for e in per[:3] if len(e) >= 10]
+        fit = [e for e in per[:nf] if len(e) >= 10]
         if not fit:
             continue
         b = np.mean([e.mean(axis=0) for e in fit], axis=0)
         var = float(np.mean([np.mean(np.sum((e - b) ** 2, axis=1)) / 2 for e in fit]))
-        nees = [np.sum((e - b) ** 2, axis=1) / var for e in per[3:] if len(e)]
+        nees = [np.sum((e - b) ** 2, axis=1) / var for e in per[nf:] if len(e)]
         out["bias"][src] = b.round(4).tolist()
         out["cov"][src] = [[var, 0.0], [0.0, var]]
-        out["check"][src] = {"fit_fixes": [len(e) for e in per[:3]], "holdout_fixes": [len(e) for e in per[3:]],
+        out["check"][src] = {"fit_fixes": [len(e) for e in per[:nf]], "holdout_fixes": [len(e) for e in per[nf:]],
                              "sigma_m": round(math.sqrt(var), 3),
                              "holdout_mean_nees": [round(float(np.mean(n)), 2) for n in nees],
                              "holdout_coverage_95": [round(float(np.mean(n <= 5.991)), 3) for n in nees]}
     return out
 
 
-def quality_calibration(dirs, bias) -> dict | None:
-    """ML fit of R = floor*I + k2*C_subpatch on the 3 fit flights, NEES on
-    the 2 held-out ones. Fixes without a sub-patch covariance are left out
+def quality_calibration(dirs, bias, nf: int = 3) -> dict | None:
+    """ML fit of R = floor*I + k2*C_subpatch on the nf fit flights, NEES on
+    the held-out ones. Fixes without a sub-patch covariance are left out
     (counted)."""
     errs, subs, dropped = [], [], []
     for d in dirs:
@@ -231,12 +233,63 @@ def quality_calibration(dirs, bias) -> dict | None:
         c = np.asarray(f["subpatch_cov_ne_m2"], float)
         ok = np.isfinite(c).all(axis=(1, 2))
         errs.append(e[ok]); subs.append(c[ok]); dropped.append(int((~ok).sum()))
-    m = fit_quality_model(errs[:3], subs[:3], errs[3:], subs[3:], bias)
+    m = fit_quality_model(errs[:nf], subs[:nf], errs[nf:], subs[nf:], bias)
     m["fixes_without_subpatch"] = dropped
     return m
 
 
+def place_diagnostics(dirs, raw, fit_flights: int = 3) -> dict | None:
+    """Place-weighted model on the fit flights and the cross-validated
+    holdout NEES of both estimators (diagnostic: covariance_ne_m2 stays the
+    per-fix estimate). Only for calibrations over many places (walk)."""
+    if not all(r.get("outlier_rule") == "place" for r in raw):
+        return None
+    errs = [np.asarray(r["errors_ne_m"]) for r in raw]
+    pos = [flight_positions(d, r) for d, r in zip(dirs, raw)]
+    model = place_weighted_error_model(errs[:fit_flights], pos[:fit_flights])
+    b = np.asarray(model["bias_ne_m"])
+    v = model["covariance_ne_m2"][0][0]
+    nees = [np.sum((e - b) ** 2, axis=1) / v for e in errs[fit_flights:]]
+    model["holdout_mean_nees"] = [round(float(np.mean(n)), 2) for n in nees]
+    model["holdout_check"] = {"coverage": float(np.mean([np.mean(n <= 5.991464547107979) for n in nees])),
+                              "mean_nees": float(np.mean([np.mean(n) for n in nees])),
+                              "per_flight_mean_nees": model["holdout_mean_nees"]}
+    model["cross_validation_3_fit"] = cross_validated_nees(errs, pos, fit_flights=3)
+    if len(errs) > 5:
+        # More places in the fit: does the holdout consistency improve?
+        model[f"cross_validation_{len(errs) - 2}_fit"] = cross_validated_nees(errs, pos, fit_flights=len(errs) - 2)
+    return model
+
+
+def flight_positions(d: Path, f: dict) -> np.ndarray:
+    """True positions of the inlier fixes of a calibration flight.
+
+    Stored in map_errors.json since series M; for older flights recomputed
+    from the flight's ulog and map log with the same place rule, and
+    checked against the stored errors."""
+    if "positions_ne_m" in f:
+        return np.asarray(f["positions_ne_m"], dtype=float)
+    from pyulog import ULog
+    rep = json.loads((d / "gz_map_companion_calibrate.json").read_text())
+    truth = ULog(rep["ulog"], ["vehicle_local_position_groundtruth"]).data_list[0].data
+    rows = read_map_log(d / "companion_map.csv")
+    offset = int(rep["companion_final_status"].get("time_offset_us") or 0)
+    acc = [r for r in rows if r["localizer_status"].endswith("ACCEPTED_UNVALIDATED")]
+    t = np.array([int(r["t_us"]) + offset for r in acc])
+    fx = np.array([[float(r["north_m"]) - float(r["injected_shift_n"]),
+                    float(r["east_m"]) - float(r["injected_shift_e"])] for r in acc])
+    t0, t1 = rep["segments"]["flight"]
+    sel = (t >= t0) & (t <= t1)
+    pos = interp(truth, t)[sel]
+    e = fx[sel] - pos
+    inl = place_outlier_rule(e, pos)["inlier"]
+    if not np.allclose(e[inl], np.asarray(f["errors_ne_m"]), atol=1e-3):
+        raise RuntimeError(f"{d}: recomputed fixes differ from map_errors.json")
+    return pos[inl]
+
+
 def combine(args) -> None:
+    nf = args.fit_flights
     flights, heights = [], []
     for d in args.flights:
         f = json.loads((d / "map_errors.json").read_text())
@@ -249,9 +302,9 @@ def combine(args) -> None:
     rule = raw[0].get("outlier_rule", f"|error - flight median| > {FALSE_FIX_M} m")
     if rule == "place":
         rule = "place rule: 20 m places, place > 3 m off = false place, fix > 1 m from place median = false fix"
-    cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30,
+    cal = calibrate_map_error(flights[:nf], flights[nf:], min_samples_per_flight=30,
                               outliers_removed_by_rule=rule)
-    per_source = source_calibration(args.flights)
+    per_source = source_calibration(args.flights, nf)
     if per_source:
         # Fixes pre-corrected by their source's bias in the companion: the
         # pooled calibration is redone on per-source-corrected errors.
@@ -262,7 +315,7 @@ def combine(args) -> None:
             corrected.append(MapErrorFlight(f.name, tuple(map(tuple, np.asarray(f.errors_ne_m) - b)),
                                             f.total_frames, f.false_fixes))
         flights = corrected
-        cal = calibrate_map_error(flights[:3], flights[3:], min_samples_per_flight=30, outliers_removed_by_rule=rule)
+        cal = calibrate_map_error(flights[:nf], flights[nf:], min_samples_per_flight=30, outliers_removed_by_rule=rule)
     cov = np.asarray(cal.covariance_ne_m2)
     within = np.asarray(cal.within_flight_covariance_ne_m2)
     between = np.asarray(cal.between_flight_covariance_ne_m2)
@@ -272,33 +325,50 @@ def combine(args) -> None:
         within = np.eye(2) * np.trace(within) / 2
         between = np.eye(2) * np.trace(between) / 2
         nees = []
-        for f in flights[3:]:
+        for f in flights[nf:]:
             e = np.asarray(f.errors_ne_m) - np.asarray(cal.bias_ne_m)
             nees.append(np.einsum("ij,ij->i", e, e) / cov[0, 0])
         holdout = {"coverage": float(np.mean([np.mean(n <= 5.991464547107979) for n in nees])),
                    "mean_nees": float(np.mean([np.mean(n) for n in nees])),
                    "per_flight_mean_nees": [round(float(np.mean(n)), 2) for n in nees]}
-    out = {"bias_ne_m": list(cal.bias_ne_m), "covariance_ne_m2": cov.tolist(),
-           "covariance_model": "isotropic trace/2" if args.isotropic else "empirical 2x2",
+    place_model = place_diagnostics(args.flights, raw, nf)
+    bias = list(cal.bias_ne_m)
+    model = "isotropic trace/2" if args.isotropic else "empirical 2x2"
+    if args.place_weighted:
+        # Bias + place offset + noise, one weight per place (see
+        # place_weighted_error_model). No within/between-flight split: the
+        # companion uses the total at every height.
+        if place_model is None:
+            raise SystemExit("--place-weighted needs flights with the place rule")
+        bias, cov = place_model["bias_ne_m"], np.asarray(place_model["covariance_ne_m2"])
+        within = between = None
+        holdout = place_model["holdout_check"]
+        model = "place-weighted isotropic"
+    out = {"bias_ne_m": bias, "covariance_ne_m2": cov.tolist(),
+           "covariance_model": model,
            "holdout_check": holdout,
            "sigma_ne_m": [math.sqrt(cov[i, i]) for i in (0, 1)],
            # cov = within + between; the companion scales the between-flight
            # (tilt) part with (h / calibration_height_m)^2 per fix.
-           "within_flight_covariance_ne_m2": within.tolist(),
-           "between_flight_covariance_ne_m2": between.tolist(),
-           "calibration_height_m": float(np.mean(heights[:3])) if heights else None,
+           "within_flight_covariance_ne_m2": None if within is None else within.tolist(),
+           "between_flight_covariance_ne_m2": None if between is None else between.tolist(),
+           "calibration_height_m": float(np.mean(heights[:nf])) if heights else None,
            "between_flight_tilt_sigma_deg": (math.degrees(math.sqrt(np.trace(between) / 2)
-                                                          / float(np.mean(heights[:3]))) if heights else None),
+                                                          / float(np.mean(heights[:nf])))
+                                             if heights and between is not None else None),
            "fit_flights": list(cal.fit_flights), "holdout_flights": list(cal.holdout_flights),
            "holdout_nees_coverage_95pct": cal.holdout_nees_coverage_95pct,
            "holdout_mean_nees_2d": cal.holdout_mean_nees_2d,
            "holdout_false_fix_rate": cal.holdout_false_fix_rate_among_accepted,
            "fit_false_fix_rate": float(np.mean([f.false_fixes / max(1, f.false_fixes + len(f.errors_ne_m))
-                                                 for f in flights[:3]])),
+                                                 for f in flights[:nf]])),
            "outlier_rule": rule,
            "places": [f.get("places") for f in raw],
-           "map_heading": heading_calibration(args.flights),
-           "quality_model": quality_calibration(args.flights, cal.bias_ne_m),
+           "map_heading": heading_calibration(args.flights, nf),
+           "place_model": place_model,
+           "quality_model": quality_calibration(args.flights, cal.bias_ne_m, nf),
+           # The companion uses quality_model only if this is true.
+           "use_quality_model": bool(args.quality_model),
            "per_source_bias_ne_m": per_source["bias"] if per_source else None,
            "per_source_covariance_ne_m2": per_source["cov"] if per_source else None,
            "per_source_check": per_source["check"] if per_source else None,
@@ -331,7 +401,15 @@ def main() -> None:
     ap.add_argument("--wmm-declination-deg", type=float, default=3.41,
                     help="heading: declination PX4 derives from WMM at the Gazebo world origin")
     ap.add_argument("--flights", type=Path, nargs="*", default=(),
-                    help="combine: calibration flight directories, 3 fit then 2 held out")
+                    help="combine: calibration flight directories, --fit-flights fit then the rest held out")
+    ap.add_argument("--fit-flights", type=int, default=3,
+                    help="combine: the first N flights are fitted, the rest held out")
+    ap.add_argument("--quality-model", action="store_true",
+                    help="combine: the companion uses the match-quality covariance model "
+                         "(otherwise it is a diagnostic only)")
+    ap.add_argument("--place-weighted", action="store_true",
+                    help="combine: bias and covariance from the place-weighted model (one weight per "
+                         "20 m place; fixes in a place are not independent)")
     ap.add_argument("--isotropic", action="store_true",
                     help="combine: sigma^2 = trace(C)/2 in both axes (shape of C not identifiable "
                          "from fewer than 5 fit flights); held-out NEES recomputed with it")
@@ -357,6 +435,8 @@ def main() -> None:
     ap.add_argument("--calib-walk-seed", type=int,
                     help="calibrate: random walk over the map with this seed (legs avoid the test-route quadrant)")
     ap.add_argument("--calib-walk-legs", type=int, default=5)
+    ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
+                    help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
     ap.add_argument("--calib-direction-deg", type=float, default=0.0,
                     help="calibrate: direction of the two legs (0: forward then right). Each calibration "
@@ -502,7 +582,21 @@ def main() -> None:
             report["calib_direction_deg"] = args.calib_direction_deg
             for pitch, roll in legs:
                 if pitch or roll:
-                    move(pitch, roll, leg_s)
+                    if args.calib_walk_seed is not None:
+                        # Stay over the scene: a leg ends early beyond
+                        # calib_walk_bound_m from the centre (GNSS-aided
+                        # position; series M flight 5 left the 400 m scene).
+                        link.pitch, link.roll = pitch, roll
+                        t_leg = link.boot_s
+                        while link.boot_s - t_leg < leg_s:
+                            gz.sim_sleep(1)
+                            if math.hypot(link.state["x"], link.state["y"]) > args.calib_walk_bound_m:
+                                report.setdefault("calib_walk_bounded_legs", 0)
+                                report["calib_walk_bounded_legs"] += 1
+                                break
+                        link.pitch = link.roll = 0
+                    else:
+                        move(pitch, roll, leg_s)
                     gz.sim_sleep(4)
                 for p, r in ((120, 0), (0, 120), (-120, 0), (0, -120)):
                     move(p, r, 2)
@@ -683,6 +777,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         sub = [tuple(float(r.get(k, "nan") or "nan") for k in ("sub_nn", "sub_ne", "sub_ee")) for r in acc]
         false = int(np.sum(bad)) if places is None else int(np.sum(places["false_fix"]))
         e = e_all[~bad]
+        pos_inl = interp(truth, t)[sel][~bad]
         total = sum(1 for r in rows if t0 <= int(r["t_us"]) + offset <= t1)
         out = {"name": args.out.name, "errors_ne_m": e.round(4).tolist(), "total_frames": total,
                "false_fixes": false, "mean_error_ne_m": e.mean(axis=0).round(3).tolist(),
@@ -698,6 +793,8 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                # Map heading error of the same fixes (NaN: no heading from the search).
                "heading_errors_deg": [round(float(x), 3) for x in hdg[sel]],
                "map_source": src_all[~bad].tolist(),
+               # True positions of the same fixes: places for the place-weighted model.
+               "positions_ne_m": pos_inl.round(2).tolist(),
                # Sub-patch covariance of the same (inlier) fixes, for the
                # match-quality covariance model (NaN rows: not available).
                "subpatch_cov_ne_m2": [[[sub[k][0], sub[k][1]], [sub[k][1], sub[k][2]]]
@@ -775,6 +872,9 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                 nq = np.asarray(nq)
                 diag.update({"quality_mean_nees": round(float(np.mean(nq)), 2),
                              "quality_coverage_95": round(float(np.mean(nq <= 5.991)), 3), "quality_fixes": len(nq)})
+        # Which R the companion fused with (fix_covariance in gz_vo_companion).
+        diag["covariance_used_by_companion"] = "quality_model" if q and cal.get("use_quality_model") is True \
+            else "covariance_ne_m2"
         report["map_fix_consistency"] = diag
         print("MAP_FIX_CONSISTENCY", diag, flush=True)
 
