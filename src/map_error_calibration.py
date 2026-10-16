@@ -334,5 +334,7 @@ def cross_validated_nees(errors_by_flight: Sequence, positions_by_flight: Sequen
             out["per_fix"].append(float(np.mean(np.sum((errs[j] - b) ** 2, axis=1)) / v))
             out["place_weighted"].append(float(np.mean(np.sum((errs[j] - bp) ** 2, axis=1)) / vp))
     return {k: {"median": float(np.median(x)), "mean": float(np.mean(x)),
-                "fraction_above_3": float(np.mean(np.asarray(x) > 3.0)), "holdouts": len(x)}
+                "quantile_90": float(np.quantile(x, 0.9)), "quantile_95": float(np.quantile(x, 0.95)),
+                "fraction_above_3": float(np.mean(np.asarray(x) > 3.0)), "holdouts": len(x),
+                "per_holdout": [round(float(v), 3) for v in x]}
             for k, x in out.items()}

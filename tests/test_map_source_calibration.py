@@ -48,7 +48,7 @@ def test_combine_place_weighted_with_more_fit_flights(tmp_path):
             "map_source": ["primary"] * len(e)}))
         dirs.append(d)
     args = argparse.Namespace(flights=dirs, out=tmp_path / "cal", fit_flights=4, isotropic=True,
-                              place_weighted=True, quality_model=False, exclude_test_zone=False)
+                              place_weighted=True, quality_model=False, exclude_test_zone=False, flight_quantile=None)
     mf.combine(args)
     cal = json.loads((tmp_path / "cal" / "map_calibration.json").read_text())
     assert cal["covariance_model"] == "place-weighted isotropic"
@@ -82,10 +82,41 @@ def test_combine_leaves_out_fixes_in_the_test_zone(tmp_path):
             "total_frames": len(e), "false_fixes": 0, "outlier_rule": "place"}))
         dirs.append(d)
     args = argparse.Namespace(flights=dirs, out=tmp_path / "cal", fit_flights=3, isotropic=True,
-                              place_weighted=False, quality_model=False, exclude_test_zone=True)
+                              place_weighted=False, quality_model=False, exclude_test_zone=True, flight_quantile=None)
     mf.combine(args)
     cal = json.loads((tmp_path / "cal" / "map_calibration.json").read_text())
     assert cal["excluded_test_zone_fixes"] == {"fixes_per_flight": [60] * 5, "dropped_flights": []}
     assert abs(cal["bias_ne_m"][0]) < 0.5           # the 3 m zone offset is not in the bias
     assert cal["place_model"]["places"] == 9
     assert mf.in_test_zone(-30.0, 20.0) and not mf.in_test_zone(40.0, -40.0)
+
+
+def test_flight_level_scale_uses_fit_flights_only(tmp_path):
+    import argparse
+    import gz_map_companion_flight as mf
+    rng = np.random.default_rng(5)
+    dirs = []
+    for i in range(7):
+        d = tmp_path / f"f{i + 1}"
+        d.mkdir()
+        # Regional offsets: a whole flight shifted, as in the swiss series.
+        region = rng.normal(0.0, 0.6, 2)
+        e, p = [], []
+        for k in range(5):
+            n = 30
+            e.append(region + rng.normal(0.0, 0.3, 2) + rng.normal(0.0, 0.1, (n, 2)))
+            p.append(np.array([50.0 + 20 * k, -50.0 - 20 * i]) + rng.uniform(-4, 4, (n, 2)))
+        e, p = np.concatenate(e), np.concatenate(p)
+        (d / "map_errors.json").write_text(json.dumps({
+            "name": d.name, "errors_ne_m": e.tolist(), "positions_ne_m": p.tolist(),
+            "total_frames": len(e), "false_fixes": 0, "outlier_rule": "place"}))
+        dirs.append(d)
+    common = dict(flights=dirs, fit_flights=5, isotropic=True, place_weighted=False, quality_model=False,
+                  exclude_test_zone=False)
+    mf.combine(argparse.Namespace(out=tmp_path / "a", flight_quantile=None, **common))
+    mf.combine(argparse.Namespace(out=tmp_path / "b", flight_quantile=0.95, **common))
+    a = json.loads((tmp_path / "a" / "map_calibration.json").read_text())
+    b = json.loads((tmp_path / "b" / "map_calibration.json").read_text())
+    scale = b["covariance_ne_m2"][0][0] / a["covariance_ne_m2"][0][0]
+    assert scale >= 1.0 and "flight-level scale" in b["covariance_model"]
+    assert b["holdout_check"]["before_scale"]["per_flight_mean_nees"] == a["holdout_check"]["per_flight_mean_nees"]

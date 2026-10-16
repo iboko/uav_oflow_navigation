@@ -378,6 +378,27 @@ def combine(args) -> None:
         within = between = None
         holdout = place_model["holdout_check"]
         model = "place-weighted isotropic"
+    flight_scale = None
+    if args.flight_quantile is not None:
+        # Flight-level conservative R: the map error is regional, so a whole
+        # held-out flight can sit at NEES 5 with the per-fix covariance. Scale
+        # R so that the given quantile of held-out flights' mean NEES (cross
+        # validation on the calibration flights only, n-2 fit) is at 2.
+        # Fit flights only (n_fit - 2 per split): the held-out flights stay out.
+        if place_model is None or nf < 5:
+            raise SystemExit("--flight-quantile needs the place rule and at least 5 fit flights")
+        cv = cross_validated_nees([np.asarray(r["errors_ne_m"]) for r in raw[:nf]],
+                                  [flight_positions(d, r) for d, r in zip(args.flights[:nf], raw[:nf])],
+                                  fit_flights=nf - 2)
+        est = "place_weighted" if args.place_weighted else "per_fix"
+        q = float(np.quantile(cv[est]["per_holdout"], args.flight_quantile))
+        flight_scale = max(1.0, q / 2.0)
+        cov = cov * flight_scale
+        within = None if within is None else within * flight_scale
+        between = None if between is None else between * flight_scale
+        holdout = {"before_scale": holdout,
+                   "per_flight_mean_nees": [round(x / flight_scale, 2) for x in holdout["per_flight_mean_nees"]]}
+        model += f", flight-level scale {flight_scale:.2f} (q{args.flight_quantile:g} of CV flight NEES / 2)"
     out = {"bias_ne_m": bias, "covariance_ne_m2": cov.tolist(),
            "covariance_model": model,
            "holdout_check": holdout,
@@ -442,6 +463,9 @@ def main() -> None:
                     help="test: legs of the absolute-error route (all inside TEST_ZONE)")
     ap.add_argument("--exclude-test-zone", action="store_true",
                     help=f"combine: leave out calibration fixes in the test zone ({TEST_ZONE})")
+    ap.add_argument("--flight-quantile", type=float,
+                    help="combine: scale R so that this quantile of the cross-validated held-out "
+                         "flights' mean NEES is 2 (flight-level conservative covariance)")
     ap.add_argument("--fit-flights", type=int, default=3,
                     help="combine: the first N flights are fitted, the rest held out")
     ap.add_argument("--quality-model", action="store_true",
