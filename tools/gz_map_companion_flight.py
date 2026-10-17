@@ -528,6 +528,10 @@ def main() -> None:
     ap.add_argument("--calib-walk-seed", type=int,
                     help="calibrate: random walk over the map with this seed (legs avoid the test-route quadrant)")
     ap.add_argument("--calib-walk-legs", type=int, default=5)
+    ap.add_argument("--calib-walk-sector-deg", type=float, nargs=2, default=(90.0, 360.0),
+                    help="calibrate walk: leg directions (0 forward = east, 90 right = south). "
+                         "180 360 keeps every leg west/north, out of TEST_ZONE (90 360: series M/N, "
+                         "legs near 90 deg ran along the zone's south strip)")
     ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
                     help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
@@ -658,9 +662,10 @@ def main() -> None:
                 # legs carry the vehicle away from the start instead of
                 # cancelling (independent directions: 11-30 m span, series G).
                 rng = np.random.default_rng(args.calib_walk_seed)
-                angles = [rng.uniform(90.0, 360.0)]
+                lo, hi = args.calib_walk_sector_deg
+                angles = [rng.uniform(lo, hi)]
                 for _ in range(args.calib_walk_legs - 1):
-                    angles.append(float(np.clip(angles[-1] + rng.uniform(-45.0, 45.0), 90.0, 360.0)))
+                    angles.append(float(np.clip(angles[-1] + rng.uniform(-45.0, 45.0), lo, hi)))
                 angles = np.asarray(angles)
                 legs = [(0, 0)] + [(round(stick * math.cos(math.radians(x))), round(stick * math.sin(math.radians(x))))
                                    for x in angles]
