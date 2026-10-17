@@ -978,7 +978,9 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
             from src.map_error_field import MapErrorField
             fld = MapErrorField.from_json(cal["error_field"])
             pos_t = interp(truth, t)
-            nf_ = np.sum((err - fld.predict(pos_t)[0]) ** 2, axis=1) / fld.fix_variance(pos_t)
+            # The map log holds the fixes after the companion removed the field
+            # offset: err is already the residual against the field.
+            nf_ = np.sum(err ** 2, axis=1) / fld.fix_variance(pos_t)
             diag.update({"field_mean_nees": round(float(np.mean(nf_)), 2),
                          "field_coverage_95": round(float(np.mean(nf_ <= 5.991)), 3),
                          "field_sigma_median_m": round(float(np.sqrt(np.median(fld.fix_variance(pos_t)))), 3)})
