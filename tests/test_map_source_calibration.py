@@ -120,3 +120,32 @@ def test_flight_level_scale_uses_fit_flights_only(tmp_path):
     scale = b["covariance_ne_m2"][0][0] / a["covariance_ne_m2"][0][0]
     assert scale >= 1.0 and "flight-level scale" in b["covariance_model"]
     assert b["holdout_check"]["before_scale"]["per_flight_mean_nees"] == a["holdout_check"]["per_flight_mean_nees"]
+
+
+def test_combine_error_field(tmp_path):
+    import argparse
+    import gz_map_companion_flight as mf
+    rng = np.random.default_rng(6)
+    dirs = []
+    for i in range(6):
+        d = tmp_path / f"f{i + 1}"
+        d.mkdir()
+        e, p = [], []
+        for k in range(6):
+            c = np.array([30.0 + 20 * k, -30.0 - 20 * (i % 3)])
+            pts = c + rng.uniform(-5, 5, (20, 2))
+            e.append(np.stack([0.5 * np.sin(pts[:, 0] / 40.0), 0.4 * np.cos(pts[:, 1] / 40.0)], -1)
+                     + rng.normal(0.0, 0.1, (20, 2)))
+            p.append(pts)
+        e, p = np.concatenate(e), np.concatenate(p)
+        (d / "map_errors.json").write_text(json.dumps({
+            "name": d.name, "errors_ne_m": e.tolist(), "positions_ne_m": p.tolist(),
+            "total_frames": len(e), "false_fixes": 0, "outlier_rule": "place"}))
+        dirs.append(d)
+    args = argparse.Namespace(flights=dirs, out=tmp_path / "cal", fit_flights=4, isotropic=True, place_weighted=False,
+                              quality_model=False, exclude_test_zone=False, flight_quantile=None, error_field=True)
+    mf.combine(args)
+    cal = json.loads((tmp_path / "cal" / "map_calibration.json").read_text())
+    assert cal["use_error_field"] and cal["bias_ne_m"] == [0.0, 0.0]
+    assert cal["covariance_ne_m2"][0][0] == cal["error_field"]["test_route_area_max_variance_m2"]
+    assert len(cal["error_field"]["holdout_mean_nees"]) == 2 and cal["error_field"]["cross_validation"]["holdouts"] == 30
