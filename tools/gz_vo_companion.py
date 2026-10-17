@@ -43,6 +43,7 @@ from src.companion_map import GyroHeading, MapAnchor  # noqa: E402
 from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
 from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
+from src.map_error_field import MapErrorField  # noqa: E402
 from src.companion_vo import BodyVelocityMeasurement, CompanionVo  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
@@ -242,6 +243,7 @@ def main() -> None:
     # With map heading sent to EKF2: offsets relative to a gyro-integrated
     # heading, which the EV yaw fusion does not rotate (no feedback loop).
     gyro = GyroHeading() if args.map_yaw else None
+    error_field: MapErrorField | None = None
     last_map_t, last_control, frame_no = 0, 0.0, 0
     map_counts: dict[str, int] = {}
     map_log = args.map_log.open("w") if args.map_log else None
@@ -355,7 +357,12 @@ def main() -> None:
                                                     camera_offset_body_m=tuple(args.camera_offset_frd))
             if args.map_mode == "fuse":
                 c = map_cal = json.loads(args.map_calibration.read_text())
-                anchor = MapAnchor(bias_ne_m=(0.0, 0.0) if c.get("per_source_bias_ne_m") else tuple(c["bias_ne_m"]),
+                if c.get("use_error_field") and c.get("error_field"):
+                    # Offset and variance from the kriged field at each fix;
+                    # the anchor then has a zero bias.
+                    error_field = MapErrorField.from_json(c["error_field"])
+                anchor = MapAnchor(bias_ne_m=(0.0, 0.0) if (c.get("per_source_bias_ne_m") or error_field is not None)
+                                   else tuple(c["bias_ne_m"]),
                                    covariance_ne_m2=tuple(tuple(r) for r in c["covariance_ne_m2"]),
                                    max_map_step_error_m=args.max_map_step_error_m)
             pending.append((t0, first))
@@ -439,6 +446,12 @@ def main() -> None:
                     if map_cal and map_cal.get("per_source_bias_ne_m") and source in map_cal["per_source_bias_ne_m"]:
                         bs = map_cal["per_source_bias_ne_m"][source]
                         n, e = n - bs[0], e - bs[1]
+                    field_cov = None
+                    if error_field is not None and fix.accepted and math.isfinite(n) and math.isfinite(e):
+                        m_f, _ = error_field.predict([[n, e]])
+                        var_f = float(error_field.fix_variance([[n, e]])[0])
+                        n, e = n - float(m_f[0][0]), e - float(m_f[0][1])
+                        field_cov = ((var_f, 0.0), (0.0, var_f))
                     result, nis = "", float("nan")
                     if anchor is not None:
                         # Position is known at the end of the last VO interval only.
@@ -446,7 +459,7 @@ def main() -> None:
                             ref_yaw = state[2] if gyro is None else gyro.at(t_frame + pipeline.clock.offset_us)
                             psi = math.atan2(math.sin(fix.yaw_rad - ref_yaw), math.cos(fix.yaw_rad - ref_yaw))
                             result = anchor.fix(t_frame, fix.accepted, n, e, psi,
-                                                covariance_ne_m2=fix_covariance(
+                                                covariance_ne_m2=field_cov if field_cov is not None else fix_covariance(
                                                     map_cal, replace(fix, map_source=source), state[3])
                                                 if fix.accepted else None)
                             nis = anchor.last_nis if result in ("FIX_FUSED", "FIX_REJECTED_NIS", "FIX_REJECTED_STEP") else nis

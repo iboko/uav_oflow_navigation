@@ -49,6 +49,7 @@ import gz_vo_companion_flight as vo_flight
 from gz_no_gnss_flight import topic, xy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.map_error_field import cross_validated_field_nees, field_nees, fit_field  # noqa: E402
 from src.map_error_calibration import (MapErrorFlight, calibrate_map_error, cross_validated_nees,  # noqa: E402
                                        fit_quality_model, place_outlier_rule, place_weighted_error_model,
                                        quality_covariance)
@@ -265,6 +266,9 @@ def place_diagnostics(dirs, raw, fit_flights: int = 3) -> dict | None:
 # and their start lie here, in local N/E: calibration fixes inside are not
 # used (combine), and the calibration walk ends a leg on entering it.
 TEST_ZONE = "north < 10 m and east > -10 m"
+# N and E ranges (m) covering all test routes: where the field variance is
+# taken for the route limit.
+TEST_ROUTE_AREA = ((-60.0, 15.0), (-10.0, 65.0))
 TEST_ROUTES = {
     # Legs of the test box as (pitch, roll) stick fractions; all stay in TEST_ZONE.
     "box": ((1, 0), (0, 1), (1, 0), (0, 1)),
@@ -399,6 +403,27 @@ def combine(args) -> None:
         holdout = {"before_scale": holdout,
                    "per_flight_mean_nees": [round(x / flight_scale, 2) for x in holdout["per_flight_mean_nees"]]}
         model += f", flight-level scale {flight_scale:.2f} (q{args.flight_quantile:g} of CV flight NEES / 2)"
+    field_out = None
+    if getattr(args, "error_field", False):
+        # Kriged offset field (src/map_error_field.py): bias and variance per
+        # fix position in the companion. covariance_ne_m2 becomes the largest
+        # field variance over the test-route area (TEST_ROUTE_AREA), fixed
+        # before any test flight, so the route limit stays 3 sigma.
+        errs = [np.asarray(r["errors_ne_m"]) for r in raw]
+        pos = [flight_positions(d, r) for d, r in zip(args.flights, raw)]
+        field = fit_field(errs[:nf], pos[:nf])
+        nees = [float(np.mean(field_nees(field, e, p))) for e, p in zip(errs[nf:], pos[nf:])]
+        gn, ge = np.meshgrid(np.arange(*TEST_ROUTE_AREA[0], 5.0), np.arange(*TEST_ROUTE_AREA[1], 5.0))
+        area_var = float(field.fix_variance(np.column_stack([gn.ravel(), ge.ravel()])).max())
+        field_out = {**field.to_json(),
+                     "holdout_mean_nees": [round(x, 2) for x in nees],
+                     "cross_validation": cross_validated_field_nees(errs, pos, fit_flights=len(errs) - 2)
+                     if len(errs) > 4 else None,
+                     "test_route_area_max_variance_m2": area_var}
+        bias, cov = [0.0, 0.0], np.eye(2) * area_var
+        within = between = None
+        holdout = {"per_flight_mean_nees": field_out["holdout_mean_nees"]}
+        model = "kriged error field (bias and variance per fix position)"
     out = {"bias_ne_m": bias, "covariance_ne_m2": cov.tolist(),
            "covariance_model": model,
            "holdout_check": holdout,
@@ -426,6 +451,8 @@ def combine(args) -> None:
            "test_zone": TEST_ZONE if excluded is not None else None,
            # The companion uses quality_model only if this is true.
            "use_quality_model": bool(args.quality_model),
+           "error_field": field_out,
+           "use_error_field": field_out is not None,
            "per_source_bias_ne_m": per_source["bias"] if per_source else None,
            "per_source_covariance_ne_m2": per_source["cov"] if per_source else None,
            "per_source_check": per_source["check"] if per_source else None,
@@ -463,6 +490,8 @@ def main() -> None:
                     help="test: legs of the absolute-error route (all inside TEST_ZONE)")
     ap.add_argument("--exclude-test-zone", action="store_true",
                     help=f"combine: leave out calibration fixes in the test zone ({TEST_ZONE})")
+    ap.add_argument("--error-field", action="store_true",
+                    help="combine: kriged map-offset field (bias and variance at each fix position)")
     ap.add_argument("--flight-quantile", type=float,
                     help="combine: scale R so that this quantile of the cross-validated held-out "
                          "flights' mean NEES is 2 (flight-level conservative covariance)")
@@ -945,9 +974,18 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
                 nq = np.asarray(nq)
                 diag.update({"quality_mean_nees": round(float(np.mean(nq)), 2),
                              "quality_coverage_95": round(float(np.mean(nq <= 5.991)), 3), "quality_fixes": len(nq)})
+        if cal.get("use_error_field") and cal.get("error_field"):
+            from src.map_error_field import MapErrorField
+            fld = MapErrorField.from_json(cal["error_field"])
+            pos_t = interp(truth, t)
+            nf_ = np.sum((err - fld.predict(pos_t)[0]) ** 2, axis=1) / fld.fix_variance(pos_t)
+            diag.update({"field_mean_nees": round(float(np.mean(nf_)), 2),
+                         "field_coverage_95": round(float(np.mean(nf_ <= 5.991)), 3),
+                         "field_sigma_median_m": round(float(np.sqrt(np.median(fld.fix_variance(pos_t)))), 3)})
         # Which R the companion fused with (fix_covariance in gz_vo_companion).
-        diag["covariance_used_by_companion"] = "quality_model" if q and cal.get("use_quality_model") is True \
-            else "covariance_ne_m2"
+        diag["covariance_used_by_companion"] = (
+            "error_field" if cal.get("use_error_field") and cal.get("error_field")
+            else "quality_model" if q and cal.get("use_quality_model") is True else "covariance_ne_m2")
         report["map_fix_consistency"] = diag
         print("MAP_FIX_CONSISTENCY", diag, flush=True)
 
