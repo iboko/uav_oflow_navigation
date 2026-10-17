@@ -121,12 +121,25 @@ def test_ncc_measures_heading_of_the_best_rotation(heading_error_deg):
 
 def test_ncc_heading_is_nan_at_the_edge_of_the_search():
     world = _texture()
-    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(-2.0, 0.0, 2.0))
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(-2.0, 0.0, 2.0), yaw_extension_deg=0.0)
     y = math.radians(80)
     frame = _render(world, 0.0, 0.0, 40.0, 0.0, 0.0, y)
     fix = loc.localize(frame, prior_ne_m=(0.0, 0.0), radius_m=10.0, height_agl_m=40.0,
                        roll_rad=0.0, pitch_rad=0.0, yaw_rad=y + math.radians(6.0))
     assert not math.isfinite(fix.yaw_rad) or not fix.accepted
+
+
+def test_ncc_search_extends_past_the_edge_and_recovers_the_heading():
+    world = _texture()
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, yaw_search_deg=(-2.0, 0.0, 2.0), yaw_extension_deg=10.0)
+    y = math.radians(80)
+    frame = _render(world, 0.0, 0.0, 40.0, 0.0, 0.0, y)
+    fix = loc.localize(frame, prior_ne_m=(0.0, 0.0), radius_m=10.0, height_agl_m=40.0,
+                       roll_rad=0.0, pitch_rad=0.0, yaw_rad=y + math.radians(6.0))
+    assert fix.accepted and math.isfinite(fix.yaw_rad)
+    assert abs(math.degrees(fix.yaw_rad - y)) < 1.0
+    # The extension stops once the peak is passed: not all 5 extra rotations.
+    assert max(abs(math.degrees(k)) for k in loc.last_peaks) <= 10.0 + 1e-6
 
 
 def _render_surface(world, surface, n, e, h_cam_up, roll, pitch, yaw, steps=400):

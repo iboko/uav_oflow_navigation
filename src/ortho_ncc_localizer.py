@@ -43,7 +43,8 @@ class OrthoNccLocalizer:
                  map_clahe_tile_m: float = 8.75, shape_radius_m: float = 1.0,
                  subpatch_search_m: float = 3.0, surface_m: np.ndarray | None = None,
                  occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1,
-                 refine_radius_m: float = 0.0, refine_min_shift_m: float = 1.0) -> None:
+                 refine_radius_m: float = 0.0, refine_min_shift_m: float = 1.0,
+                 yaw_extension_deg: float = 12.0) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -86,6 +87,13 @@ class OrthoNccLocalizer:
         self.exclusion_px = max(1, int(round(exclusion_m / self.gsd)))
         self.max_tilt = max_tilt_rad
         self.yaw_search = tuple(np.radians(yaw_search_deg))
+        # Best rotation at the edge of the search: the search continues
+        # outward (same step) up to this much further, while the peak grows.
+        # A magnetometer heading off by 13-14 deg after take-off (SITL)
+        # left every fix without a heading, and the heading never came.
+        if not (isfinite(yaw_extension_deg) and yaw_extension_deg >= 0):
+            raise ValueError("Недопустимое расширение поиска курса")
+        self.yaw_extension = float(np.radians(yaw_extension_deg))
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         # The map is equalised once, with tiles of a fixed ground size. It
         # was equalised per search window: the result then depended on the
@@ -207,14 +215,17 @@ class OrthoNccLocalizer:
         envelope = None
         peaks: dict[float, float] = {}
         locs: dict[float, tuple[int, int]] = {}
-        for dyaw in self.yaw_search:
+        best_patch = None
+
+        def match(dyaw):
+            nonlocal best, envelope, best_patch
             patch, inside = self.ortho_patch(image, height_agl_m, roll_rad, pitch_rad, yaw_rad + dyaw,
                                              center_ne_m=cam_prior)
             if not inside:
-                continue
+                return
             patch = self.clahe.apply(patch)
             if float(np.std(patch)) < 5.0:
-                continue
+                return
             r = cv2.matchTemplate(window, patch, cv2.TM_CCOEFF_NORMED)
             envelope = r.copy() if envelope is None else np.maximum(envelope, r)
             _, pk, _, lc = cv2.minMaxLoc(r)
@@ -223,6 +234,20 @@ class OrthoNccLocalizer:
             if best is None or pk > best[0]:
                 best = (pk, lc, r, dyaw)
                 best_patch = patch
+
+        for dyaw in self.yaw_search:
+            match(dyaw)
+        grid = sorted(self.yaw_search)
+        if best is not None and len(grid) > 1 and best[3] in (grid[0], grid[-1]):
+            step = grid[1] - grid[0] if best[3] == grid[0] else grid[-1] - grid[-2]
+            sign = -1.0 if best[3] == grid[0] else 1.0
+            start = dyaw = best[3]
+            while abs(dyaw + sign * abs(step) - start) <= self.yaw_extension + 1e-9:
+                edge = best[3]
+                dyaw = dyaw + sign * abs(step)
+                match(dyaw)
+                if best[3] == edge:      # the peak stopped growing: maximum passed
+                    break
         if best is None:
             return MapLocalizationFix(False, "NO_USABLE_ORTHO_PATCH")
         peak, loc, res, best_dyaw = best
@@ -330,7 +355,7 @@ class OrthoNccLocalizer:
         rotation may lie outside it) or without both neighbours. Its error
         statistics need calibration on separate flights, like the position.
         """
-        grid = sorted(self.yaw_search)
+        grid = sorted(peaks)             # the searched rotations, extension included
         i = grid.index(best_dyaw)
         if i == 0 or i == len(grid) - 1 or grid[i - 1] not in peaks or grid[i + 1] not in peaks:
             return float("nan")
