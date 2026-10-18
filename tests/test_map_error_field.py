@@ -103,3 +103,17 @@ def test_linear_drift_reduces_to_ordinary_on_flat_offsets():
     assert np.all(lin.fix_variance(near) < 1.0)
     with pytest.raises(ValueError):
         MapErrorField(np.zeros((3, 2)), np.zeros((3, 2)), 0.0, 1.0, 50.0, 0.0, drift="quadratic")
+
+
+def test_linear_drift_rejects_collinear_places():
+    rng = np.random.default_rng(6)
+    errs, poss = [], []
+    for _ in range(3):
+        n = rng.uniform(-100, 100, 8)
+        pts = np.concatenate([np.column_stack([np.full(25, x), np.full(25, 0.0)]) + rng.uniform(-3, 3, (25, 2))
+                              for x in np.floor(n / 20.0) * 20.0 + 10.0])
+        pts[:, 1] = 10.0                                         # one straight leg: E constant
+        errs.append(rng.normal(0.0, 0.2, (len(pts), 2))); poss.append(pts)
+    with pytest.raises(ValueError):
+        fit_field(errs, poss, drift="linear")
+    fit_field(errs, poss)                                        # constant mean is fine on a line

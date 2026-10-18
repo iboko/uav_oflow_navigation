@@ -158,18 +158,26 @@ def detrend(centres: np.ndarray, offsets: np.ndarray, drift: str) -> np.ndarray:
     return offsets - f @ np.linalg.lstsq(f, offsets, rcond=None)[0]
 
 
+def drift_identifiable(centres: np.ndarray, drift: str) -> bool:
+    """A linear drift needs places spanning both axes (not all on one line)."""
+    if drift == "constant":
+        return len(centres) >= 3
+    f = np.column_stack([np.ones(len(centres)), np.asarray(centres) / 100.0])
+    return len(centres) >= 6 and np.linalg.matrix_rank(f, tol=1e-3) == 3
+
+
 def fit_field(errors_by_flight: Sequence, positions_by_flight: Sequence, *, flight_variance: bool = True,
               cell_m: float = 20.0, drift: str = "constant") -> MapErrorField:
     """Field from calibration flights; flight variance by leaving each flight out."""
     c, o, fl, w = place_offsets(errors_by_flight, positions_by_flight, cell_m=cell_m)
-    if drift == "linear" and len(c) < 6:
-        raise ValueError("Недостаточно мест для линейного тренда")
+    if drift == "linear" and not drift_identifiable(c, drift):
+        raise ValueError("Линейный тренд не определяется: меньше 6 мест или все места на одной прямой")
     field = MapErrorField(c, o, *fit_variogram(c, detrend(c, o, drift)), w, drift=drift)
     if flight_variance and len(errors_by_flight) >= 3:
         excess = []
         for k in range(len(errors_by_flight)):
             keep = fl != k
-            if keep.sum() < (3 if drift == "constant" else 6):
+            if not drift_identifiable(c[keep], drift):
                 continue
             sub = MapErrorField(c[keep], o[keep], field.nugget, field.partial_sill, field.range_m, w, drift=drift)
             e, p = np.asarray(errors_by_flight[k], float), np.asarray(positions_by_flight[k], float)
