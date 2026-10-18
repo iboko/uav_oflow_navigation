@@ -64,3 +64,42 @@ def test_held_out_flights_are_consistent_and_json_round_trips():
     assert field_nees(g, errs[6], poss[6]).shape == (len(errs[6]),)
     with pytest.raises(ValueError):
         cross_validated_field_nees(errs, poss, fit_flights=7)
+
+
+def _trend_flights(seed, n_flights=8, places=8, north_max=60.0):
+    """Offset 1.5 cm/m in N plus the smooth field; places only up to north_max."""
+    rng = np.random.default_rng(seed)
+    errs, poss = [], []
+    for _ in range(n_flights):
+        e, p = [], []
+        for _ in range(places):
+            c = np.array([rng.uniform(-150, north_max), rng.uniform(-150, 150)])
+            pts = c + rng.uniform(-6, 6, (25, 2))
+            off = _smooth_field(pts[:, 0], pts[:, 1]) * 0.5 + np.column_stack([0.015 * pts[:, 0], 0.0 * pts[:, 1]])
+            e.append(off + rng.normal(0.0, 0.1, (25, 2)))
+            p.append(pts)
+        errs.append(np.concatenate(e)); poss.append(np.concatenate(p))
+    return errs, poss
+
+
+def test_linear_drift_extrapolates_a_trend():
+    errs, poss = _trend_flights(4)
+    const, lin = fit_field(errs, poss), fit_field(errs, poss, drift="linear")
+    far = np.array([[150.0, 0.0], [140.0, 50.0]])                 # 80-90 m beyond the northmost place
+    truth = 0.5 * _smooth_field(far[:, 0], far[:, 1]) + np.column_stack([0.015 * far[:, 0], np.zeros(2)])
+    err_c = np.linalg.norm(const.predict(far)[0] - truth, axis=1)
+    err_l = np.linalg.norm(lin.predict(far)[0] - truth, axis=1)
+    assert err_l.max() < 0.6 and err_l.mean() < err_c.mean()
+    # Far-away NEES of the linear field stays plausible (< 3 per axis pair on average).
+    assert np.mean(np.sum((lin.predict(far)[0] - truth) ** 2, 1) / lin.fix_variance(far)) < 6.0
+    g = MapErrorField.from_json(lin.to_json())
+    assert g.drift == "linear" and np.allclose(g.predict(far)[0], lin.predict(far)[0], atol=1e-3)
+
+
+def test_linear_drift_reduces_to_ordinary_on_flat_offsets():
+    errs, poss = _flights(5, n_flights=8)
+    lin = fit_field(errs, poss, drift="linear")
+    near = np.array([[0.0, 0.0], [50.0, -40.0]])
+    assert np.all(lin.fix_variance(near) < 1.0)
+    with pytest.raises(ValueError):
+        MapErrorField(np.zeros((3, 2)), np.zeros((3, 2)), 0.0, 1.0, 50.0, 0.0, drift="quadratic")

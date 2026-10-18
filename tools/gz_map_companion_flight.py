@@ -445,13 +445,14 @@ def combine(args) -> None:
         # before any test flight, so the route limit stays 3 sigma.
         errs = [np.asarray(r["errors_ne_m"]) for r in raw]
         pos = [flight_positions(d, r) for d, r in zip(args.flights, raw)]
-        field = fit_field(errs[:nf], pos[:nf])
+        field = fit_field(errs[:nf], pos[:nf], drift=getattr(args, "field_drift", "constant"))
         nees = [float(np.mean(field_nees(field, e, p))) for e, p in zip(errs[nf:], pos[nf:])]
         gn, ge = np.meshgrid(np.arange(*TEST_ROUTE_AREA[0], 5.0), np.arange(*TEST_ROUTE_AREA[1], 5.0))
         area_var = float(field.fix_variance(np.column_stack([gn.ravel(), ge.ravel()])).max())
         field_out = {**field.to_json(),
                      "holdout_mean_nees": [round(x, 2) for x in nees],
-                     "cross_validation": cross_validated_field_nees(errs, pos, fit_flights=len(errs) - 2)
+                     "cross_validation": cross_validated_field_nees(errs, pos, fit_flights=len(errs) - 2,
+                                                                 drift=getattr(args, "field_drift", "constant"))
                      if len(errs) > 4 else None,
                      "test_route_area_max_variance_m2": area_var}
         bias, cov = [0.0, 0.0], np.eye(2) * area_var
@@ -526,6 +527,9 @@ def main() -> None:
                     help=f"combine: leave out calibration fixes in the test zone ({TEST_ZONE})")
     ap.add_argument("--error-field", action="store_true",
                     help="combine: kriged map-offset field (bias and variance at each fix position)")
+    ap.add_argument("--field-drift", choices=("constant", "linear"), default="constant",
+                    help="combine --error-field: mean of the field, constant (ordinary kriging) or "
+                         "linear in N/E (universal kriging)")
     ap.add_argument("--flight-quantile", type=float,
                     help="combine: scale R so that this quantile of the cross-validated held-out "
                          "flights' mean NEES is 2 (flight-level conservative covariance)")
