@@ -21,13 +21,15 @@ places of other flights). Far from the calibration places the kriging
 variance tends to the sill: the field is no better than a constant there.
 
 Optional linear drift (universal kriging, ``drift="linear"``): the mean
-offset is a + b N + c E instead of a constant. Series M/N/P: place offsets
-grow to the north by about 1.4 cm/m in N; the 2019 map against the 2025
-scene texture shows the same trend (0.8 cm/m, template matching), so it is
-in the imagery, not in the simulation. With a constant mean the variogram
-range ran to its 500-m grid limit and the field was too confident far from
-the calibration places (series P flight 1, 90 m away: NEES 5.5). The
-variogram is then fitted to the residuals of the least-squares trend.
+offset is a + b N + c E instead of a constant; the variogram is fitted to
+the residuals of the least-squares trend. Tried because place offsets grow
+to the north (series M/N/P, ~1.4 cm/m; the 2019 map against the 2025 scene
+texture shows the same trend, so it is in the imagery) and the constant-mean
+variogram range runs to its 500-m grid limit. Rejected on the flights: the
+residual range drops to ~20 m, the share of held-out flights with NEES > 3
+grows (0.10-0.12 -> 0.18) and series P flight 1, 90 m from the nearest
+calibration place, stays at NEES ~7. Kept for reproducing that comparison;
+the default stays constant.
 
 Isotropic, stationary model; short-scale features (roof edges) are not
 resolved below the place size. Not a certified error model.
