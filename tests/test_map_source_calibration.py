@@ -149,3 +149,29 @@ def test_combine_error_field(tmp_path):
     assert cal["use_error_field"] and cal["bias_ne_m"] == [0.0, 0.0]
     assert cal["covariance_ne_m2"][0][0] == cal["error_field"]["test_route_area_max_variance_m2"]
     assert len(cal["error_field"]["holdout_mean_nees"]) == 2 and cal["error_field"]["cross_validation"]["holdouts"] == 30
+
+
+def _sim(positions):
+    """read_ne/sleep pair replaying one position per 0.5-s step."""
+    it = iter(positions)
+    state = {"p": next(it)}
+
+    def sleep(_s):
+        state["p"] = next(it, state["p"])
+    return (lambda: state["p"]), sleep
+
+
+def test_wait_settled_needs_hold_below_speed():
+    import gz_map_companion_flight as mf
+    # 0.2 m/s for 4 s (overshoot), then still.
+    moving = [(0.1 * k, 0.0) for k in range(9)]
+    read, sleep = _sim(moving + [moving[-1]] * 20)
+    assert mf.wait_settled(read, sleep) == 4.0 + 3.0
+    read, sleep = _sim([(0.1 * k, 0.0) for k in range(200)])
+    assert mf.wait_settled(read, sleep, timeout_s=5.0) is None
+
+
+def test_mean_position_averages_oscillation():
+    import gz_map_companion_flight as mf
+    read, sleep = _sim([(0.2 * (-1) ** k, 1.0) for k in range(5)])
+    assert np.allclose(mf.mean_position(read, sleep), (0.04, 1.0))
