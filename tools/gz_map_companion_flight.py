@@ -568,8 +568,9 @@ def main() -> None:
     ap.add_argument("--calib-walk-legs", type=int, default=5)
     ap.add_argument("--calib-walk-sector-deg", type=float, nargs=2, default=(90.0, 360.0),
                     help="calibrate walk: leg directions (0 forward = east, 90 right = south). "
-                         "180 360 keeps every leg west/north, out of TEST_ZONE (90 360: series M/N, "
-                         "legs near 90 deg ran along the zone's south strip)")
+                         "180 270 (west to north) keeps every leg out of TEST_ZONE. 180 360 does not: "
+                         "legs near 360 head east, into the zone (series P flights 5-6); 90 360: "
+                         "series M/N, legs near 90 deg ran along the zone's south strip")
     ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
                     help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
