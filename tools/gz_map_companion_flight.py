@@ -93,6 +93,40 @@ def latest_status(log: Path) -> dict:
     return json.loads(lines[-1]) if lines else {}
 
 
+# Map fault (check 4): the vehicle must be still before the shift, else the
+# true drift picks up the settling after the last route leg (test FB2 diag:
+# 0.22 m/s at the fault start, 0.61 m "drift" of which ~0.3 m was settling).
+SETTLE_MAX_SPEED_MPS = 0.1
+SETTLE_HOLD_S = 3.0
+SETTLE_TIMEOUT_S = 30.0
+DRIFT_MEAN_S = 2.0
+
+
+def wait_settled(read_ne, sleep, *, step_s: float = 0.5, max_speed: float = SETTLE_MAX_SPEED_MPS,
+                 hold_s: float = SETTLE_HOLD_S, timeout_s: float = SETTLE_TIMEOUT_S):
+    """Sim seconds until the speed from successive positions stayed below
+    max_speed for hold_s; None if not within timeout_s."""
+    prev, still, waited = np.asarray(read_ne(), float), 0.0, 0.0
+    while waited < timeout_s:
+        sleep(step_s)
+        waited += step_s
+        cur = np.asarray(read_ne(), float)
+        still = still + step_s if np.linalg.norm(cur - prev) / step_s < max_speed else 0.0
+        prev = cur
+        if still >= hold_s:
+            return waited
+    return None
+
+
+def mean_position(read_ne, sleep, *, seconds: float = DRIFT_MEAN_S, step_s: float = 0.5) -> np.ndarray:
+    """Mean of positions read over seconds (hover oscillation averaged out)."""
+    pts = [np.asarray(read_ne(), float)]
+    for _ in range(int(round(seconds / step_s))):
+        sleep(step_s)
+        pts.append(np.asarray(read_ne(), float))
+    return np.mean(pts, axis=0)
+
+
 def ulog_truth(px4_dir: Path, since_wall: float):
     from pyulog import ULog
     logs = sorted((px4_dir / "build" / "px4_sitl_default" / "rootfs" / "log").glob("*/*.ulg"),
@@ -759,15 +793,22 @@ def main() -> None:
                   mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors))
         if args.mode == "test":
             # 4: map fault.
+            def truth_ne():
+                return truth_est()[0]
+            settle_s = wait_settled(truth_ne, gz.sim_sleep)
+            truth0 = mean_position(truth_ne, gz.sim_sleep)
             before = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
-            truth0, est0 = truth_est()
             control.write_text(json.dumps({"shift_ne_m": [0.0, 3.0]}))
             report["fault_start_us"] = int(link.boot_s * 1e6)
             worst = 0.0
-            for _ in range(10):
+            for _ in range(9):
                 gz.sim_sleep(2)
                 truth, est = truth_est()
                 worst = max(worst, float(np.linalg.norm(est - truth)))
+            # Last 2 s of the 20-s fault: mean true position.
+            truth = mean_position(truth_ne, gz.sim_sleep)
+            t_est, est = truth_est()
+            worst = max(worst, float(np.linalg.norm(est - t_est)))
             during = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
             control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
             report["fault_end_us"] = int(link.boot_s * 1e6)
@@ -782,6 +823,7 @@ def main() -> None:
             # the flight (status lines are 5 s apart); vehicle behaviour here.
             report["fault_live"] = {"max_abs_error_during_fault_m": round(worst, 3),
                                     "true_drift_during_fault_m": round(drift, 3),
+                                    "settle_s": settle_s,
                                     "status_counts_delta": {"fused": fused_during, "rejected": rejected,
                                                             "fused_after": refused}}
         link.set_mode(4, 6)
