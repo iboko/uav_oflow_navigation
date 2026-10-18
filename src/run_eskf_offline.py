@@ -71,6 +71,7 @@ def run_eskf_offline(
     visual = _read_visual(Path(visual_log))
     latest_raw = 0
     outcomes: list[dict] = []
+    snapshots: list[dict] = []
     reasons = Counter()
     nis_values = []
     last_visual_time = 0
@@ -121,6 +122,24 @@ def run_eskf_offline(
                 except (TypeError, ValueError):
                     reason = "INVALID_VISUAL_FIELDS"
         snap = eskf.snapshot()
+        # Store the FULL posterior 15x15 covariance at its actual state
+        # timestamp, never at camera time if an IMU prediction is missing.
+        # Enables independent-reference NEES without reconstructing a diagonal
+        # approximation from the human-readable trajectory CSV.
+        if snap.timestamp_us == t and snap.status not in (
+            "IMU_INVALID_OR_GAP", "NUMERICAL_FAILURE", "POSTERIOR_INVALID"
+        ):
+            snapshots.append({
+                "timestamp_us": snap.timestamp_us,
+                "status": snap.status,
+                "position_ned_m": list(snap.position_ned_m),
+                "velocity_ned_m_s": list(snap.velocity_ned_m_s),
+                "quaternion_body_to_ned": list(snap.quaternion_body_to_ned),
+                "gyro_bias_rad_s": list(snap.gyro_bias_rad_s),
+                "accel_bias_m_s2": list(snap.accel_bias_m_s2),
+                "covariance_15x15": [list(x) for x in snap.covariance_15x15],
+                "visual_status": reason,
+            })
         reasons[reason] += 1
         outcomes.append({
             "camera_timestamp_us": camera_time,
@@ -154,7 +173,11 @@ def run_eskf_offline(
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(outcomes)
+    with (out / "eskf_states.jsonl").open("w", encoding="utf-8") as stream:
+        for snapshot in snapshots:
+            stream.write(json.dumps(snapshot, allow_nan=False, ensure_ascii=False) + "\n")
     report = {
+        "state_snapshots_with_full_covariance": len(snapshots),
         "imu_samples": len(imu),
         "visual_samples": len(visual),
         "accepted_visual_updates": eskf.snapshot().accepted_visual_count,
