@@ -787,6 +787,7 @@ def main() -> None:
             # 3: box pattern, absolute error.
             errors, legs = [], []
             report["test_route"] = args.test_route
+            report["route_start_us"] = int(link.boot_s * 1e6)
             for fp, fr in TEST_ROUTES[args.test_route]:
                 pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
@@ -998,6 +999,20 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
             "fused_after_fault": fused_after, **{k: v for k, v in live.items() if k != "status_counts_delta"}}
         report["analysis_ok"] = ok
         print("PASS" if ok else "FAIL", "4_shifted_map_rejected", report["checks"]["4_shifted_map_rejected"], flush=True)
+    # Check 3 also over the whole route from the ULog: the live samples are
+    # 3 s apart and missed a 5.7 m excursion of 2 s (series P repeat, box_rf).
+    c3 = report.get("checks", {}).get("3_route_absolute_error_on_map")
+    t_r0, t_r1 = report.get("route_start_us"), report.get("route_end_us")
+    if c3 is not None and t_r0 and t_r1:
+        tg = truth["timestamp"]
+        sel = (tg >= t_r0) & (tg <= t_r1)
+        e_cont = np.linalg.norm(interp(est, tg[sel]) - interp(truth, tg[sel]), axis=1)
+        limit = report["route_error_limit_m"]
+        c3["max_abs_error_continuous_m"] = round(float(e_cont.max()), 3)
+        c3["continuous_samples"] = int(sel.sum())
+        c3["pass"] = bool(c3["pass"] and e_cont.max() < limit)
+        report["analysis_ok"] = report.get("analysis_ok", True) and c3["pass"]
+        print("PASS" if c3["pass"] else "FAIL", "3_route_absolute_error_on_map (continuous)", c3, flush=True)
     # Test: VO-only track from GNSS loss to the end of the box, same flight.
     vo = np.genfromtxt(args.out / "companion_vo.csv", delimiter=",", names=True)
     t_off, t_end = report.get("gnss_off_us"), report.get("route_end_us")

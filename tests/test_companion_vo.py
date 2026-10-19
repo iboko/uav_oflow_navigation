@@ -131,3 +131,22 @@ def test_no_measurement_below_minimum_height():
         pipe.distance.add(t_ap, 0.3)
     assert pipe.process(2_000_000, texture[:240, :320].copy()) is None
     assert pipe.counts == {"BELOW_MIN_HEIGHT": 1}
+
+
+def test_velocity_jump_gate_rejects_impossible_jumps_and_recovers():
+    from src.companion_vo import VelocityJumpGate
+    g = VelocityJumpGate(max_accel_m_s2=3.7, noise_m_s=0.6, max_hold_s=1.0)
+    t = 0
+    assert g.check(t, (0.0, 0.0))
+    t += 130_000
+    assert g.check(t, (0.5, 0.0))                 # 0.5 m/s in 0.13 s: within 3.7*0.13 + 0.6
+    t += 130_000
+    assert not g.check(t, (1.8, 1.0))             # the series P outlier: 1.6 m/s jump
+    v, var = g.held_velocity(t)
+    assert v == (0.5, 0.0) and var == pytest.approx((3.7 * 0.13) ** 2 + 0.36)
+    t += 130_000
+    assert g.check(t, (0.6, 0.1))                 # back to plausible: compared with the last accepted
+    assert not g.check(t + 130_000, (float("nan"), 0.0))
+    # After max_hold_s without an accepted sample the next one is taken as is.
+    assert not g.check(t + 200_000, (9.0, 0.0))
+    assert g.check(t + 1_200_000, (3.0, 0.0))

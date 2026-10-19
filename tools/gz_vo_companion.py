@@ -44,7 +44,7 @@ from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
 from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
 from src.map_error_field import MapErrorField  # noqa: E402
-from src.companion_vo import BodyVelocityMeasurement, CompanionVo  # noqa: E402
+from src.companion_vo import BodyVelocityMeasurement, CompanionVo, VelocityJumpGate  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
 from src.imu_preintegration import ImuReading  # noqa: E402
@@ -153,6 +153,9 @@ def main() -> None:
     ap.add_argument("--camera-offset-frd", type=float, nargs=3, default=(0.0, 0.0, 0.1),
                     help="camera position in body FRD (x500_vo_down: 0.1 m below the centre)")
     ap.add_argument("--max-latency-ms", type=float, default=200.0)
+    ap.add_argument("--no-vo-jump-gate", action="store_true",
+                    help="send every VO velocity (default: reject jumps beyond the vehicle's acceleration, "
+                         "src/companion_vo.py VelocityJumpGate)")
     ap.add_argument("--focal-error", type=float, default=0.0,
                     help="injected relative focal-length error (VO scale fault)")
     ap.add_argument("--map-mode", choices=("off", "observe", "fuse"), default="off",
@@ -228,7 +231,7 @@ def main() -> None:
         mc = json.loads(args.msckf_calibration.read_text())
         msckf_scale = (float(mc["horizontal"]["scale"]), float(mc["vertical"]["scale"]))
     if log:
-        log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers\n")
+        log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers,jump_rejected\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
@@ -326,6 +329,7 @@ def main() -> None:
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=0.25, max_pair_dt_s=0.25)
             pipeline = CompanionVo(vo)
+            jump_gate = None if args.no_vo_jump_gate or args.estimator == "msckf" else VelocityJumpGate()
             if args.estimator == "msckf":
                 msckf = CompanionMsckf(
                     PinholeCamera(cal.focal_x_px, cal.focal_y_px, cal.center_x_px, cal.center_y_px,
@@ -405,14 +409,25 @@ def main() -> None:
                     last_msckf_t = t_frame
             else:
                 out = pipeline.process(t_frame, gray)
+            vo_rejected = False
+            if out is not None and jump_gate is not None and not jump_gate.check(out.time_us, (out.vo.vn_m_s,
+                                                                                            out.vo.ve_m_s)):
+                vo_rejected = True
+                pipeline.count("VO_JUMP_REJECTED")
             if out is not None and anchor is not None:
                 r = out.vo
+                v_prop = (r.vn_m_s, r.ve_m_s)
+                c_prop = ((r.velocity_cov_nn, r.velocity_cov_ne), (r.velocity_cov_ne, r.velocity_cov_ee))
+                if vo_rejected:
+                    # Across a rejected interval: the last accepted velocity,
+                    # its variance grown by the possible acceleration.
+                    v_prop, var_h = jump_gate.held_velocity(out.time_us)
+                    c_prop = ((var_h, 0.0), (0.0, var_h))
                 ref = 0.0
                 if gyro is not None:
                     d = gyro.at(out.time_us + pipeline.clock.offset_us) - out.rpy_mid[2]
                     ref = math.atan2(math.sin(d), math.cos(d)) if math.isfinite(d) else float("nan")
-                anchor.propagate(r.interval_start_us, r.timestamp_us, (r.vn_m_s, r.ve_m_s),
-                                 ((r.velocity_cov_nn, r.velocity_cov_ne), (r.velocity_cov_ne, r.velocity_cov_ee)),
+                anchor.propagate(r.interval_start_us, r.timestamp_us, v_prop, c_prop,
                                  reference_minus_autopilot_rad=ref)
             if localizer is not None and t_frame - last_map_t >= 1e6 / args.map_rate_hz:
                 state = pipeline.state_at_camera_time(t_frame)
@@ -484,6 +499,11 @@ def main() -> None:
             cov = [0.0] * 21
             cov[0], cov[6], cov[11] = out.variance_frd
             cov[15] = cov[18] = cov[20] = nan
+            velocity = list(out.velocity_frd)
+            if vo_rejected:
+                # No velocity measurement; the map position (if any) still goes.
+                velocity = [nan, nan, nan]
+                cov = [nan] * 21
             # Position only with a map lock: EKF2 stops position fusion on any
             # message without it, so it is sent with every velocity message.
             pos, pose_cov, quat = [nan, nan, nan], [nan] * 21, [nan, nan, nan, nan]
@@ -515,7 +535,7 @@ def main() -> None:
                     pose_cov[20] = anchor.heading_sigma_rad() ** 2
             link.mav.odometry_send(
                 out.time_us, mavutil.mavlink.MAV_FRAME_LOCAL_NED, mavutil.mavlink.MAV_FRAME_BODY_FRD,
-                *pos, quat, *out.velocity_frd, nan, nan, nan,
+                *pos, quat, *velocity, nan, nan, nan,
                 pose_cov, cov, 0, mavutil.mavlink.MAV_ESTIMATOR_TYPE_VIO, 100)
             sent += 1
             if log:
@@ -526,7 +546,7 @@ def main() -> None:
                                    + [str(round(v, 5)) for v in out.velocity_frd]
                                    + [f"{v:.6g}" for v in out.variance_frd]
                                    + [str(round(v, 5)) for v in (r.vn_m_s, r.ve_m_s, out.vd_m_s)])
-                          + f",{r.inlier_count}\n")
+                          + f",{r.inlier_count},{int(vo_rejected)}\n")
         # A frame waiting far too long has no autopilot data around it.
         while pending and now - pending[0][0] > 1_000_000:
             pending.pop(0)
