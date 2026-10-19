@@ -1,0 +1,184 @@
+{
+  "model": "variance = scale * camera-VO model variance (horizontal body axes; vertical untouched)",
+  "horizontal": {
+    "scale": 0.012163161769002177,
+    "bias_m_s": [
+      0.002544103843262578,
+      0.0004428430984320077
+    ],
+    "fit_mean_nees_2d": 1.9999999999999996,
+    "holdout_mean_nees_2d": 0.8219225641857995,
+    "holdout_coverage_95pct": 0.9859006027708919,
+    "holdout_flight_details": {
+      "swcalN/f1": {
+        "samples": 3522,
+        "mean_nees_2d": 0.603765922238599,
+        "fraction_within_chi2_2_95": 0.9920499716070414,
+        "bias_corrected_rmse_m_s": 0.14409311322019377
+      },
+      "swcalN/f2": {
+        "samples": 3662,
+        "mean_nees_2d": 1.1125599137625475,
+        "fraction_within_chi2_2_95": 0.9863462588749318,
+        "bias_corrected_rmse_m_s": 0.19915434109325292
+      },
+      "swcalN/f3": {
+        "samples": 1848,
+        "mean_nees_2d": 0.4341925601306962,
+        "fraction_within_chi2_2_95": 0.9897186147186147,
+        "bias_corrected_rmse_m_s": 0.11737851493795629
+      },
+      "swcalN/f4": {
+        "samples": 3403,
+        "mean_nees_2d": 0.6021797103328462,
+        "fraction_within_chi2_2_95": 0.9879518072289156,
+        "bias_corrected_rmse_m_s": 0.15065568480729674
+      },
+      "swcalN/f5": {
+        "samples": 3449,
+        "mean_nees_2d": 0.782429866446594,
+        "fraction_within_chi2_2_95": 0.9875326181501884,
+        "bias_corrected_rmse_m_s": 0.15836169482436738
+      },
+      "swcalN/f6": {
+        "samples": 3907,
+        "mean_nees_2d": 0.8340346282384161,
+        "fraction_within_chi2_2_95": 0.9851548502687484,
+        "bias_corrected_rmse_m_s": 0.17922215562289004
+      },
+      "swcalP/f1": {
+        "samples": 3597,
+        "mean_nees_2d": 0.7533121610883073,
+        "fraction_within_chi2_2_95": 0.9886016124548235,
+        "bias_corrected_rmse_m_s": 0.16905415042126226
+      },
+      "swcalP/f2": {
+        "samples": 3283,
+        "mean_nees_2d": 1.102108341885105,
+        "fraction_within_chi2_2_95": 0.9832470301553458,
+        "bias_corrected_rmse_m_s": 0.18675421349523308
+      },
+      "swcalP/f3": {
+        "samples": 3677,
+        "mean_nees_2d": 0.6725622288669341,
+        "fraction_within_chi2_2_95": 0.9883056839815066,
+        "bias_corrected_rmse_m_s": 0.16470240598741426
+      },
+      "swcalP/f4": {
+        "samples": 3300,
+        "mean_nees_2d": 0.7209379816745842,
+        "fraction_within_chi2_2_95": 0.9872727272727273,
+        "bias_corrected_rmse_m_s": 0.16491032747782336
+      },
+      "swcalP/f5": {
+        "samples": 1813,
+        "mean_nees_2d": 0.837252777198725,
+        "fraction_within_chi2_2_95": 0.9795918367346939,
+        "bias_corrected_rmse_m_s": 0.15187103159739487
+      },
+      "swcalP/f6": {
+        "samples": 1816,
+        "mean_nees_2d": 0.8262202169162451,
+        "fraction_within_chi2_2_95": 0.9763215859030837,
+        "bias_corrected_rmse_m_s": 0.14929048269078657
+      },
+      "swcalP/f7": {
+        "samples": 3250,
+        "mean_nees_2d": 1.2159677515652583,
+        "fraction_within_chi2_2_95": 0.9818461538461538,
+        "bias_corrected_rmse_m_s": 0.1976343389071372
+      },
+      "swcalP/f8": {
+        "samples": 3265,
+        "mean_nees_2d": 1.0093918382563352,
+        "fraction_within_chi2_2_95": 0.9886676875957121,
+        "bias_corrected_rmse_m_s": 0.20146798771310684
+      }
+    },
+    "consistent_on_holdout": false
+  },
+  "vertical": {
+    "scale": 1.0
+  },
+  "fit_flights": [
+    "swcalM/f1",
+    "swcalM/f2",
+    "swcalM/f3",
+    "swcalM/f4",
+    "swcalM/f5",
+    "swcalM/f6",
+    "swcalM/f7",
+    "swcalM/f8",
+    "swcalM/f9",
+    "swcalM/f10"
+  ],
+  "holdout_flights": [
+    "swcalN/f1",
+    "swcalN/f2",
+    "swcalN/f3",
+    "swcalN/f4",
+    "swcalN/f5",
+    "swcalN/f6",
+    "swcalP/f1",
+    "swcalP/f2",
+    "swcalP/f3",
+    "swcalP/f4",
+    "swcalP/f5",
+    "swcalP/f6",
+    "swcalP/f7",
+    "swcalP/f8"
+  ],
+  "jump_gate_rejected_per_flight": {
+    "swcalM/f1": 54,
+    "swcalM/f2": 33,
+    "swcalM/f3": 41,
+    "swcalM/f4": 44,
+    "swcalM/f5": 47,
+    "swcalM/f6": 45,
+    "swcalM/f7": 32,
+    "swcalM/f8": 53,
+    "swcalM/f9": 16,
+    "swcalM/f10": 57,
+    "swcalN/f1": 39,
+    "swcalN/f2": 37,
+    "swcalN/f3": 12,
+    "swcalN/f4": 34,
+    "swcalN/f5": 17,
+    "swcalN/f6": 52,
+    "swcalP/f1": 42,
+    "swcalP/f2": 32,
+    "swcalP/f3": 32,
+    "swcalP/f4": 48,
+    "swcalP/f5": 48,
+    "swcalP/f6": 33,
+    "swcalP/f7": 43,
+    "swcalP/f8": 15
+  },
+  "samples_per_flight": {
+    "swcalM/f1": 3350,
+    "swcalM/f2": 3898,
+    "swcalM/f3": 3897,
+    "swcalM/f4": 3896,
+    "swcalM/f5": 1459,
+    "swcalM/f6": 3844,
+    "swcalM/f7": 3259,
+    "swcalM/f8": 3723,
+    "swcalM/f9": 3474,
+    "swcalM/f10": 3301,
+    "swcalN/f1": 3522,
+    "swcalN/f2": 3662,
+    "swcalN/f3": 1848,
+    "swcalN/f4": 3403,
+    "swcalN/f5": 3449,
+    "swcalN/f6": 3907,
+    "swcalP/f1": 3597,
+    "swcalP/f2": 3283,
+    "swcalP/f3": 3677,
+    "swcalP/f4": 3300,
+    "swcalP/f5": 1813,
+    "swcalP/f6": 1816,
+    "swcalP/f7": 3250,
+    "swcalP/f8": 3265
+  },
+  "note": "simulated flights (Gazebo, 3D swiss scene, 50 m); not a sensor certification"
+}
