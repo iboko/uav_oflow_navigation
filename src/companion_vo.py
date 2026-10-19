@@ -202,3 +202,52 @@ class CompanionVo:
         return BodyVelocityMeasurement((t0 + t1) // 2, tuple(float(v) for v in v_body),
                                        tuple(float(cov_body[i, i]) for i in range(3)), result, vd,
                                        float(mid[3]), (float(mid[0]), float(mid[1]), float(mid[2])))
+
+
+class VelocityJumpGate:
+    """Rejects VO velocities that jump more than the vehicle can accelerate.
+
+    A multirotor tilted at most max_tilt accelerates horizontally at most
+    g tan(max_tilt); between two VO measurements dt apart the velocity can
+    change by that times dt, plus the VO noise of both. Series P/M/N (50 m,
+    3D world): VO velocity error median 0.09-0.10 m/s, q95 0.28-0.32 m/s,
+    but single samples 1-11 m/s off with hundreds of inliers. EKF2 takes
+    VO with sigma ~1.6 m/s at that height, so a 1-2 m/s outlier passes its
+    gate; in hover nothing corrects it and the position controller chases
+    it (series P repeat, box_rf: 3.7 m/s and 26 deg tilt, 5.7 m error).
+
+    Limits fixed from physics and the calibration flights (not the tests):
+    max_accel = 1.5 g tan(0.25 rad) = 3.7 m/s^2 (VO itself drops frames
+    beyond 0.25 rad), noise = 2 x q95 = 0.6 m/s. On calibration flights P:
+    0.12 % of good samples (error < 0.5 m/s) rejected, 86 % of outliers
+    (> 1 m/s); M/N: 0.10 % and 62 % (slow drifts are not jumps). After
+    max_hold_s without an accepted sample the next one is taken as is.
+    """
+
+    def __init__(self, max_accel_m_s2: float = 3.7, noise_m_s: float = 0.6, max_hold_s: float = 1.0) -> None:
+        self.max_accel = max_accel_m_s2
+        self.noise = noise_m_s
+        self.max_hold_s = max_hold_s
+        self.last_t_us: int | None = None
+        self.last_v: np.ndarray | None = None
+
+    def check(self, t_us: int, v_ne) -> bool:
+        v = np.asarray(v_ne, dtype=float)
+        if not np.isfinite(v).all():
+            return False
+        if self.last_t_us is None or (t_us - self.last_t_us) * 1e-6 > self.max_hold_s:
+            ok = True
+        else:
+            dt = max(0.0, (t_us - self.last_t_us) * 1e-6)
+            ok = float(np.linalg.norm(v - self.last_v)) <= self.max_accel * dt + self.noise
+        if ok:
+            self.last_t_us, self.last_v = t_us, v
+        return ok
+
+    def held_velocity(self, t_us: int) -> tuple[tuple[float, float], float]:
+        """Last accepted velocity and its variance per axis grown by the
+        possible acceleration since: for the map anchor across a rejected
+        interval (no gap, no invented precision)."""
+        age = max(0.0, (t_us - self.last_t_us) * 1e-6)
+        var = (self.max_accel * age) ** 2 + self.noise ** 2
+        return (float(self.last_v[0]), float(self.last_v[1])), var

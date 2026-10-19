@@ -145,14 +145,27 @@ def yaw_deg(att) -> np.ndarray:
                                  1 - 2 * (att["q[2]"] ** 2 + att["q[3]"] ** 2)))
 
 
-def heading_error_deg(d: dict, t0_us: int) -> dict:
-    """EKF2 heading minus ground truth, airborne part (diagnostic only)."""
+def heading_error_deg(d: dict, t0_us: int, gnss_off_us: int | None = None, min_alt_m: float = 2.0) -> dict:
+    """EKF2 heading minus ground truth while airborne (diagnostic only).
+
+    Airborne: after t0_us and more than min_alt_m above the start (true
+    altitude). Before the map lock the heading is the magnetometer's; on the
+    ground after landing the true yaw jumps at touchdown. Both used to set the
+    maximum (8-11 deg) of flights whose in-flight error stayed below 1.5 deg."""
     a, g = d["vehicle_attitude"], d["vehicle_attitude_groundtruth"]
-    sel = a["timestamp"] >= t0_us
-    truth = np.interp(a["timestamp"][sel], g["timestamp"], np.unwrap(np.radians(yaw_deg(g))))
-    err = (np.radians(yaw_deg(a))[sel] - truth + np.pi) % (2 * np.pi) - np.pi
-    return {"max_abs_deg": round(float(np.degrees(np.max(np.abs(err)))), 2),
-            "mean_deg": round(float(np.degrees(np.mean(err))), 2)}
+    gt = d["vehicle_local_position_groundtruth"]
+    t = a["timestamp"]
+    alt = -np.interp(t, gt["timestamp"], gt["z"])
+    sel = (t >= t0_us) & (alt > min_alt_m)
+    if not sel.any():
+        return {"max_abs_deg": None, "mean_deg": None}
+    truth = np.interp(t, g["timestamp"], np.unwrap(np.radians(yaw_deg(g))))
+    err = np.degrees((np.radians(yaw_deg(a)) - truth + np.pi) % (2 * np.pi) - np.pi)
+    out = {"max_abs_deg": round(float(np.max(np.abs(err[sel]))), 2), "mean_deg": round(float(np.mean(err[sel])), 2),
+           "airborne_from_alt_m": min_alt_m}
+    if gnss_off_us is not None and (sel & (t >= gnss_off_us)).any():
+        out["no_gnss_max_abs_deg"] = round(float(np.max(np.abs(err[sel & (t >= gnss_off_us)]))), 2)
+    return out
 
 
 def map_heading_errors_deg(d: dict, rows: list[dict], t_us: np.ndarray) -> np.ndarray:
@@ -774,6 +787,7 @@ def main() -> None:
             # 3: box pattern, absolute error.
             errors, legs = [], []
             report["test_route"] = args.test_route
+            report["route_start_us"] = int(link.boot_s * 1e6)
             for fp, fr in TEST_ROUTES[args.test_route]:
                 pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
@@ -875,7 +889,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
     truth, est = d["vehicle_local_position_groundtruth"], d["vehicle_local_position"]
     report["ulog"] = ulog
     if report.get("takeoff_us"):
-        report["ekf2_heading_error"] = heading_error_deg(d, report["takeoff_us"])
+        report["ekf2_heading_error"] = heading_error_deg(d, report["takeoff_us"], report.get("gnss_off_us"))
     rows = read_map_log(args.out / "companion_map.csv")
     offset = int(report["companion_final_status"].get("time_offset_us") or 0)
     acc = [r for r in rows if r["localizer_status"].endswith("ACCEPTED_UNVALIDATED")]
@@ -985,6 +999,20 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
             "fused_after_fault": fused_after, **{k: v for k, v in live.items() if k != "status_counts_delta"}}
         report["analysis_ok"] = ok
         print("PASS" if ok else "FAIL", "4_shifted_map_rejected", report["checks"]["4_shifted_map_rejected"], flush=True)
+    # Check 3 also over the whole route from the ULog: the live samples are
+    # 3 s apart and missed a 5.7 m excursion of 2 s (series P repeat, box_rf).
+    c3 = report.get("checks", {}).get("3_route_absolute_error_on_map")
+    t_r0, t_r1 = report.get("route_start_us"), report.get("route_end_us")
+    if c3 is not None and t_r0 and t_r1:
+        tg = truth["timestamp"]
+        sel = (tg >= t_r0) & (tg <= t_r1)
+        e_cont = np.linalg.norm(interp(est, tg[sel]) - interp(truth, tg[sel]), axis=1)
+        limit = report["route_error_limit_m"]
+        c3["max_abs_error_continuous_m"] = round(float(e_cont.max()), 3)
+        c3["continuous_samples"] = int(sel.sum())
+        c3["pass"] = bool(c3["pass"] and e_cont.max() < limit)
+        report["analysis_ok"] = report.get("analysis_ok", True) and c3["pass"]
+        print("PASS" if c3["pass"] else "FAIL", "3_route_absolute_error_on_map (continuous)", c3, flush=True)
     # Test: VO-only track from GNSS loss to the end of the box, same flight.
     vo = np.genfromtxt(args.out / "companion_vo.csv", delimiter=",", names=True)
     t_off, t_end = report.get("gnss_off_us"), report.get("route_end_us")
