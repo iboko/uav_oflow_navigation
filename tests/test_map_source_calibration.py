@@ -175,3 +175,19 @@ def test_mean_position_averages_oscillation():
     import gz_map_companion_flight as mf
     read, sleep = _sim([(0.2 * (-1) ** k, 1.0) for k in range(5)])
     assert np.allclose(mf.mean_position(read, sleep), (0.04, 1.0))
+
+
+def test_heading_error_counts_only_airborne_time():
+    import gz_map_companion_flight as mf
+    t = np.arange(0, 100_000_000, 100_000)                       # 100 s at 10 Hz
+    alt = np.where((t > 10e6) & (t < 90e6), 50.0, 0.0)           # take-off at 10 s, landed at 90 s
+    yaw_true = np.zeros(len(t))
+    yaw_est = np.where(alt > 0, 1.0, 9.0)                        # 9 deg off on the ground, 1 deg in flight
+
+    def att(yaw_deg):
+        h = np.radians(yaw_deg) / 2
+        return {"timestamp": t, "q[0]": np.cos(h), "q[1]": 0 * h, "q[2]": 0 * h, "q[3]": np.sin(h)}
+    d = {"vehicle_attitude": att(yaw_est), "vehicle_attitude_groundtruth": att(yaw_true),
+         "vehicle_local_position_groundtruth": {"timestamp": t, "z": -alt}}
+    out = mf.heading_error_deg(d, 0, gnss_off_us=30_000_000)
+    assert out["max_abs_deg"] == 1.0 and out["no_gnss_max_abs_deg"] == 1.0

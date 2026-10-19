@@ -145,14 +145,27 @@ def yaw_deg(att) -> np.ndarray:
                                  1 - 2 * (att["q[2]"] ** 2 + att["q[3]"] ** 2)))
 
 
-def heading_error_deg(d: dict, t0_us: int) -> dict:
-    """EKF2 heading minus ground truth, airborne part (diagnostic only)."""
+def heading_error_deg(d: dict, t0_us: int, gnss_off_us: int | None = None, min_alt_m: float = 2.0) -> dict:
+    """EKF2 heading minus ground truth while airborne (diagnostic only).
+
+    Airborne: after t0_us and more than min_alt_m above the start (true
+    altitude). Before the map lock the heading is the magnetometer's; on the
+    ground after landing the true yaw jumps at touchdown. Both used to set the
+    maximum (8-11 deg) of flights whose in-flight error stayed below 1.5 deg."""
     a, g = d["vehicle_attitude"], d["vehicle_attitude_groundtruth"]
-    sel = a["timestamp"] >= t0_us
-    truth = np.interp(a["timestamp"][sel], g["timestamp"], np.unwrap(np.radians(yaw_deg(g))))
-    err = (np.radians(yaw_deg(a))[sel] - truth + np.pi) % (2 * np.pi) - np.pi
-    return {"max_abs_deg": round(float(np.degrees(np.max(np.abs(err)))), 2),
-            "mean_deg": round(float(np.degrees(np.mean(err))), 2)}
+    gt = d["vehicle_local_position_groundtruth"]
+    t = a["timestamp"]
+    alt = -np.interp(t, gt["timestamp"], gt["z"])
+    sel = (t >= t0_us) & (alt > min_alt_m)
+    if not sel.any():
+        return {"max_abs_deg": None, "mean_deg": None}
+    truth = np.interp(t, g["timestamp"], np.unwrap(np.radians(yaw_deg(g))))
+    err = np.degrees((np.radians(yaw_deg(a)) - truth + np.pi) % (2 * np.pi) - np.pi)
+    out = {"max_abs_deg": round(float(np.max(np.abs(err[sel]))), 2), "mean_deg": round(float(np.mean(err[sel])), 2),
+           "airborne_from_alt_m": min_alt_m}
+    if gnss_off_us is not None and (sel & (t >= gnss_off_us)).any():
+        out["no_gnss_max_abs_deg"] = round(float(np.max(np.abs(err[sel & (t >= gnss_off_us)]))), 2)
+    return out
 
 
 def map_heading_errors_deg(d: dict, rows: list[dict], t_us: np.ndarray) -> np.ndarray:
@@ -875,7 +888,7 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
     truth, est = d["vehicle_local_position_groundtruth"], d["vehicle_local_position"]
     report["ulog"] = ulog
     if report.get("takeoff_us"):
-        report["ekf2_heading_error"] = heading_error_deg(d, report["takeoff_us"])
+        report["ekf2_heading_error"] = heading_error_deg(d, report["takeoff_us"], report.get("gnss_off_us"))
     rows = read_map_log(args.out / "companion_map.csv")
     offset = int(report["companion_final_status"].get("time_offset_us") or 0)
     acc = [r for r in rows if r["localizer_status"].endswith("ACCEPTED_UNVALIDATED")]
