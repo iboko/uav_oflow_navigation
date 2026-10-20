@@ -16,8 +16,11 @@ Input: flight directories of ``gz_map_companion_flight.py`` (calibrate or
 test mode): ``companion_vo.csv`` (body-FRD velocity and model variances,
 NED velocity) and the flight report with the ULog path. Reference: Gazebo
 ground-truth velocity rotated into the true body axes. Samples the
-companion's ``VelocityJumpGate`` rejects are left out (they never reach
-EKF2), and only the flight segment of the report is used.
+companion's ``VelocityJumpGate`` rejected are left out (they never reach
+EKF2): its recorded ``jump_rejected`` column where present, otherwise
+(logs from before the gate) the gate replayed on the logged rows. Only
+the flight segment of the report is used. The log's ``t_us`` is already
+on the autopilot (ULog) clock.
 
 The first --fit-flights directories fit, the rest are held out. Nothing is
 fitted on the held-out flights. Simulated flights: not a sensor
@@ -54,10 +57,12 @@ def body_errors(flight_dir: Path):
     """(errors body x/y, model variances x/y, rejected-by-gate count)."""
     from pyulog import ULog
     rep = _report(flight_dir)
-    offset = int((rep.get("companion_final_status") or {}).get("time_offset_us") or 0)
     rows = np.genfromtxt(flight_dir / "companion_vo.csv", delimiter=",", names=True)
-    t = rows["t_us"] + offset
-    ok = gate_mask(t, rows["vn"], rows["ve"])
+    t = rows["t_us"]                       # companion time + offset: autopilot clock
+    if "jump_rejected" in rows.dtype.names:
+        ok = rows["jump_rejected"] == 0
+    else:
+        ok = gate_mask(t, rows["vn"], rows["ve"])
     seg = (rep.get("segments") or {}).get("flight")
     t0, t1 = seg if seg else (rep.get("takeoff_us", 0) + 20e6, t[-1])
     var_all = np.column_stack([rows["var_x"], rows["var_y"]])
