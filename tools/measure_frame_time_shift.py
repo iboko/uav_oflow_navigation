@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the camera frame time shift from SITL flight logs.
+"""Measure the apparent time lead of the VO velocity over the truth (SITL logs).
 
 The VO velocity EKF2 received (``vehicle_visual_odometry``, body FRD,
 stamped with ``timestamp_sample``) is rotated to N/E with the true yaw and
@@ -9,11 +9,16 @@ horizontal acceleration > --min-accel) are used: at constant velocity the
 shift is not observable. Errors are clipped at 1 m/s (VO outliers). The
 shift is the minimum of the error curve averaged over the flights.
 
-Series M/P calibration flights (3D swiss scene, 50 m): 105 ms (per-flight
-minima: median 107 ms, IQR 88-146 ms). The VO velocity matches the true
-velocity that much after its stamp: the frame stamps are early. Use on
-calibration flights only; the result goes to the companion as
-``--frame-time-shift-ms``.
+Series M/P calibration flights (3D swiss scene, 50 m): the VO velocity
+best matches the true velocity 105 ms after its stamp (per-flight minima:
+median 107 ms, IQR 88-146 ms). This is NOT a stamp error: ULog
+``timestamp_sample`` equals the companion's own time within ~1 ms, and the
+GNSS-aided EKF2 velocity leads the truth by only 15-40 ms. Applied as a
+frame stamp shift in the companion (``--frame-time-shift-ms 105``) all
+three test flights diverged (route error 12-422 m, map lock lost). The
+apparent lead is a property of the VO in accelerating (tilting) segments,
+probably rotation leaking into the translation estimate; cause open.
+Diagnostic only.
 """
 from __future__ import annotations
 

@@ -194,8 +194,8 @@ def main() -> None:
     ap.add_argument("--msckf-calibration", type=Path,
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
-                    help="added to every camera frame stamp before use (calibrated on separate flights; "
-                         "SITL 3D swiss scene: 105 ms, tools/measure_frame_time_shift.py)")
+                    help="added to every camera frame stamp before use; keep 0: the apparent 105 ms VO lead "
+                         "(tools/measure_frame_time_shift.py) applied here made the test flights diverge")
     ap.add_argument("--vo-calibration", type=Path,
                     help="JSON from tools/calibrate_vo_covariance.py: horizontal variance scale of the camera VO "
                          "(separate calibration flights); applied to what EKF2 and the map anchor get, the log "
@@ -218,10 +218,9 @@ def main() -> None:
     node.subscribe(Clock, f"/world/{args.world}/clock",
                    lambda m: clock_us.__setitem__(0, m.sim.sec * 1_000_000 + m.sim.nsec // 1000))
 
-    # Measured on the calibration flights (series M/P, 3D swiss scene): the
-    # VO velocity matches the true velocity ~105 ms after the Gazebo image
-    # stamp (cross-correlation in accelerating segments). The frame time
-    # is shifted before anything uses it (VO, attitude interpolation, map).
+    # Frame stamp shift, default 0. The 105 ms the VO velocity appears to
+    # lead the truth (tools/measure_frame_time_shift.py) is not a stamp
+    # error: applying it made all three test flights diverge.
     frame_shift_us = int(round(args.frame_time_shift_ms * 1000))
     def on_image(msg: Image) -> None:
         gray = to_gray(msg)
