@@ -195,7 +195,11 @@ class CompanionVo:
         surface = self.vo.surface
         if surface is not None and position_ne_m is not None and all(isfinite(v) for v in position_ne_m):
             ne = (float(position_ne_m[0]), float(position_ne_m[1]))
-            alt = height + float(surface.height_at(ne[0], ne[1])[0])
+            # The rangefinder (body down) hits the surface off the nadir when
+            # tilted: sample the DSM at that point (50 m, 0.2 rad: 10 m away).
+            down = body_to_ned(roll, pitch, yaw)[:, 2]
+            slant = height / down[2]
+            alt = height + float(surface.height_at(ne[0] + slant * down[0], ne[1] + slant * down[1])[0])
         result = self.vo.process(VisualFrame(companion_t_us, gray, height, yaw, roll, pitch, ne, alt))
         self._heights[companion_t_us] = height
         for t in [t for t in self._heights if t < companion_t_us - 2_000_000]:

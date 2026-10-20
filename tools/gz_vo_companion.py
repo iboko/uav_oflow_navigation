@@ -214,8 +214,10 @@ def main() -> None:
     args = ap.parse_args()
     if args.vo_surface_depth and not (args.surface and args.map_georef):
         ap.error("--vo-surface-depth needs --surface and --map-georef")
-    if args.vo_window_pairs < 1:
-        ap.error("--vo-window-pairs must be >= 1")
+    if not 1 <= args.vo_window_pairs <= 16:
+        # The map anchor keeps 16 intervals: a longer window's midpoint
+        # would lose the map position.
+        ap.error("--vo-window-pairs must be 1..16")
     if args.map_mode != "off" and not (args.orthophoto and args.map_georef):
         ap.error("--map-mode needs --orthophoto and --map-georef")
     if args.map_mode == "fuse" and not args.map_calibration:

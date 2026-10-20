@@ -186,3 +186,24 @@ def test_velocity_jump_gate_rejects_impossible_jumps_and_recovers():
     # After max_hold_s without an accepted sample the next one is taken as is.
     assert not g.check(t + 200_000, (9.0, 0.0))
     assert g.check(t + 1_200_000, (3.0, 0.0))
+
+
+def test_dsm_altitude_is_sampled_at_the_rangefinder_hit_point():
+    # Rolled 0.2 rad (right side down): the body-down rangefinder hits
+    # ~6 m west, on a 20 m roof; the ground under the vehicle is at 0 m.
+    grid = np.zeros((200, 200), np.float32)
+    grid[:, :92] = 20.0                       # west of -4 m
+    dsm = SurfaceDepth(grid, (50.0, -50.0), 0.5)
+    pipe = _pipeline(surface=dsm)
+    roll = 0.2
+    q = (math.cos(roll / 2), math.sin(roll / 2), 0.0, 0.0)
+    slant = 30.0 / math.cos(roll)             # 30 m to the roof along the body axis
+    t_cam = 2_000_000
+    for j in range(-8, 9):
+        t_ap = t_cam + OFFSET_US + j * 10_000
+        pipe.attitude.add(t_ap, q)
+        pipe.distance.add(t_ap, slant)
+    seen = []
+    pipe.vo.process = lambda frame: seen.append(frame) or pipe.vo.reject_frame(frame.timestamp_us, "TEST")
+    pipe.process(t_cam, _texture()[:240, :320], position_ne_m=(0.0, 0.0))
+    assert seen[0].altitude_m == pytest.approx(50.0, abs=0.05)

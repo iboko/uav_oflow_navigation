@@ -131,7 +131,11 @@ def load_inputs(flight: Path, surface: SurfaceDepth | None, attitude_shift_us: f
         inp["datum_m"] = c
         inp["alt_truth"] = -inp["z_truth"] + c
         inp["alt_ekf"] = -inp["z_ekf"] + c
-        inp["alt_range"] = inp["range_v"] + surface.height_at(inp["ne_ekf"][:, 0], inp["ne_ekf"][:, 1])
+        # Rangefinder hit point (body down axis), as in CompanionVo.
+        hit = inp["ne_ekf"] + inp["range"][:, None] * np.column_stack(
+            [np.cos(r) * np.sin(p) * np.cos(inp["rpy_ekf"][:, 2]) + np.sin(r) * np.sin(inp["rpy_ekf"][:, 2]),
+             np.cos(r) * np.sin(p) * np.sin(inp["rpy_ekf"][:, 2]) - np.sin(r) * np.cos(inp["rpy_ekf"][:, 2])])
+        inp["alt_range"] = inp["range_v"] + surface.height_at(hit[:, 0], hit[:, 1])
         inp["h_truth"] = inp["alt_truth"] - nadir
     else:
         inp["h_truth"] = -inp["z_truth"]
@@ -181,6 +185,10 @@ def replay(inp: dict, *, attitude="ekf", height="range", depth="none", position=
         dt = (b - a) * 1e-6
         ref = [(np.interp(b, gt["timestamp"], gt[c]) - np.interp(a, gt["timestamp"], gt[c])) / dt for c in "xy"]
         errs.append((b, r.vn_m_s - ref[0], r.ve_m_s - ref[1], ref[0], ref[1]))
+    if not errs:
+        return {"pairs": 0, "status": status, "rms_m_s": float("nan"), "core_axis_std_m_s": float("nan"),
+                "core_axis_mean_m_s": [float("nan")] * 2, "outliers_over_1m_s": 0, "p95_m_s": float("nan"),
+                "errors": np.empty((0, 5))}
     e = np.array(errs)
     mag = np.hypot(e[:, 1], e[:, 2])
     core = mag < 1.0
