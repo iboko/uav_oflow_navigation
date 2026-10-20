@@ -2,7 +2,7 @@
 """Measure the apparent time lead of the VO velocity over the truth (SITL logs).
 
 The VO velocity EKF2 received (``vehicle_visual_odometry``, body FRD,
-stamped with ``timestamp_sample``) is rotated to N/E with the true yaw and
+stamped with ``timestamp_sample``) is rotated to NED with the true attitude and
 compared with the Gazebo ground-truth velocity at ``timestamp_sample +
 shift`` for shifts in --range-ms. Only accelerating samples (true
 horizontal acceleration > --min-accel) are used: at constant velocity the
@@ -10,8 +10,8 @@ shift is not observable. Errors are clipped at 1 m/s (VO outliers). The
 shift is the minimum of the error curve averaged over the flights.
 
 Series M/P calibration flights (3D swiss scene, 50 m): the VO velocity
-best matches the true velocity 105 ms after its stamp (per-flight minima:
-median 107 ms, IQR 88-146 ms). This is NOT a stamp error: ULog
+best matches the true velocity 110 ms after its stamp (per-flight minima:
+median 112 ms; 105 ms with the earlier yaw-only rotation). This is NOT a stamp error: ULog
 ``timestamp_sample`` equals the companion's own time within ~1 ms, and the
 GNSS-aided EKF2 velocity leads the truth by only 15-40 ms. Applied as a
 frame stamp shift in the companion (``--frame-time-shift-ms 105``) all
@@ -47,11 +47,16 @@ def error_curve(flight_dir: Path, lags_ms: np.ndarray, min_accel: float = 0.4) -
     ok = np.isfinite(vo["velocity[0]"])
     t = vo["timestamp_sample"][ok].astype(float)
     q = np.column_stack([np.interp(t, a["timestamp"], a[f"q[{i}]"]) for i in range(4)])
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
     w, x, y, z = q.T
-    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-    c, s = np.cos(yaw), np.sin(yaw)
-    vx, vy = vo["velocity[0]"][ok], vo["velocity[1]"][ok]
-    vn, ve = c * vx - s * vy, s * vx + c * vy
+    # Full body-FRD -> NED rotation (the companion built the body vector
+    # from all three NED components with the full attitude).
+    r = np.stack([np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
+                  np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
+                  np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1)], -2)
+    v_b = np.column_stack([vo["velocity[0]"][ok], vo["velocity[1]"][ok], vo["velocity[2]"][ok]])
+    v_n = np.einsum("nij,nj->ni", r, v_b)
+    vn, ve = v_n[:, 0], v_n[:, 1]
     tg = gt["timestamp"].astype(float)
     acc = np.hypot(np.gradient(gt["vx"], tg / 1e6), np.gradient(gt["vy"], tg / 1e6))
     m = np.interp(t, tg, acc) > min_accel
