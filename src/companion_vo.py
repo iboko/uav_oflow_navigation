@@ -20,7 +20,9 @@ the position given with the frame); ``window_pairs`` > 1 sends the mean
 velocity over that many contiguous pairs, stamped at the window midpoint.
 The window cancels a ~2.5 Hz error from the frame-to-frame tilt
 (EKF2 attitude and integrated gyro alike), which integrates to almost no
-position error but dominates the per-pair velocity error.
+position error but dominates the per-pair velocity error. In the closed
+loop the window's ~165 ms delay made the test flights swing at route
+corners (docs/SWISS_SCENE_SITL_RU.md): keep 1.
 """
 from __future__ import annotations
 
