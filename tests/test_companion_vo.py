@@ -10,6 +10,7 @@ from src.camera_rotation_compensation import CameraMountCalibration
 from src.companion_vo import CompanionVo, History, TimeOffset
 from src.continuous_visual_odometry import ContinuousPlanarOdometry
 from src.ground_visual_motion import CameraCalibration
+from src.surface_depth import SurfaceDepth
 from src.velocity_uncertainty import VelocityErrorAssumptions
 
 IMAGE_TO_BODY = ((0.0, -1.0), (1.0, 0.0))
@@ -28,14 +29,14 @@ def _texture():
     return (255 * img).astype(np.uint8)
 
 
-def _pipeline():
+def _pipeline(window_pairs=1, surface=None):
     cal = CameraCalibration(F_PX, F_PX, 160.0, 120.0, IMAGE_TO_BODY)
     vo = ContinuousPlanarOdometry(
         cal, camera_mount=CameraMountCalibration(BODY_FROM_CAMERA),
         velocity_error_assumptions=VelocityErrorAssumptions(0.5, 0.05, 0.002, 0.02, 0.01,
                                                             velocity_model_floor_m_s=0.05),
-        max_tilt_rad=0.25)
-    pipe = CompanionVo(vo)
+        max_tilt_rad=0.25, surface=surface)
+    pipe = CompanionVo(vo, window_pairs=window_pairs)
     for k in range(5):  # обмен TIMESYNC, задержка круга 2-6 мс
         sent = 1_000_000 + k * 200_000
         rtt = 2000 + 1000 * k
@@ -106,6 +107,41 @@ def test_forward_and_climb_give_body_frd_velocity_from_measurements():
     assert o.time_us == (o.vo.interval_start_us + o.vo.timestamp_us) // 2
 
 
+@pytest.mark.parametrize("surface", [False, True])
+def test_window_sends_the_mean_over_contiguous_pairs(surface):
+    """Speed alternating 0.4 / 1.6 m/s per pair: the 2-pair window sends 1 m/s.
+
+    With a flat DSM (and a position) the feature depths equal the height.
+    """
+    texture = _texture()
+    dsm = SurfaceDepth(np.full((200, 200), 7.0, np.float32), (50.0, -50.0), 0.5) if surface else None
+    pipe = _pipeline(window_pairs=2, surface=dsm)
+    q = (1.0, 0.0, 0.0, 0.0)
+    dt_us = 66_667
+    outs, travelled = [], 0.0
+    for k in range(9):
+        t_cam = 2_000_000 + k * dt_us
+        for j in range(-8, 9):
+            t_ap = t_cam + OFFSET_US + j * 10_000
+            pipe.attitude.add(t_ap, q)
+            pipe.distance.add(t_ap, 3.0)
+        if k:
+            travelled += (0.4 if k % 2 else 1.6) * dt_us * 1e-6
+        crop = cv2.getRectSubPix(texture, (320, 240), (450.0, 520.0 - travelled * F_PX / 3.0))
+        out = pipe.process(t_cam, crop, position_ne_m=(0.0, 0.0) if surface else None)
+        if out is not None:
+            outs.append(out)
+    full = [o for o in outs if o.pairs_in_window == 2]
+    assert len(full) >= 5, pipe.counts
+    assert outs[0].pairs_in_window == 1
+    for o in full:
+        assert o.velocity_ne_sent[0] == pytest.approx(1.0, abs=0.12)
+        assert o.velocity_frd[0] == pytest.approx(1.0, abs=0.12)
+        assert o.time_us == o.vo.timestamp_us - dt_us
+    # The last pair itself still alternates (anchor propagation uses it).
+    assert max(o.vo.vn_m_s for o in full) - min(o.vo.vn_m_s for o in full) > 0.8
+
+
 def test_no_measurement_without_time_sync_or_rangefinder():
     texture = _texture()
     cal = CameraCalibration(F_PX, F_PX, 160.0, 120.0, IMAGE_TO_BODY)
@@ -150,3 +186,24 @@ def test_velocity_jump_gate_rejects_impossible_jumps_and_recovers():
     # After max_hold_s without an accepted sample the next one is taken as is.
     assert not g.check(t + 200_000, (9.0, 0.0))
     assert g.check(t + 1_200_000, (3.0, 0.0))
+
+
+def test_dsm_altitude_is_sampled_at_the_rangefinder_hit_point():
+    # Rolled 0.2 rad (right side down): the body-down rangefinder hits
+    # ~6 m west, on a 20 m roof; the ground under the vehicle is at 0 m.
+    grid = np.zeros((200, 200), np.float32)
+    grid[:, :92] = 20.0                       # west of -4 m
+    dsm = SurfaceDepth(grid, (50.0, -50.0), 0.5)
+    pipe = _pipeline(surface=dsm)
+    roll = 0.2
+    q = (math.cos(roll / 2), math.sin(roll / 2), 0.0, 0.0)
+    slant = 30.0 / math.cos(roll)             # 30 m to the roof along the body axis
+    t_cam = 2_000_000
+    for j in range(-8, 9):
+        t_ap = t_cam + OFFSET_US + j * 10_000
+        pipe.attitude.add(t_ap, q)
+        pipe.distance.add(t_ap, slant)
+    seen = []
+    pipe.vo.process = lambda frame: seen.append(frame) or pipe.vo.reject_frame(frame.timestamp_us, "TEST")
+    pipe.process(t_cam, _texture()[:240, :320], position_ne_m=(0.0, 0.0))
+    assert seen[0].altitude_m == pytest.approx(50.0, abs=0.05)

@@ -225,7 +225,8 @@ def test_map_position_export_refuses_stale_and_extrapolated_timestamps():
     anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
     _, _, t = _fly(anchor, 3, v=(0.0, 0.0))
     anchor.propagate(t, t + 200_000, (0.0, 0.0), VO_COV)
-    assert anchor.measurement_at(t - 1, max_fix_age_s=1.0) is None
+    # The interval of the locking fix is still stored; before it, nothing.
+    assert anchor.measurement_at(t - DT - 1, max_fix_age_s=1.0) is None
     assert anchor.measurement_at(t + 200_001, max_fix_age_s=1.0) is None
     assert anchor.measurement_at(t + 100_000, max_fix_age_s=0.1) is None
     assert anchor.measurement_at(t + 100_000, max_fix_age_s=1.0) is not None
@@ -345,3 +346,23 @@ def test_gyro_reference_breaks_the_ev_yaw_feedback_loop():
     # already turned, the heading runs past the truth (test M: 48 deg).
     assert abs(_heading_loop(use_gyro=False)) > 2.0
     assert abs(_heading_loop(use_gyro=True)) < 0.1
+
+
+def test_window_midpoint_position_from_an_earlier_interval():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R, heading_sigma_unknown_rad=0.0)
+    _, pos, t = _fly(anchor, 3, v=(0.0, 0.0))
+    start = t
+    for _ in range(4):
+        anchor.propagate(t, t + 100_000, (2.0, 0.0), VO_COV)
+        t += 100_000
+    # Midpoint of a 4-interval window: inside the second interval.
+    m = anchor.measurement_at(start + 150_000, max_fix_age_s=10.0)
+    assert m is not None
+    assert m.position_ne_m == pytest.approx((pos[0] + 0.3, pos[1]), abs=1e-9)
+    # The state of that time, not the later (larger) end covariance.
+    assert np.trace(m.covariance_ne_m2) < np.trace(anchor.status().covariance_ne_m2)
+    # Before the lock-time interval: nothing stored.
+    assert anchor.measurement_at(start - DT - 1, max_fix_age_s=10.0) is None
+    # A VO gap clears the history: no position across it.
+    anchor.propagate(t + 50_000, t + 150_000, (2.0, 0.0), VO_COV)
+    assert anchor.measurement_at(start + 150_000, max_fix_age_s=10.0) is None

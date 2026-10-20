@@ -64,6 +64,7 @@ def estimate_ground_motion(
     min_inliers: int = 20,
     min_inlier_ratio: float = 0.60,
     max_horizontal_speed_m_s: float = 15.0,
+    feature_depth_m=None,
 ) -> GroundMotionEstimate:
     """LK tracking + forward/backward test + RANSAC partial-affine plane motion.
 
@@ -71,6 +72,13 @@ def estimate_ground_motion(
     Translation at the calibrated principal point is converted to motion of
     the camera with the opposite sign; 2D orientation is an explicit calibration.
     No absolute coordinates, VIO or map matching are implied.
+
+    ``feature_depth_m``: optional callable, inlier pixels of the previous
+    image (N x 2) -> their depths along the optical axis (m), e.g. from a
+    DSM (``SurfaceDepth``). The camera translation is then solved by least
+    squares with each point's own depth, instead of one height for the
+    whole frame: d_u = (-f t_x + x t_z) / Z - w y, d_v = (-f t_y + y t_z) / Z
+    + w x (x, y from the principal point; w: residual roll about the axis).
     """
     def reject(reason: str, tracked: int = 0, inliers: int = 0) -> GroundMotionEstimate:
         return GroundMotionEstimate(
@@ -161,6 +169,22 @@ def estimate_ground_motion(
         -pixel_shift[0] * height_agl_m / (calibration.focal_x_px * dt_s),
         -pixel_shift[1] * height_agl_m / (calibration.focal_y_px * dt_s),
     ])
+    if feature_depth_m is not None:
+        try:
+            depth = np.asarray(feature_depth_m(inliers), dtype=np.float64).reshape(-1)
+        except ValueError:
+            return reject("FEATURE_DEPTH_FAILED", tracked, n_inlier)
+        if depth.shape != (len(inliers),) or not np.isfinite(depth).all() or np.any(depth <= 0.5):
+            return reject("FEATURE_DEPTH_FAILED", tracked, n_inlier)
+        x = inliers[:, 0] - principal[0]
+        y = inliers[:, 1] - principal[1]
+        flow = target - inliers
+        fx, fy = calibration.focal_x_px, calibration.focal_y_px
+        zero = np.zeros_like(x)
+        a = np.vstack([np.column_stack([-fx / depth, zero, x / depth, -y]),
+                       np.column_stack([zero, -fy / depth, y / depth, x * fy / fx])])
+        solution, *_ = np.linalg.lstsq(a, np.concatenate([flow[:, 0], flow[:, 1]]), rcond=None)
+        image_plane_speed = solution[:2] / dt_s
     velocity_body = np.asarray(calibration.image_to_body_xy) @ image_plane_speed
     if not np.isfinite(velocity_body).all():
         return reject("NUMERICAL_FAILURE", tracked, n_inlier)

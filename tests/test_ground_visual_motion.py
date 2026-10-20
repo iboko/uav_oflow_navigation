@@ -91,3 +91,30 @@ def test_concentrated_features_do_not_pass_geometric_gate():
         "INSUFFICIENT_SPATIAL_DISTRIBUTION",
         "TOO_FEW_RELIABLE_TRACKS",
     )
+
+
+def test_feature_depths_remove_parallax_scale_error():
+    # Left half: ground at 100 m; right half: a roof at 75 m. The same
+    # camera translation moves the roof 4/3 as far in the image.
+    image = textured_frame()
+    move = np.float32([[1, 0, 3.0], [0, 1, 0]])
+    roof = np.float32([[1, 0, 4.0], [0, 1, 0]])
+    warped = cv2.warpAffine(image, move, (640, 480))
+    warped[:, 330:] = cv2.warpAffine(image, roof, (640, 480))[:, 330:]
+    truth = -3.0 * 100.0 / (1400.0 * 0.2)
+    plain = estimate_ground_motion(image, warped, dt_s=0.2, height_agl_m=100.0, calibration=calibration())
+    assert plain.valid, plain
+    assert abs(plain.velocity_body_x_m_s - truth) > 0.08
+    out = estimate_ground_motion(image, warped, dt_s=0.2, height_agl_m=100.0, calibration=calibration(),
+                                 feature_depth_m=lambda p: np.where(p[:, 0] < 325, 100.0, 75.0))
+    assert out.valid, out
+    assert out.velocity_body_x_m_s == pytest.approx(truth, abs=0.03)
+    assert out.velocity_body_y_m_s == pytest.approx(0.0, abs=0.03)
+
+
+def test_feature_depth_failure_rejects_the_pair():
+    image = textured_frame()
+    warped = cv2.warpAffine(image, np.float32([[1, 0, 3.0], [0, 1, 0]]), (640, 480))
+    out = estimate_ground_motion(image, warped, dt_s=0.2, height_agl_m=100.0, calibration=calibration(),
+                                 feature_depth_m=lambda p: np.full(len(p), np.nan))
+    assert not out.valid and out.reason == "FEATURE_DEPTH_FAILED"

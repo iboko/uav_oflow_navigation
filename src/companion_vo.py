@@ -12,10 +12,22 @@ TIMESYNC. Выход: трехмерная скорость в осях корп
 дальномеру на том же интервале: это измерение, а не подставленное
 значение (допущение ровной земли между двумя отсчетами). Без высоты
 по обе стороны интервала измерение не выдается.
+
+Options (3D swiss scene, offline replay of recorded frames,
+tools/replay_vo_frames.py): with a surface model in the odometry each
+feature gets its DSM depth (camera altitude = rangefinder height + DSM at
+the position given with the frame); ``window_pairs`` > 1 sends the mean
+velocity over that many contiguous pairs, stamped at the window midpoint.
+The window cancels a ~2.5 Hz error from the frame-to-frame tilt
+(EKF2 attitude and integrated gyro alike), which integrates to almost no
+position error but dominates the per-pair velocity error. In the closed
+loop the window's ~165 ms delay made the test flights swing at route
+corners (docs/SWISS_SCENE_SITL_RU.md): keep 1.
 """
 from __future__ import annotations
 
 import bisect
+from collections import deque
 from dataclasses import dataclass
 from math import cos, isfinite
 
@@ -97,13 +109,21 @@ class BodyVelocityMeasurement:
     vd_m_s: float
     height_mid_m: float = float("nan")   # над ровной землей, середина интервала
     rpy_mid: tuple[float, float, float] = (float("nan"),) * 3  # ориентация автопилота, середина
+    # NED horizontal velocity of what is sent (the window mean with
+    # window_pairs > 1); ``vo`` stays the last pair (anchor propagation).
+    velocity_ne_sent: tuple[float, float] = (float("nan"),) * 2
+    pairs_in_window: int = 1
 
 
 class CompanionVo:
     def __init__(self, odometry: ContinuousPlanarOdometry, *, height_sigma_m: float = 0.02,
                  max_tilt_rad: float = 0.45, min_range_rate_dt_s: float = 0.02,
-                 min_height_m: float = 0.5) -> None:
+                 min_height_m: float = 0.5, window_pairs: int = 1) -> None:
+        if window_pairs < 1:
+            raise ValueError("window_pairs must be >= 1")
         self.vo = odometry
+        self._window_pairs = window_pairs
+        self._window: deque = deque(maxlen=window_pairs)
         self.attitude = History(max_gap_us=50_000)   # кватернион FRD->NED
         self.distance = History(max_gap_us=150_000)  # дальность по оси дальномера, м
         self.clock = TimeOffset()
@@ -155,7 +175,9 @@ class CompanionVo:
         # ровной землей — проекция на вертикаль.
         return roll, pitch, yaw, distance * cos(roll) * cos(pitch)
 
-    def process(self, companion_t_us: int, gray: np.ndarray) -> BodyVelocityMeasurement | None:
+    def process(self, companion_t_us: int, gray: np.ndarray,
+                position_ne_m: tuple[float, float] | None = None) -> BodyVelocityMeasurement | None:
+        """``position_ne_m``: estimated horizontal position (DSM lookup), if any."""
         if not self.clock.valid:
             self.count("NO_TIME_SYNC")
             return None
@@ -169,7 +191,16 @@ class CompanionVo:
             self.count("BELOW_MIN_HEIGHT")
             self.vo.reject_frame(companion_t_us, "BELOW_MIN_HEIGHT")
             return None
-        result = self.vo.process(VisualFrame(companion_t_us, gray, height, yaw, roll, pitch))
+        ne, alt = None, None
+        surface = self.vo.surface
+        if surface is not None and position_ne_m is not None and all(isfinite(v) for v in position_ne_m):
+            ne = (float(position_ne_m[0]), float(position_ne_m[1]))
+            # The rangefinder (body down) hits the surface off the nadir when
+            # tilted: sample the DSM at that point (50 m, 0.2 rad: 10 m away).
+            down = body_to_ned(roll, pitch, yaw)[:, 2]
+            slant = height / down[2]
+            alt = height + float(surface.height_at(ne[0] + slant * down[0], ne[1] + slant * down[1])[0])
+        result = self.vo.process(VisualFrame(companion_t_us, gray, height, yaw, roll, pitch, ne, alt))
         self._heights[companion_t_us] = height
         for t in [t for t in self._heights if t < companion_t_us - 2_000_000]:
             del self._heights[t]
@@ -183,15 +214,29 @@ class CompanionVo:
             self.count("NO_RANGE_RATE")
             return None
         vd = -(height - h0) / dt
-        var_vd = 2.0 * self._sigma_h ** 2 / dt ** 2
-        mid = self._state_at((t0 + t1) // 2 + self.clock.offset_us)
+        # Window of contiguous pairs (same segment, each starting where the
+        # previous ended); a gap restarts it.
+        if self._window and (self._window[-1][1] != t0 or self._window[-1][6] != result.segment_id):
+            self._window.clear()
+        self._window.append((t0, t1, result.vn_m_s, result.ve_m_s, vd,
+                             (result.velocity_cov_nn, result.velocity_cov_ne, result.velocity_cov_ee),
+                             result.segment_id))
+        w0, w1 = self._window[0][0], self._window[-1][1]
+        span = (w1 - w0) * 1e-6
+        weights = [(e[1] - e[0]) * 1e-6 / span for e in self._window]
+        vn, ve, vdw = (sum(wk * e[k] for wk, e in zip(weights, self._window)) for k in (2, 3, 4))
+        # Model covariance of the mean: the per-pair mean, not divided by
+        # the pair count (the errors of neighbouring pairs are correlated).
+        cnn, cne, cee = (sum(wk * e[5][k] for wk, e in zip(weights, self._window)) for k in range(3))
+        var_vd = 2.0 * self._sigma_h ** 2 / span ** 2
+        mid = self._state_at((w0 + w1) // 2 + self.clock.offset_us)
         if mid is None:
             self.count("NO_ATTITUDE_OR_RANGE")
             return None
         r_nb = body_to_ned(mid[0], mid[1], mid[2])
-        v_ned = np.array([result.vn_m_s, result.ve_m_s, vd])
-        cov_ned = np.array([[result.velocity_cov_nn, result.velocity_cov_ne, 0.0],
-                            [result.velocity_cov_ne, result.velocity_cov_ee, 0.0],
+        v_ned = np.array([vn, ve, vdw])
+        cov_ned = np.array([[cnn, cne, 0.0],
+                            [cne, cee, 0.0],
                             [0.0, 0.0, var_vd]])
         v_body = r_nb.T @ v_ned
         cov_body = r_nb.T @ cov_ned @ r_nb
@@ -199,9 +244,10 @@ class CompanionVo:
             self.count("NONFINITE")
             return None
         self.count("PUBLISHED")
-        return BodyVelocityMeasurement((t0 + t1) // 2, tuple(float(v) for v in v_body),
-                                       tuple(float(cov_body[i, i]) for i in range(3)), result, vd,
-                                       float(mid[3]), (float(mid[0]), float(mid[1]), float(mid[2])))
+        return BodyVelocityMeasurement((w0 + w1) // 2, tuple(float(v) for v in v_body),
+                                       tuple(float(cov_body[i, i]) for i in range(3)), result, float(vdw),
+                                       float(mid[3]), (float(mid[0]), float(mid[1]), float(mid[2])),
+                                       (float(vn), float(ve)), len(self._window))
 
 
 class VelocityJumpGate:
