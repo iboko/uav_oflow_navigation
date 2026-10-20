@@ -40,6 +40,7 @@ EKF2 получает и это положение, и скорость VO. Ко
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from math import hypot, isfinite
 
@@ -117,6 +118,9 @@ class MapAnchor:
         self._interval_velocity_ne = np.zeros(2)
         self._interval_velocity_cov = np.eye(2)
         self._interval_heading_sigma = 0.0
+        # States at the end of the last few superseded intervals: a VO
+        # message stamped at a window midpoint lies before the latest one.
+        self._history: deque = deque(maxlen=16)
         # Heading of the autopilot (used by VO for N/E) relative to the map
         # frame, measured by the map fixes: magnetometer headings are off by
         # 5-10 deg, which rotates every VO displacement.
@@ -176,6 +180,12 @@ class MapAnchor:
         if gap_s < -1e-3:
             self._count("BAD_VO_INTERVAL")
             return
+        if self._p is not None and gap_s <= 1e-3 and self._t_us:
+            self._history.append((self._interval_start_us, self._t_us, self._p.copy(), self._cov.copy(),
+                                  self._interval_velocity_ne.copy(), self._interval_velocity_cov.copy(),
+                                  self._interval_heading_sigma, self.last_fix_us))
+        else:
+            self._history.clear()
         self._interval_start_us = t0_us
         self._interval_velocity_ne = rot @ v
         self._interval_velocity_cov = c.copy()
@@ -368,7 +378,7 @@ class MapAnchor:
                             self.heading_offset_rad)
 
     def measurement_at(self, timestamp_us: int, *, max_fix_age_s: float) -> AnchorMeasurement | None:
-        """Map-backed position within the most recent VO interval only.
+        """Map-backed position within the most recent VO intervals only.
 
         A midpoint VO message must use the same heading-corrected velocity
         used by propagate(). No extrapolation outside the stored interval.
@@ -378,20 +388,30 @@ class MapAnchor:
         """
         if not isfinite(max_fix_age_s) or max_fix_age_s <= 0:
             raise ValueError("Возраст привязки должен быть конечным и положительным")
-        if (self._p is None or not isfinite(timestamp_us)
-                or not self._interval_start_us <= timestamp_us <= self._t_us
-                or not 0 <= self._t_us - self.last_fix_us <= max_fix_age_s * 1e6):
+        if self._p is None or not isfinite(timestamp_us):
             return None
-        back_s = (self._t_us - timestamp_us) * 1e-6
-        back = self._interval_velocity_ne * back_s
-        cov = self._cov.copy()
+        if self._interval_start_us <= timestamp_us <= self._t_us:
+            state = (self._interval_start_us, self._t_us, self._p, self._cov, self._interval_velocity_ne,
+                     self._interval_velocity_cov, self._interval_heading_sigma, self.last_fix_us)
+        else:
+            # An earlier interval: its end state as it was then (later fixes
+            # are not applied backwards).
+            state = next((h for h in reversed(self._history) if h[0] <= timestamp_us <= h[1]), None)
+            if state is None:
+                return None
+        t0, t1, p, cov0, v_ne, v_cov, heading_sigma, last_fix = state
+        if not 0 <= t1 - last_fix <= max_fix_age_s * 1e6:
+            return None
+        back_s = (t1 - timestamp_us) * 1e-6
+        back = v_ne * back_s
+        cov = cov0.copy()
         if back_s > 0:
-            q = self._interval_velocity_cov * back_s ** 2 + np.eye(2) * (
-                self._scale_sigma ** 2 + self._interval_heading_sigma ** 2) * float(back @ back)
+            q = v_cov * back_s ** 2 + np.eye(2) * (
+                self._scale_sigma ** 2 + heading_sigma ** 2) * float(back @ back)
             # ||C_p,d + C_d,p|| <= 2 sqrt(lambda_max(P) lambda_max(Q)).
             cross_bound = 2 * np.sqrt(np.linalg.eigvalsh(cov).max() * np.linalg.eigvalsh(q).max())
             cov += q + np.eye(2) * cross_bound
-        position = self._p - back
+        position = p - back
         return AnchorMeasurement(int(timestamp_us), tuple(float(x) for x in position),
                                  tuple(tuple(float(x) for x in row) for row in cov))
 
