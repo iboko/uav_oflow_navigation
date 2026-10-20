@@ -196,10 +196,10 @@ def main() -> None:
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
     ap.add_argument("--vo-surface-depth", action="store_true",
                     help="VO: each feature's depth on the --surface DSM (needs --surface, --map-georef) "
-                         "instead of one rangefinder height for the frame")
+                         "instead of one rangefinder height for the frame (swiss tests: safe, no route gain)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="send the mean VO velocity over this many contiguous frame pairs (window midpoint "
-                         "stamp; keep its age under --max-latency-ms and EKF2_DELAY_MAX)")
+                         "stamp); keep 1: 4 pairs made the swiss test flights swing at the route corners")
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
                     help="added to every camera frame stamp before use; keep 0: the apparent 105 ms VO lead "
                          "(tools/measure_frame_time_shift.py) applied here made the test flights diverge")
