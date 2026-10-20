@@ -193,6 +193,10 @@ def main() -> None:
                          "without GNSS from the rangefinder")
     ap.add_argument("--msckf-calibration", type=Path,
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
+    ap.add_argument("--vo-calibration", type=Path,
+                    help="JSON from tools/calibrate_vo_covariance.py: horizontal variance scale of the camera VO "
+                         "(separate calibration flights); applied to what EKF2 and the map anchor get, the log "
+                         "keeps the model variance")
     ap.add_argument("--msckf-record", type=Path,
                     help="JSON lines: IMU samples and per-frame MSCKF inputs (offline replay)")
     ap.add_argument("--log", type=Path)
@@ -230,6 +234,9 @@ def main() -> None:
     if args.msckf_calibration:
         mc = json.loads(args.msckf_calibration.read_text())
         msckf_scale = (float(mc["horizontal"]["scale"]), float(mc["vertical"]["scale"]))
+    vo_scale = 1.0
+    if args.vo_calibration:
+        vo_scale = float(json.loads(args.vo_calibration.read_text())["horizontal"]["scale"])
     if log:
         log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers,jump_rejected\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
@@ -417,7 +424,8 @@ def main() -> None:
             if out is not None and anchor is not None:
                 r = out.vo
                 v_prop = (r.vn_m_s, r.ve_m_s)
-                c_prop = ((r.velocity_cov_nn, r.velocity_cov_ne), (r.velocity_cov_ne, r.velocity_cov_ee))
+                k = vo_scale if msckf is None else 1.0
+                c_prop = ((k * r.velocity_cov_nn, k * r.velocity_cov_ne), (k * r.velocity_cov_ne, k * r.velocity_cov_ee))
                 if vo_rejected:
                     # Across a rejected interval: the last accepted velocity,
                     # its variance grown by the possible acceleration.
@@ -498,6 +506,9 @@ def main() -> None:
             nan = float("nan")
             cov = [0.0] * 21
             cov[0], cov[6], cov[11] = out.variance_frd
+            if msckf is None:
+                cov[0] *= vo_scale
+                cov[6] *= vo_scale
             cov[15] = cov[18] = cov[20] = nan
             velocity = list(out.velocity_frd)
             if vo_rejected:

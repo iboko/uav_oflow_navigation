@@ -525,6 +525,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("px4_dir", type=Path)
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
+    ap.add_argument("--vo-calibration", type=Path,
+                    help="companion: camera-VO variance scale (tools/calibrate_vo_covariance.py)")
     ap.add_argument("--ev-yaw", action="store_true",
                     help="send the map-referenced heading to EKF2 (EKF2_EV_CTRL bit 3) in any mode")
     ap.add_argument("--mag-decl-error-deg", type=float, default=12.0,
@@ -664,6 +666,8 @@ def main() -> None:
                "--orthophoto", str(map_png), "--map-georef", str(georef),
                "--map-log", str(args.out / "companion_map.csv"), "--map-control", str(control),
                "--save-frames", str(args.out / "frames")]
+        if args.vo_calibration:
+            cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
         cmd += ["--map-mode", "observe"] if args.mode == "calibrate" else \
             ["--map-mode", "fuse", "--map-calibration", str(args.calibration.resolve())]
         if args.ev_yaw:
