@@ -525,6 +525,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("px4_dir", type=Path)
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
+    ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
+                    help="companion: camera frame stamp shift (tools/measure_frame_time_shift.py)")
     ap.add_argument("--vo-calibration", type=Path,
                     help="companion: camera-VO variance scale (tools/calibrate_vo_covariance.py)")
     ap.add_argument("--ev-yaw", action="store_true",
@@ -668,6 +670,8 @@ def main() -> None:
                "--save-frames", str(args.out / "frames")]
         if args.vo_calibration:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
+        if args.frame_time_shift_ms:
+            cmd += ["--frame-time-shift-ms", str(args.frame_time_shift_ms)]
         cmd += ["--map-mode", "observe"] if args.mode == "calibrate" else \
             ["--map-mode", "fuse", "--map-calibration", str(args.calibration.resolve())]
         if args.ev_yaw:
