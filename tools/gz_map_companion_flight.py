@@ -527,6 +527,8 @@ def main() -> None:
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
                     help="companion: camera frame stamp shift (tools/measure_frame_time_shift.py)")
+    ap.add_argument("--save-every", type=int, default=75,
+                    help="companion: save every N-th camera frame (1: all, for offline VO replay)")
     ap.add_argument("--vo-calibration", type=Path,
                     help="companion: camera-VO variance scale (tools/calibrate_vo_covariance.py)")
     ap.add_argument("--ev-yaw", action="store_true",
@@ -667,7 +669,7 @@ def main() -> None:
                "--log", str(args.out / "companion_vo.csv"), "--focal-error", str(args.focal_error),
                "--orthophoto", str(map_png), "--map-georef", str(georef),
                "--map-log", str(args.out / "companion_map.csv"), "--map-control", str(control),
-               "--save-frames", str(args.out / "frames")]
+               "--save-frames", str(args.out / "frames"), "--save-every", str(args.save_every)]
         if args.vo_calibration:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
         if args.frame_time_shift_ms:

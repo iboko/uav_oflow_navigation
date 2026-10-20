@@ -14,7 +14,8 @@ import numpy as np
 
 from .ground_visual_motion import CameraCalibration, GroundMotionEstimate, estimate_ground_motion
 from .camera_rotation_compensation import (CameraMountCalibration, align_current_to_previous,
-                                           camera_delta_to_center_ned)
+                                           body_to_ned, camera_delta_to_center_ned)
+from .surface_depth import SurfaceDepth
 from .velocity_uncertainty import VelocityErrorAssumptions, modeled_velocity_covariance_ned
 
 
@@ -32,6 +33,10 @@ class VisualFrame:
     yaw_rad: float
     roll_rad: float = 0.0
     pitch_rad: float = 0.0
+    # Only with a surface model: camera horizontal position (m, the DSM's
+    # north/east) and altitude above the DSM datum (m, up).
+    position_ne_m: tuple[float, float] | None = None
+    altitude_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,7 @@ class ContinuousPlanarOdometry:
         min_inliers: int = 20,
         min_inlier_ratio: float = 0.60,
         pixel_resolution_floor: float = 0.5,
+        surface: "SurfaceDepth | None" = None,
     ) -> None:
         if not calibration.valid():
             raise ValueError("Неверные параметры камеры или ориентации ее осей")
@@ -106,6 +112,9 @@ class ContinuousPlanarOdometry:
         if (velocity_error_assumptions is not None and
                 not velocity_error_assumptions.valid()):
             raise ValueError("Недопустимые предположения о погрешностях")
+        if surface is not None and camera_mount is None:
+            raise ValueError("Feature depths from a surface model need the 3D camera mount")
+        self._surface = surface
         self._velocity_errors = velocity_error_assumptions
         self._offset = tuple(float(v) for v in offset)
         self._calib = calibration
@@ -175,7 +184,24 @@ class ContinuousPlanarOdometry:
     def _snapshot(frame: VisualFrame) -> VisualFrame:
         # Camera drivers may reuse frame buffers between calls.
         return VisualFrame(frame.timestamp_us, frame.gray.copy(), frame.height_agl_m,
-                           frame.yaw_rad, frame.roll_rad, frame.pitch_rad)
+                           frame.yaw_rad, frame.roll_rad, frame.pitch_rad,
+                           frame.position_ne_m, frame.altitude_m)
+
+    def _depth_function(self, frame: VisualFrame):
+        """Feature depths in ``frame`` from the surface model, or None."""
+        if (self._surface is None or frame.position_ne_m is None or frame.altitude_m is None
+                or not all(isfinite(v) for v in (*frame.position_ne_m, frame.altitude_m))):
+            return None
+        calib, mount, surface = self._calib, self._mount, self._surface
+        rpy = (frame.roll_rad, frame.pitch_rad, frame.yaw_rad)
+        body_c = np.asarray(mount.body_from_camera, dtype=np.float64)
+        # Camera position: the body position plus the rotated lever arm.
+        lever = body_to_ned(*rpy) @ np.asarray(self._offset)
+        ne = (frame.position_ne_m[0] + lever[0], frame.position_ne_m[1] + lever[1])
+        alt = frame.altitude_m - lever[2]
+        return lambda pts: surface.feature_depths(
+            pts, focal_px=(calib.focal_x_px, calib.focal_y_px), center_px=(calib.center_x_px, calib.center_y_px),
+            body_from_camera=body_c, rpy=rpy, position_ne_m=ne, altitude_m=alt)
 
     def process(self, frame: VisualFrame) -> VisualOdomResult:
         if not self._frame_valid(frame):
@@ -257,6 +283,7 @@ class ContinuousPlanarOdometry:
             self._calib, roll_rad=previous.roll_rad, pitch_rad=previous.pitch_rad,
             max_tilt_rad=self._max_tilt, min_inliers=self._min_inliers,
             min_inlier_ratio=self._min_ratio,
+            feature_depth_m=self._depth_function(previous),
         )
         if not motion.valid:
             # The new frame can seed a new segment but cannot bridge missing
