@@ -527,6 +527,10 @@ def main() -> None:
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
                     help="companion: camera frame stamp shift (tools/measure_frame_time_shift.py)")
+    ap.add_argument("--vo-surface-depth", action="store_true",
+                    help="companion: VO feature depths on the DSM (with --dsm-surface)")
+    ap.add_argument("--vo-window-pairs", type=int, default=1,
+                    help="companion: mean VO velocity over this many frame pairs")
     ap.add_argument("--save-every", type=int, default=75,
                     help="companion: save every N-th camera frame (1: all, for offline VO replay)")
     ap.add_argument("--vo-calibration", type=Path,
@@ -672,6 +676,12 @@ def main() -> None:
                "--save-frames", str(args.out / "frames"), "--save-every", str(args.save_every)]
         if args.vo_calibration:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
+        if args.vo_window_pairs != 1:
+            cmd += ["--vo-window-pairs", str(args.vo_window_pairs)]
+        if args.vo_surface_depth:
+            if not args.dsm_surface:
+                raise SystemExit("--vo-surface-depth needs --dsm-surface")
+            cmd += ["--vo-surface-depth"]
         if args.frame_time_shift_ms:
             cmd += ["--frame-time-shift-ms", str(args.frame_time_shift_ms)]
         cmd += ["--map-mode", "observe"] if args.mode == "calibrate" else \

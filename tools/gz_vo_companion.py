@@ -50,6 +50,7 @@ from src.feature_tracker import KltTracker  # noqa: E402
 from src.imu_preintegration import ImuReading  # noqa: E402
 from src.msckf_vio import PinholeCamera  # noqa: E402
 from src.continuous_visual_odometry import ContinuousPlanarOdometry, VisualOdomResult  # noqa: E402
+from src.surface_depth import SurfaceDepth  # noqa: E402
 from src.ground_visual_motion import CameraCalibration  # noqa: E402
 from src.ortho_ncc_localizer import OrthoNccLocalizer  # noqa: E402
 from src.orthophoto_localization import MapGeoReference, OrthophotoLocalizer, OrthophotoTile  # noqa: E402
@@ -193,6 +194,12 @@ def main() -> None:
                          "without GNSS from the rangefinder")
     ap.add_argument("--msckf-calibration", type=Path,
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
+    ap.add_argument("--vo-surface-depth", action="store_true",
+                    help="VO: each feature's depth on the --surface DSM (needs --surface, --map-georef) "
+                         "instead of one rangefinder height for the frame")
+    ap.add_argument("--vo-window-pairs", type=int, default=1,
+                    help="send the mean VO velocity over this many contiguous frame pairs (window midpoint "
+                         "stamp; keep its age under --max-latency-ms and EKF2_DELAY_MAX)")
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
                     help="added to every camera frame stamp before use; keep 0: the apparent 105 ms VO lead "
                          "(tools/measure_frame_time_shift.py) applied here made the test flights diverge")
@@ -205,6 +212,10 @@ def main() -> None:
     ap.add_argument("--log", type=Path)
     ap.add_argument("--status-s", type=float, default=5.0)
     args = ap.parse_args()
+    if args.vo_surface_depth and not (args.surface and args.map_georef):
+        ap.error("--vo-surface-depth needs --surface and --map-georef")
+    if args.vo_window_pairs < 1:
+        ap.error("--vo-window-pairs must be >= 1")
     if args.map_mode != "off" and not (args.orthophoto and args.map_georef):
         ap.error("--map-mode needs --orthophoto and --map-georef")
     if args.map_mode == "fuse" and not args.map_calibration:
@@ -335,14 +346,18 @@ def main() -> None:
                 continue
             h, w = first.shape
             cal = calibration(w, h, args.hfov, args.focal_error)
+            vo_surface = None
+            if args.vo_surface_depth:
+                vo_surface = SurfaceDepth.from_georef(np.load(args.surface),
+                                                      json.loads(args.map_georef.read_text()))
             vo = ContinuousPlanarOdometry(
                 cal, camera_mount=CameraMountCalibration(BODY_FROM_CAMERA),
                 camera_offset_body_m=tuple(args.camera_offset_frd),
                 velocity_error_assumptions=VelocityErrorAssumptions(
                     fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
-                max_tilt_rad=0.25, max_pair_dt_s=0.25)
-            pipeline = CompanionVo(vo)
+                max_tilt_rad=0.25, max_pair_dt_s=0.25, surface=vo_surface)
+            pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs)
             jump_gate = None if args.no_vo_jump_gate or args.estimator == "msckf" else VelocityJumpGate()
             if args.estimator == "msckf":
                 msckf = CompanionMsckf(
@@ -422,10 +437,15 @@ def main() -> None:
                 if out is not None:
                     last_msckf_t = t_frame
             else:
-                out = pipeline.process(t_frame, gray)
+                # DSM lookup position: the anchor once locked, else the autopilot's.
+                st = anchor.status() if anchor is not None else None
+                pos = st.position_ne_m if st is not None and st.locked else local_ne
+                out = pipeline.process(t_frame, gray, position_ne_m=(float(pos[0]), float(pos[1])))
             vo_rejected = False
-            if out is not None and jump_gate is not None and not jump_gate.check(out.time_us, (out.vo.vn_m_s,
-                                                                                            out.vo.ve_m_s)):
+            # The gate checks what is sent: the window mean when windowing.
+            v_gate = out.velocity_ne_sent if out is not None and out.pairs_in_window > 1 else \
+                ((out.vo.vn_m_s, out.vo.ve_m_s) if out is not None else None)
+            if out is not None and jump_gate is not None and not jump_gate.check(out.time_us, v_gate):
                 vo_rejected = True
                 pipeline.count("VO_JUMP_REJECTED")
             if out is not None and anchor is not None:

@@ -7,7 +7,9 @@ time; the report's ``time_offset_us`` moves them to the autopilot clock).
 The VO is the companion's ``ContinuousPlanarOdometry`` with the same
 settings; its inputs are chosen per run:
 
-  --attitude ekf|truth      roll/pitch/yaw for rotation compensation
+  --attitude ekf|truth|gyro roll/pitch/yaw for rotation compensation (gyro:
+                            frame-to-frame rotation from the integrated
+                            angular rate, pulled to EKF2 by --gyro-blend)
   --height range|truth      scale height (range: rangefinder, as onboard)
   --depth none|dsm          one height per frame, or each feature's depth on the DSM
   --position ekf|truth      horizontal position for the DSM lookup
@@ -67,24 +69,58 @@ def interp_quat(t, data) -> np.ndarray:
     return q / np.linalg.norm(q, axis=1, keepdims=True)
 
 
-def load_inputs(flight: Path, surface: SurfaceDepth | None):
+def _qmul(a, b):
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                     w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
+
+
+def gyro_attitude(t: np.ndarray, q_ekf: np.ndarray, rate, blend: float) -> np.ndarray:
+    """Attitude chained by the body angular rate between frames, pulled to EKF2.
+
+    Frame-to-frame rotation comes from the integrated (bias-corrected)
+    rate; each frame the chain moves ``blend`` of the way to the EKF2
+    attitude (complementary filter), so its absolute error stays bounded.
+    """
+    ts = rate["timestamp_sample"].astype(float) if "timestamp_sample" in rate else rate["timestamp"].astype(float)
+    w = np.column_stack([rate[f"xyz[{i}]"] for i in range(3)])
+    q = q_ekf[0].copy()
+    out = [q]
+    for k in range(1, len(t)):
+        grid = np.linspace(t[k - 1], t[k], 9)
+        wk = np.column_stack([np.interp(grid, ts, w[:, i]) for i in range(3)])
+        for j in range(8):
+            th = 0.5 * (wk[j] + wk[j + 1]) * (grid[j + 1] - grid[j]) * 1e-6
+            a = np.linalg.norm(th)
+            dq = np.r_[np.cos(a / 2), th / a * np.sin(a / 2)] if a > 1e-12 else np.r_[1.0, 0.5 * th]
+            q = _qmul(q, dq)
+        target = q_ekf[k] if np.dot(q_ekf[k], q) >= 0 else -q_ekf[k]
+        q = (1 - blend) * q + blend * target
+        q /= np.linalg.norm(q)
+        out.append(q)
+    return np.array(out)
+
+
+def load_inputs(flight: Path, surface: SurfaceDepth | None, attitude_shift_us: float = 0.0):
     from pyulog import ULog
     rep = _report(flight)
     offset = int(rep["companion_final_status"].get("time_offset_us") or 0)
     frames = sorted((flight / "frames").glob("*.png"), key=lambda p: int(p.stem))
     t = np.array([int(p.stem) + offset for p in frames], dtype=float)
     u = ULog(rep["ulog"], ["vehicle_attitude", "vehicle_attitude_groundtruth", "distance_sensor",
-                           "vehicle_local_position", "vehicle_local_position_groundtruth"])
+                           "vehicle_local_position", "vehicle_local_position_groundtruth",
+                           "vehicle_angular_velocity"])
     g = {x.name: x.data for x in u.data_list}
     ds, lp, gt = g["distance_sensor"], g["vehicle_local_position"], g["vehicle_local_position_groundtruth"]
     ip = lambda d, k: np.interp(t, d["timestamp"], d[k])  # noqa: E731
     inp = {"t": t, "frames": frames, "rep": rep,
-           "rpy_ekf": np.column_stack(quat_rpy(interp_quat(t, g["vehicle_attitude"]))),
+           "rpy_ekf": np.column_stack(quat_rpy(interp_quat(t + attitude_shift_us, g["vehicle_attitude"]))),
            "rpy_truth": np.column_stack(quat_rpy(interp_quat(t, g["vehicle_attitude_groundtruth"]))),
            "range": ip(ds, "current_distance"),
            "ne_ekf": np.column_stack([ip(lp, "x"), ip(lp, "y")]), "z_ekf": ip(lp, "z"),
            "ne_truth": np.column_stack([ip(gt, "x"), ip(gt, "y")]), "z_truth": ip(gt, "z"),
-           "gt": gt}
+           "gt": gt, "q_ekf": interp_quat(t + attitude_shift_us, g["vehicle_attitude"]), "rate": g["vehicle_angular_velocity"]}
     r, p = inp["rpy_ekf"][:, 0], inp["rpy_ekf"][:, 1]
     inp["range_v"] = inp["range"] * np.cos(r) * np.cos(p)
     if surface is not None:
@@ -103,7 +139,7 @@ def load_inputs(flight: Path, surface: SurfaceDepth | None):
 
 
 def replay(inp: dict, *, attitude="ekf", height="range", depth="none", position="ekf", altitude="range",
-           pair_step=1, surface: SurfaceDepth | None = None, hfov=1.2) -> dict:
+           pair_step=1, surface: SurfaceDepth | None = None, hfov=1.2, gyro_blend=0.05) -> dict:
     first = cv2.imread(str(inp["frames"][0]), cv2.IMREAD_GRAYSCALE)
     h, w = first.shape
     cal = calibration(w, h, hfov)
@@ -113,7 +149,15 @@ def replay(inp: dict, *, attitude="ekf", height="range", depth="none", position=
             fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
             yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
         max_tilt_rad=0.25, max_pair_dt_s=min(1.0, 0.25 * pair_step), surface=surface if depth == "dsm" else None)
-    rpy = inp[f"rpy_{attitude}"]
+    if attitude == "gyro":
+        rpy = np.column_stack(quat_rpy(gyro_attitude(inp["t"], inp["q_ekf"], inp["rate"], gyro_blend)))
+    elif attitude in ("tilt_truth", "yaw_truth"):
+        # Mixed: roll/pitch from one source, yaw from the other.
+        rpy = inp["rpy_ekf"].copy()
+        cols = [0, 1] if attitude == "tilt_truth" else [2]
+        rpy[:, cols] = inp["rpy_truth"][:, cols]
+    else:
+        rpy = inp[f"rpy_{attitude}"]
     hh = inp["range_v"] if height == "range" else inp["h_truth"]
     ne = inp[f"ne_{position}"]
     alt = inp.get(f"alt_{altitude}")
@@ -151,7 +195,10 @@ def replay(inp: dict, *, attitude="ekf", height="range", depth="none", position=
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("flight", type=Path)
-    ap.add_argument("--attitude", choices=("ekf", "truth"), default="ekf")
+    ap.add_argument("--attitude", choices=("ekf", "truth", "gyro", "tilt_truth", "yaw_truth"), default="ekf")
+    ap.add_argument("--gyro-blend", type=float, default=0.05)
+    ap.add_argument("--attitude-shift-ms", type=float, default=0.0,
+                    help="read the EKF2 attitude this much after the frame stamp")
     ap.add_argument("--height", choices=("range", "truth"), default="range")
     ap.add_argument("--depth", choices=("none", "dsm"), default="none")
     ap.add_argument("--position", choices=("ekf", "truth"), default="ekf")
@@ -166,9 +213,10 @@ def main(argv=None) -> int:
         surface = SurfaceDepth.from_georef(np.load(args.surface), json.loads(args.georef.read_text()))
     if args.depth == "dsm" and surface is None:
         ap.error("--depth dsm needs --surface and --georef")
-    inp = load_inputs(args.flight, surface)
+    inp = load_inputs(args.flight, surface, args.attitude_shift_ms * 1e3)
     res = replay(inp, attitude=args.attitude, height=args.height, depth=args.depth, position=args.position,
-                 altitude=args.altitude, pair_step=args.pair_step, surface=surface)
+                 altitude=args.altitude, pair_step=args.pair_step, surface=surface,
+                 gyro_blend=args.gyro_blend)
     if args.out:
         np.savetxt(args.out, res["errors"], delimiter=",", header="t_us,err_n,err_e,ref_vn,ref_ve", comments="")
     res.pop("errors")

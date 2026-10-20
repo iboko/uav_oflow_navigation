@@ -133,6 +133,10 @@ class ContinuousPlanarOdometry:
         self._east = 0.0
         self._resolution = 0.0
 
+    @property
+    def surface(self) -> "SurfaceDepth | None":
+        return self._surface
+
     def reset(self) -> None:
         """Явный разрыв относительной траектории."""
         self._restart(None)
