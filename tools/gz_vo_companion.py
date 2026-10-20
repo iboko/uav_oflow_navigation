@@ -193,6 +193,9 @@ def main() -> None:
                          "without GNSS from the rangefinder")
     ap.add_argument("--msckf-calibration", type=Path,
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
+    ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
+                    help="added to every camera frame stamp before use; keep 0: the apparent 105 ms VO lead "
+                         "(tools/measure_frame_time_shift.py) applied here made the test flights diverge")
     ap.add_argument("--vo-calibration", type=Path,
                     help="JSON from tools/calibrate_vo_covariance.py: horizontal variance scale of the camera VO "
                          "(separate calibration flights); applied to what EKF2 and the map anchor get, the log "
@@ -215,12 +218,16 @@ def main() -> None:
     node.subscribe(Clock, f"/world/{args.world}/clock",
                    lambda m: clock_us.__setitem__(0, m.sim.sec * 1_000_000 + m.sim.nsec // 1000))
 
+    # Frame stamp shift, default 0. The 105 ms the VO velocity appears to
+    # lead the truth (tools/measure_frame_time_shift.py) is not a stamp
+    # error: applying it made all three test flights diverge.
+    frame_shift_us = int(round(args.frame_time_shift_ms * 1000))
     def on_image(msg: Image) -> None:
         gray = to_gray(msg)
         if gray is None:
             return
         try:
-            frames.put_nowait((stamp_us(msg.header), gray))
+            frames.put_nowait((stamp_us(msg.header) + frame_shift_us, gray))
         except queue.Full:
             pass  # processing is behind: drop, the VO pair gate restarts the segment
     node.subscribe(Image, args.camera_topic, on_image)
