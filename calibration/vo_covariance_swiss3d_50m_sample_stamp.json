@@ -1,0 +1,55 @@
+{
+  "model": "variance = scale * camera-VO model variance (horizontal body axes; vertical untouched)",
+  "horizontal": {
+    "scale": 0.006539824057813366,
+    "bias_m_s": [
+      -0.027012965741398973,
+      -0.029923154152239284
+    ],
+    "fit_mean_nees_2d": 2.0,
+    "holdout_mean_nees_2d": 1.5271320540378273,
+    "holdout_coverage_95pct": 0.970132628876202,
+    "holdout_flight_details": {
+      "swcalV/f4": {
+        "samples": 3305,
+        "mean_nees_2d": 1.3279015976060662,
+        "fraction_within_chi2_2_95": 0.9700453857791226,
+        "bias_corrected_rmse_m_s": 0.15592385514854057
+      },
+      "swcalV/f5": {
+        "samples": 3593,
+        "mean_nees_2d": 1.7263625104695883,
+        "fraction_within_chi2_2_95": 0.9702198719732814,
+        "bias_corrected_rmse_m_s": 0.17774206655417985
+      }
+    },
+    "consistent_on_holdout": true
+  },
+  "vertical": {
+    "scale": 1.0
+  },
+  "fit_flights": [
+    "swcalV/f1",
+    "swcalV/f2",
+    "swcalV/f3"
+  ],
+  "holdout_flights": [
+    "swcalV/f4",
+    "swcalV/f5"
+  ],
+  "jump_gate_rejected_per_flight": {
+    "swcalV/f1": 9,
+    "swcalV/f2": 5,
+    "swcalV/f3": 2,
+    "swcalV/f4": 4,
+    "swcalV/f5": 3
+  },
+  "samples_per_flight": {
+    "swcalV/f1": 3462,
+    "swcalV/f2": 3628,
+    "swcalV/f3": 3575,
+    "swcalV/f4": 3305,
+    "swcalV/f5": 3593
+  },
+  "note": "simulated flights (Gazebo, 3D swiss scene, 50 m); not a sensor certification"
+}
