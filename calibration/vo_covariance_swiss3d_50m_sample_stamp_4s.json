@@ -1,0 +1,30 @@
+{
+  "model": "variance = scale * camera-VO model variance (horizontal body axes; vertical untouched)",
+  "horizontal": {
+    "scale": 0.0746,
+    "method": "equivalent white variance of the 4 s displacement error (correlated VO error), mean of fit flights",
+    "per_fit_flight_scale": {
+      "swcalV/f1": 0.0855,
+      "swcalV/f2": 0.0747,
+      "swcalV/f3": 0.0636
+    },
+    "holdout_scale_4s": {
+      "swcalV/f4": 0.0556,
+      "swcalV/f5": 0.0653
+    },
+    "per_sample_ml_scale": 0.006539824057813366
+  },
+  "vertical": {
+    "scale": 1.0
+  },
+  "fit_flights": [
+    "swcalV/f1",
+    "swcalV/f2",
+    "swcalV/f3"
+  ],
+  "holdout_flights": [
+    "swcalV/f4",
+    "swcalV/f5"
+  ],
+  "note": "chosen after tests U failed with the per-sample scale (EKF2 rejected 55 % of VO velocities); simulated flights"
+}
