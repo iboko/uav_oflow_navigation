@@ -194,7 +194,7 @@ def main() -> None:
                          "without GNSS from the rangefinder")
     ap.add_argument("--msckf-calibration", type=Path,
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
-    ap.add_argument("--attitude-stamp", choices=("publish", "sample"), default="publish",
+    ap.add_argument("--attitude-stamp", choices=("publish", "sample"), default="sample",
                     help="attitude for VO rotation compensation: ATTITUDE_QUATERNION (stamped at EKF2 "
                          "publication, 0-12 ms after the IMU sample) or the autopilot ODOMETRY (stamped at "
                          "the IMU sample)")

@@ -527,7 +527,7 @@ def main() -> None:
     ap.add_argument("--mode", choices=("calibrate", "combine", "test", "heading"), required=True)
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
                     help="companion: camera frame stamp shift (tools/measure_frame_time_shift.py)")
-    ap.add_argument("--attitude-stamp", choices=("publish", "sample"), default="publish",
+    ap.add_argument("--attitude-stamp", choices=("publish", "sample"), default="sample",
                     help="companion: VO attitude from ATTITUDE_QUATERNION (publish) or ODOMETRY (sample)")
     ap.add_argument("--vo-surface-depth", action="store_true",
                     help="companion: VO feature depths on the DSM (with --dsm-surface)")
@@ -678,8 +678,7 @@ def main() -> None:
                "--save-frames", str(args.out / "frames"), "--save-every", str(args.save_every)]
         if args.vo_calibration:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
-        if args.attitude_stamp != "publish":
-            cmd += ["--attitude-stamp", args.attitude_stamp]
+        cmd += ["--attitude-stamp", args.attitude_stamp]
         if args.vo_window_pairs != 1:
             cmd += ["--vo-window-pairs", str(args.vo_window_pairs)]
         if args.vo_surface_depth:
