@@ -89,8 +89,9 @@ def main(argv=None) -> int:
     ap.add_argument("--fit-flights", type=int, required=True)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
-    if not 2 <= args.fit_flights <= len(args.flights) - 2:
-        ap.error("need at least 2 fit and 2 held-out flights")
+    if not 3 <= args.fit_flights <= len(args.flights) - 2:
+        # calibrate_velocity_covariance needs 3 fitting flights.
+        ap.error("need at least 3 fit and 2 held-out flights")
     data = [body_errors(f) for f in args.flights]
     flights = [VelocityErrorFlight(f"{f.parent.name}/{f.name}", tuple(map(tuple, e)),
                                    tuple(((float(v[0]), 0.0), (0.0, float(v[1]))) for v in var))

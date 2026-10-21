@@ -194,6 +194,10 @@ def main() -> None:
                          "without GNSS from the rangefinder")
     ap.add_argument("--msckf-calibration", type=Path,
                     help="JSON from tools/calibrate_msckf_covariance.py: variance scales (separate flights)")
+    ap.add_argument("--attitude-stamp", choices=("publish", "sample"), default="sample",
+                    help="attitude for VO rotation compensation: ATTITUDE_QUATERNION (stamped at EKF2 "
+                         "publication, 0-12 ms after the IMU sample) or the autopilot ODOMETRY (stamped at "
+                         "the IMU sample)")
     ap.add_argument("--vo-surface-depth", action="store_true",
                     help="VO: each feature's depth on the --surface DSM (needs --surface, --map-georef) "
                          "instead of one rangefinder height for the frame (swiss tests: safe, no route gain)")
@@ -317,8 +321,14 @@ def main() -> None:
             if t == "TIMESYNC" and msg.get_srcComponent() == 1:
                 # Answer to our request, at its arrival time.
                 pipeline.clock.add(msg.ts1 // 1000, msg.tc1 // 1000, arrival)
+            elif (t == "ODOMETRY" and args.attitude_stamp == "sample" and msg.get_srcComponent() == 1
+                  and all(map(math.isfinite, msg.q))):
+                # The autopilot's own odometry: stamped at the IMU sample
+                # (vehicle_odometry.timestamp_sample).
+                pipeline.attitude.add(int(msg.time_usec), tuple(float(v) for v in msg.q))
             elif t == "ATTITUDE_QUATERNION":
-                pipeline.attitude.add(msg.time_boot_ms * 1000, (msg.q1, msg.q2, msg.q3, msg.q4))
+                if args.attitude_stamp == "publish":
+                    pipeline.attitude.add(msg.time_boot_ms * 1000, (msg.q1, msg.q2, msg.q3, msg.q4))
                 if gyro is not None:
                     gyro.add(msg.time_boot_ms * 1000, *quaternion_to_rpy(np.array([msg.q1, msg.q2, msg.q3, msg.q4])),
                              (msg.rollspeed, msg.pitchspeed, msg.yawspeed))
@@ -411,6 +421,8 @@ def main() -> None:
         if wall - last_rates > 5.0:
             streams = [(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE_QUATERNION, 100),
                        (mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR, 50)]
+            if args.attitude_stamp == "sample":
+                streams.append((mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY, 100))
             if msckf is not None:
                 streams.append((mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 200))
             for msg_id, hz in streams:

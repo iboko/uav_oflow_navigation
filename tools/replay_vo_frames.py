@@ -64,8 +64,10 @@ def quat_rpy(q: np.ndarray):
     return roll, pitch, yaw
 
 
-def interp_quat(t, data) -> np.ndarray:
-    q = np.column_stack([np.interp(t, data["timestamp"], data[f"q[{i}]"]) for i in range(4)])
+def interp_quat(t, data, stamp: str = "timestamp") -> np.ndarray:
+    ts = data[stamp].astype(float)
+    order = np.argsort(ts, kind="stable")
+    q = np.column_stack([np.interp(t, ts[order], data[f"q[{i}]"][order]) for i in range(4)])
     return q / np.linalg.norm(q, axis=1, keepdims=True)
 
 
@@ -102,7 +104,8 @@ def gyro_attitude(t: np.ndarray, q_ekf: np.ndarray, rate, blend: float) -> np.nd
     return np.array(out)
 
 
-def load_inputs(flight: Path, surface: SurfaceDepth | None, attitude_shift_us: float = 0.0):
+def load_inputs(flight: Path, surface: SurfaceDepth | None, attitude_shift_us: float = 0.0,
+                attitude_stamp: str = "timestamp"):
     from pyulog import ULog
     rep = _report(flight)
     offset = int(rep["companion_final_status"].get("time_offset_us") or 0)
@@ -115,12 +118,12 @@ def load_inputs(flight: Path, surface: SurfaceDepth | None, attitude_shift_us: f
     ds, lp, gt = g["distance_sensor"], g["vehicle_local_position"], g["vehicle_local_position_groundtruth"]
     ip = lambda d, k: np.interp(t, d["timestamp"], d[k])  # noqa: E731
     inp = {"t": t, "frames": frames, "rep": rep,
-           "rpy_ekf": np.column_stack(quat_rpy(interp_quat(t + attitude_shift_us, g["vehicle_attitude"]))),
+           "rpy_ekf": np.column_stack(quat_rpy(interp_quat(t + attitude_shift_us, g["vehicle_attitude"], attitude_stamp))),
            "rpy_truth": np.column_stack(quat_rpy(interp_quat(t, g["vehicle_attitude_groundtruth"]))),
            "range": ip(ds, "current_distance"),
            "ne_ekf": np.column_stack([ip(lp, "x"), ip(lp, "y")]), "z_ekf": ip(lp, "z"),
            "ne_truth": np.column_stack([ip(gt, "x"), ip(gt, "y")]), "z_truth": ip(gt, "z"),
-           "gt": gt, "q_ekf": interp_quat(t + attitude_shift_us, g["vehicle_attitude"]), "rate": g["vehicle_angular_velocity"]}
+           "gt": gt, "q_ekf": interp_quat(t + attitude_shift_us, g["vehicle_attitude"], attitude_stamp), "rate": g["vehicle_angular_velocity"]}
     r, p = inp["rpy_ekf"][:, 0], inp["rpy_ekf"][:, 1]
     inp["range_v"] = inp["range"] * np.cos(r) * np.cos(p)
     if surface is not None:
@@ -205,6 +208,8 @@ def main(argv=None) -> int:
     ap.add_argument("flight", type=Path)
     ap.add_argument("--attitude", choices=("ekf", "truth", "gyro", "tilt_truth", "yaw_truth"), default="ekf")
     ap.add_argument("--gyro-blend", type=float, default=0.05)
+    ap.add_argument("--attitude-stamp", choices=("timestamp", "timestamp_sample"), default="timestamp",
+                    help="EKF2 attitude time: publication (as ATTITUDE_QUATERNION.time_boot_ms) or IMU sample")
     ap.add_argument("--attitude-shift-ms", type=float, default=0.0,
                     help="read the EKF2 attitude this much after the frame stamp")
     ap.add_argument("--height", choices=("range", "truth"), default="range")
@@ -221,7 +226,7 @@ def main(argv=None) -> int:
         surface = SurfaceDepth.from_georef(np.load(args.surface), json.loads(args.georef.read_text()))
     if args.depth == "dsm" and surface is None:
         ap.error("--depth dsm needs --surface and --georef")
-    inp = load_inputs(args.flight, surface, args.attitude_shift_ms * 1e3)
+    inp = load_inputs(args.flight, surface, args.attitude_shift_ms * 1e3, args.attitude_stamp)
     res = replay(inp, attitude=args.attitude, height=args.height, depth=args.depth, position=args.position,
                  altitude=args.altitude, pair_step=args.pair_step, surface=surface,
                  gyro_blend=args.gyro_blend)
