@@ -610,6 +610,11 @@ def main() -> None:
     args = ap.parse_args()
     if args.mode in ("test", "heading") and not args.calibration:
         ap.error("--mode test/heading needs --calibration")
+    if args.map_outage_legs:
+        first, last = args.map_outage_legs
+        if args.mode not in ("test", "heading") or not 1 <= first <= last <= len(TEST_ROUTES[args.test_route]):
+            ap.error(f"--map-outage-legs needs a test route and 1 <= FIRST <= LAST <= "
+                     f"{len(TEST_ROUTES[args.test_route])}")
     params = dict(PARAMS, EKF2_EV_CTRL="13") if args.ev_yaw else dict(PARAMS)
     if args.mode == "heading":
         # A 3D magnetometer with estimated earth field absorbs a declination
