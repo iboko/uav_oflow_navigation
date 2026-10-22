@@ -533,6 +533,13 @@ def main() -> None:
                     help="companion: VO feature depths on the DSM (with --dsm-surface)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="companion: mean VO velocity over this many frame pairs")
+    ap.add_argument("--map-patch-at-boresight", action="store_true",
+                    help="companion: map patch centred on the optical axis (see gz_vo_companion.py)")
+    ap.add_argument("--map-max-tilt-rad", type=float, default=0.12, help="companion: map matching tilt limit")
+    ap.add_argument("--wind-ne-m-s", type=float, nargs=2, metavar=("NORTH", "EAST"),
+                    help="steady wind from reaching altitude on (drag force on the model, tools/gz_wind.py)")
+    ap.add_argument("--wind-gust-sigma", type=float, default=0.0, help="gust speed sigma per axis, m/s")
+    ap.add_argument("--wind-seed", type=int, default=0)
     ap.add_argument("--map-outage-legs", type=int, nargs=2, metavar=("FIRST", "LAST"),
                     help="test: no map matching from route leg FIRST to the end of leg LAST (1-based); "
                          "diagnostic MAP_OUTAGE (check 3 then includes the outage)")
@@ -658,6 +665,7 @@ def main() -> None:
     clog_path = args.out / "companion.log"
     clog = clog_path.open("w")
     companion = None
+    wind = None
     ok_all = True
 
     def check(name: str, cond: bool, **info) -> None:
@@ -687,6 +695,10 @@ def main() -> None:
         if args.vo_calibration:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
         cmd += ["--attitude-stamp", args.attitude_stamp]
+        if args.map_max_tilt_rad != 0.12:
+            cmd += ["--map-max-tilt-rad", str(args.map_max_tilt_rad)]
+        if args.map_patch_at_boresight:
+            cmd += ["--map-patch-at-boresight"]
         if args.vo_window_pairs != 1:
             cmd += ["--vo-window-pairs", str(args.vo_window_pairs)]
         if args.vo_surface_depth:
@@ -727,6 +739,16 @@ def main() -> None:
         if not gz.wait(lambda: link.state["z"] - z_home > altitude - 0.3, 120):
             raise RuntimeError(f"takeoff failed dz={link.state['z'] - z_home}")
         report["takeoff_us"] = int(link.boot_s * 1e6)
+        if args.wind_ne_m_s:
+            import gz_wind
+            wind = gz_wind.WindDisturbance(world, f"{vo_flight.MODEL}_0", args.wind_ne_m_s,
+                                           args.wind_gust_sigma, seed=args.wind_seed,
+                                           log_path=args.out / "wind.csv", clock=lambda: link.boot_s)
+            wind.start()
+            report["wind"] = {"ne_m_s": list(args.wind_ne_m_s), "gust_sigma_m_s": args.wind_gust_sigma,
+                              "seed": args.wind_seed,
+                              "force_ne_n": gz_wind.drag_force_ne(args.wind_ne_m_s).round(3).tolist(),
+                              "start_us": int(link.boot_s * 1e6)}
         gz.sim_sleep(4)
         link.set_mode(3)
         gz.wait(lambda: link.mode() == "POSCTL", 10)
@@ -896,6 +918,8 @@ def main() -> None:
         report["error"] = repr(exc)
         print("ERROR", exc, flush=True)
     finally:
+        if wind is not None:
+            wind.stop()
         link.close()
         if companion is not None:
             companion.terminate()
