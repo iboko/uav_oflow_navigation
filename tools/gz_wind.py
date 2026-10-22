@@ -87,6 +87,15 @@ class WindDisturbance:
         from gz.transport13 import Node
         self._node = Node()
         self._pub = self._node.advertise(f"/world/{self.world}/wrench/persistent", EntityWrench)
+        # A message published before Gazebo has subscribed is lost; with
+        # change-only publishing that would drop the steady force for good
+        # (second wind flight: tilt answered only the gusts).
+        t_end = time.time() + 20.0
+        while not self._pub.has_connections():
+            if time.time() > t_end:
+                raise RuntimeError("no subscriber on the wrench topic (ApplyLinkWrench system loaded?)")
+            time.sleep(0.05)
+        time.sleep(0.5)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
