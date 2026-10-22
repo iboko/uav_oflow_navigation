@@ -184,6 +184,8 @@ def main() -> None:
                          "(orthophoto of another year/season)")
     ap.add_argument("--map-patch-at-boresight", action="store_true",
                     help="ncc: centre the map patch where the optical axis meets the ground (steady tilt, wind)")
+    ap.add_argument("--map-max-tilt-rad", type=float, default=0.12,
+                    help="ncc: largest roll/pitch for map matching (OrthoNccLocalizer max_tilt_rad, <= 0.2)")
     ap.add_argument("--map-yaw", action="store_true",
                     help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
@@ -394,13 +396,15 @@ def main() -> None:
                     surface = np.load(args.surface) if args.surface else None
                     localizer = OrthoNccLocalizer(map_gray, geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                   camera_offset_body_m=tuple(args.camera_offset_frd),
-                                                  surface_m=surface, patch_at_boresight=args.map_patch_at_boresight)
+                                                  surface_m=surface, patch_at_boresight=args.map_patch_at_boresight,
+                                                  max_tilt_rad=args.map_max_tilt_rad)
                     if args.orthophoto_fallback:
                         fallback = OrthoNccLocalizer(cv2.imread(str(args.orthophoto_fallback), cv2.IMREAD_GRAYSCALE),
                                                      geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                      camera_offset_body_m=tuple(args.camera_offset_frd),
                                                      surface_m=surface,
-                                                     patch_at_boresight=args.map_patch_at_boresight)
+                                                     patch_at_boresight=args.map_patch_at_boresight,
+                                                     max_tilt_rad=args.map_max_tilt_rad)
                 else:
                     tile = OrthophotoTile("orthophoto", clahe.apply(map_gray), geo)
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),
