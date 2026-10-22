@@ -7,6 +7,12 @@ system), so wind is applied as a persistent link wrench on the model
 F = k |w| w, k = 0.5 rho CdA, plus gusts. Gusts are a first-order
 (exponentially correlated) random process per horizontal axis, seeded.
 
+Every message on the persistent topic ADDS a wrench to the ones already
+applied (a first version republishing the full force at 10 Hz built up
+~18 N in a second and flipped the vehicle). Only the change of the force
+is published, so the applied sum equals the current force; ``stop``
+clears them.
+
 Approximation: the drag depends on the wind only, not on the vehicle's
 airspeed (no change when it flies with or against the wind); enough to
 make the vehicle tilt and work against a disturbance, not a wind model.
@@ -61,6 +67,7 @@ class WindDisturbance:
         self.log = open(log_path, "w") if log_path else None
         if self.log:
             self.log.write("sim_s,wind_n,wind_e,force_n,force_e\n")
+        self._applied = np.zeros(2)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -83,17 +90,23 @@ class WindDisturbance:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def update(self, now: float, dt: float) -> np.ndarray:
+        """One step: publish the change of the drag force; returns the force."""
+        w = self.wind + self.gusts.step(dt)
+        f = drag_force_ne(w)
+        self._publish(f - self._applied)
+        self._applied = f
+        if self.log:
+            self.log.write(f"{now:.2f},{w[0]:.3f},{w[1]:.3f},{f[0]:.4f},{f[1]:.4f}\n")
+            self.log.flush()
+        return f
+
     def _run(self) -> None:
         last = self.clock()
         while not self._stop.is_set():
             now = self.clock()
-            w = self.wind + self.gusts.step(max(now - last, 0.0))
+            self.update(now, max(now - last, 0.0))
             last = now
-            f = drag_force_ne(w)
-            self._publish(f)
-            if self.log:
-                self.log.write(f"{now:.2f},{w[0]:.3f},{w[1]:.3f},{f[0]:.4f},{f[1]:.4f}\n")
-                self.log.flush()
             self._stop.wait(self.period)
 
     def stop(self) -> None:

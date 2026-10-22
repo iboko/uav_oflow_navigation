@@ -21,3 +21,16 @@ def test_gust_process_has_the_set_sigma_and_correlation():
     assert np.array_equal(g.step(0.0), g.g)   # no time, no change
     with pytest.raises(ValueError):
         GustProcess(-1.0)
+
+
+def test_only_force_changes_are_published():
+    # Gazebo adds every persistent wrench message: the published sum must
+    # equal the current drag force, not grow with the number of updates.
+    from tools.gz_wind import WindDisturbance
+    w = WindDisturbance("w", "m", (0.0, 5.0), gust_sigma_m_s=1.0, seed=2)
+    sent = []
+    w._publish = lambda f: sent.append(np.array(f))
+    for k in range(50):
+        f = w.update(k * 0.1, 0.1)
+    assert np.sum(sent, axis=0) == pytest.approx(f, abs=1e-12)
+    assert np.linalg.norm(f) < 5.0      # ~1.8 N mean, not 50 x 1.8 N
