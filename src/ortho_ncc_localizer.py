@@ -44,7 +44,7 @@ class OrthoNccLocalizer:
                  subpatch_search_m: float = 3.0, surface_m: np.ndarray | None = None,
                  occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1,
                  refine_radius_m: float = 0.0, refine_min_shift_m: float = 1.0,
-                 yaw_extension_deg: float = 12.0) -> None:
+                 yaw_extension_deg: float = 12.0, patch_at_boresight: bool = False) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -86,6 +86,11 @@ class OrthoNccLocalizer:
         self.last_hidden_fraction = 0.0
         self.exclusion_px = max(1, int(round(exclusion_m / self.gsd)))
         self.max_tilt = max_tilt_rad
+        # Centre the patch where the optical axis meets the ground (flat
+        # approximation) instead of below the camera: with a steady tilt
+        # (wind) the nadir patch leaves the frame (swiss wind test: 19 -> 75
+        # NO_USABLE_ORTHO_PATCH). The fix is still the camera position.
+        self.patch_at_boresight = patch_at_boresight
         self.yaw_search = tuple(np.radians(yaw_search_deg))
         # Best rotation at the edge of the search: the search continues
         # outward (same step) up to this much further, while the peak grows.
@@ -111,8 +116,11 @@ class OrthoNccLocalizer:
         return (e - self.origin[1]) / self.gsd, (self.origin[0] - n) / self.gsd
 
     def ortho_patch(self, frame: np.ndarray, height_agl_m: float, roll: float, pitch: float, yaw: float,
-                    center_ne_m=None):
+                    center_ne_m=None, patch_offset_ne_m=(0.0, 0.0)):
         """North-up patch centred below the camera; returns (patch, fully_inside).
+
+        ``patch_offset_ne_m`` moves the patch centre that far from the point
+        below the camera (the camera position itself is unchanged).
 
         Without a surface model: every patch cell is a point of a flat ground
         ``height_agl_m`` below the camera. With one (``surface_m``, heights on
@@ -125,8 +133,8 @@ class OrthoNccLocalizer:
         r_nb = body_to_ned(roll, pitch, yaw)
         r_nc = r_nb @ self.r_bc
         js, is_ = np.meshgrid(np.arange(self.npx), np.arange(self.npx))
-        dn = (self.npx / 2 - is_ - 0.5) * self.gsd
-        de = (js - self.npx / 2 + 0.5) * self.gsd
+        dn = (self.npx / 2 - is_ - 0.5) * self.gsd + float(patch_offset_ne_m[0])
+        de = (js - self.npx / 2 + 0.5) * self.gsd + float(patch_offset_ne_m[1])
         # NED z is down: a camera below the body has a smaller AGL.
         camera_height = height_agl_m - (r_nb @ self.offset)[2]
         if camera_height <= 0:
@@ -198,9 +206,16 @@ class OrthoNccLocalizer:
         if not 5.0 <= height_agl_m <= 150.0:
             return MapLocalizationFix(False, "UNSUPPORTED_HEIGHT")
         lever = (body_to_ned(roll_rad, pitch_rad, yaw_rad) @ self.offset)[:2]
-        # The patch centre is the ground point below the CAMERA.
+        # The patch centre is the ground point below the CAMERA (optionally
+        # moved to where the optical axis meets a flat ground).
         cam_prior = np.asarray(prior_ne_m, dtype=float) + lever
-        col, row = self._pixel(*cam_prior)
+        off = np.zeros(2)
+        if self.patch_at_boresight:
+            axis = body_to_ned(roll_rad, pitch_rad, yaw_rad) @ self.r_bc[:, 2]
+            cam_h = height_agl_m - (body_to_ned(roll_rad, pitch_rad, yaw_rad) @ self.offset)[2]
+            if axis[2] > 0.5 and cam_h > 0:
+                off = cam_h * axis[:2] / axis[2]
+        col, row = self._pixel(*(cam_prior + off))
         rad = int(round(radius_m / self.gsd)) + self.npx // 2
         r0, c0 = int(round(row)) - rad, int(round(col)) - rad
         if r0 < 0 or c0 < 0 or r0 + 2 * rad > self.map.shape[0] or c0 + 2 * rad > self.map.shape[1]:
@@ -220,7 +235,7 @@ class OrthoNccLocalizer:
         def match(dyaw):
             nonlocal best, envelope, best_patch
             patch, inside = self.ortho_patch(image, height_agl_m, roll_rad, pitch_rad, yaw_rad + dyaw,
-                                             center_ne_m=cam_prior)
+                                             center_ne_m=cam_prior, patch_offset_ne_m=off)
             if not inside:
                 return
             patch = self.clahe.apply(patch)
@@ -276,8 +291,8 @@ class OrthoNccLocalizer:
             y += 0.5 * (a - c) / den if den < 0 else 0.0
         # The georeference origin is the centre of pixel (0, 0); the patch
         # centre (camera nadir) lies at index npx/2 - 0.5 inside the patch.
-        cam_n = self.origin[0] - (r0 + y + self.npx / 2 - 0.5) * self.gsd
-        cam_e = self.origin[1] + (c0 + x + self.npx / 2 - 0.5) * self.gsd
+        cam_n = self.origin[0] - (r0 + y + self.npx / 2 - 0.5) * self.gsd - off[0]
+        cam_e = self.origin[1] + (c0 + x + self.npx / 2 - 0.5) * self.gsd - off[1]
         north, east = cam_n - lever[0], cam_e - lever[1]
         yaw = self._refined_yaw(yaw_rad, best_dyaw, peaks)
         return MapLocalizationFix(True, "NCC_ACCEPTED_UNVALIDATED", "ncc", float(north), float(east),

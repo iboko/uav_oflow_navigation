@@ -182,3 +182,19 @@ def test_dsm_projection_removes_building_parallax():
     err_dsm = math.hypot(f_dsm.north_m - n, f_dsm.east_m - e)
     err_flat = math.hypot(f_flat.north_m - n, f_flat.east_m - e) if f_flat.accepted else float("inf")
     assert err_dsm < 0.25 and dsm.last_peak > flat.last_peak, (err_dsm, err_flat, dsm.last_peak, flat.last_peak)
+
+
+def test_patch_at_boresight_keeps_a_tilted_frame_usable():
+    # Pitch 0.19 rad at 50 m: the image edge on the near side is 14.6 m
+    # from the nadir, inside the 15 m half patch; centred on the optical
+    # axis the patch fits and the fix is still the camera position.
+    world = _texture(seed=4)
+    n, e, h, r, p, y = 5.0, 3.0, 50.0, 0.0, 0.19, math.radians(30)
+    frame = _render(world, n, e, h, r, p, y)
+    kw = dict(prior_ne_m=(n + 2.0, e - 2.0), radius_m=8.0, height_agl_m=h, roll_rad=r, pitch_rad=p, yaw_rad=y)
+    nadir = OrthoNccLocalizer(world, GEO, CAL, MOUNT, max_tilt_rad=0.2)
+    assert nadir.localize(frame, **kw).status == "NO_USABLE_ORTHO_PATCH"
+    bore = OrthoNccLocalizer(world, GEO, CAL, MOUNT, max_tilt_rad=0.2, patch_at_boresight=True)
+    fix = bore.localize(frame, **kw)
+    assert fix.accepted, (fix, bore.last_peak, bore.last_margin)
+    assert math.hypot(fix.north_m - n, fix.east_m - e) < 0.3

@@ -182,6 +182,8 @@ def main() -> None:
     ap.add_argument("--map-method", choices=("orb", "ncc"), default="orb",
                     help="ncc: ortho-rectified frame + correlation around a position prior "
                          "(orthophoto of another year/season)")
+    ap.add_argument("--map-patch-at-boresight", action="store_true",
+                    help="ncc: centre the map patch where the optical axis meets the ground (steady tilt, wind)")
     ap.add_argument("--map-yaw", action="store_true",
                     help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
@@ -392,12 +394,13 @@ def main() -> None:
                     surface = np.load(args.surface) if args.surface else None
                     localizer = OrthoNccLocalizer(map_gray, geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                   camera_offset_body_m=tuple(args.camera_offset_frd),
-                                                  surface_m=surface)
+                                                  surface_m=surface, patch_at_boresight=args.map_patch_at_boresight)
                     if args.orthophoto_fallback:
                         fallback = OrthoNccLocalizer(cv2.imread(str(args.orthophoto_fallback), cv2.IMREAD_GRAYSCALE),
                                                      geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
                                                      camera_offset_body_m=tuple(args.camera_offset_frd),
-                                                     surface_m=surface)
+                                                     surface_m=surface,
+                                                     patch_at_boresight=args.map_patch_at_boresight)
                 else:
                     tile = OrthophotoTile("orthophoto", clahe.apply(map_gray), geo)
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),

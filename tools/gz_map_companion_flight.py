@@ -533,6 +533,8 @@ def main() -> None:
                     help="companion: VO feature depths on the DSM (with --dsm-surface)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="companion: mean VO velocity over this many frame pairs")
+    ap.add_argument("--map-patch-at-boresight", action="store_true",
+                    help="companion: map patch centred on the optical axis (see gz_vo_companion.py)")
     ap.add_argument("--wind-ne-m-s", type=float, nargs=2, metavar=("NORTH", "EAST"),
                     help="steady wind from reaching altitude on (drag force on the model, tools/gz_wind.py)")
     ap.add_argument("--wind-gust-sigma", type=float, default=0.0, help="gust speed sigma per axis, m/s")
@@ -692,6 +694,8 @@ def main() -> None:
         if args.vo_calibration:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
         cmd += ["--attitude-stamp", args.attitude_stamp]
+        if args.map_patch_at_boresight:
+            cmd += ["--map-patch-at-boresight"]
         if args.vo_window_pairs != 1:
             cmd += ["--vo-window-pairs", str(args.vo_window_pairs)]
         if args.vo_surface_depth:
