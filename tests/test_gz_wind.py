@@ -23,14 +23,20 @@ def test_gust_process_has_the_set_sigma_and_correlation():
         GustProcess(-1.0)
 
 
-def test_only_force_changes_are_published():
+def test_only_force_changes_are_published_and_the_list_stays_bounded(monkeypatch):
+    monkeypatch.setattr("tools.gz_wind.time.sleep", lambda s: None)
     # Gazebo adds every persistent wrench message: the published sum must
     # equal the current drag force, not grow with the number of updates.
     from tools.gz_wind import WindDisturbance
-    w = WindDisturbance("w", "m", (0.0, 5.0), gust_sigma_m_s=1.0, seed=2)
-    sent = []
-    w._publish = lambda f: sent.append(np.array(f))
-    for k in range(50):
+    # Every consolidate_s the list is cleared and one full wrench sent.
+    w = WindDisturbance("w", "m", (0.0, 5.0), gust_sigma_m_s=1.0, seed=2, consolidate_s=2.0)
+    stored = []                          # Gazebo's persistent-wrench list
+    w._publish = lambda f: stored.append(np.array(f))
+    w._clear = lambda: stored.clear()
+    longest = 0
+    for k in range(200):
         f = w.update(k * 0.1, 0.1)
-    assert np.sum(sent, axis=0) == pytest.approx(f, abs=1e-12)
-    assert np.linalg.norm(f) < 5.0      # ~1.8 N mean, not 50 x 1.8 N
+        assert np.sum(stored, axis=0) == pytest.approx(f, abs=1e-12)
+        longest = max(longest, len(stored))
+    assert np.linalg.norm(f) < 5.0      # ~1.8 N mean, not 200 x 1.8 N
+    assert longest <= 21                # bounded by rate x consolidate_s
