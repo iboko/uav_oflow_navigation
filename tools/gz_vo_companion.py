@@ -185,7 +185,8 @@ def main() -> None:
     ap.add_argument("--map-yaw", action="store_true",
                     help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
-                    help="JSON polled in flight: {\"shift_ne_m\": [dn, de]} injects a map fault")
+                    help="JSON polled in flight: {\"shift_ne_m\": [dn, de], \"outage\": bool} injects a map "
+                         "fault or a map outage (no matching)")
     ap.add_argument("--map-log", type=Path)
     ap.add_argument("--save-frames", type=Path, help="directory: every --save-every-th frame as PNG")
     ap.add_argument("--save-every", type=int, default=75)
@@ -270,6 +271,7 @@ def main() -> None:
     fallback = None
     source = "primary"
     map_shift = np.zeros(2)
+    map_outage = False
     msckf: CompanionMsckf | None = None
     tracker: KltTracker | None = None
     last_msckf_t = 0
@@ -435,7 +437,9 @@ def main() -> None:
         if args.map_control and wall - last_control > 0.5:
             last_control = wall
             try:
-                map_shift = np.asarray(json.loads(args.map_control.read_text()).get("shift_ne_m", (0, 0)), float)
+                ctl = json.loads(args.map_control.read_text())
+                map_shift = np.asarray(ctl.get("shift_ne_m", (0, 0)), float)
+                map_outage = bool(ctl.get("outage", False))
             except (OSError, ValueError):
                 pass
         # Process frames in order once autopilot samples exist after them.
@@ -478,7 +482,11 @@ def main() -> None:
                     ref = math.atan2(math.sin(d), math.cos(d)) if math.isfinite(d) else float("nan")
                 anchor.propagate(r.interval_start_us, r.timestamp_us, v_prop, c_prop,
                                  reference_minus_autopilot_rad=ref)
-            if localizer is not None and t_frame - last_map_t >= 1e6 / args.map_rate_hz:
+            if localizer is not None and map_outage and t_frame - last_map_t >= 1e6 / args.map_rate_hz:
+                # Injected outage (map control): no map matching at all.
+                last_map_t = t_frame
+                pipeline.count("MAP_OUTAGE")
+            elif localizer is not None and t_frame - last_map_t >= 1e6 / args.map_rate_hz:
                 state = pipeline.state_at_camera_time(t_frame)
                 if state is not None:
                     last_map_t = t_frame

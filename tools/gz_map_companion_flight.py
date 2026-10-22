@@ -533,6 +533,9 @@ def main() -> None:
                     help="companion: VO feature depths on the DSM (with --dsm-surface)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="companion: mean VO velocity over this many frame pairs")
+    ap.add_argument("--map-outage-legs", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                    help="test: no map matching from route leg FIRST to the end of leg LAST (1-based); "
+                         "diagnostic MAP_OUTAGE (check 3 then includes the outage)")
     ap.add_argument("--save-every", type=int, default=75,
                     help="companion: save every N-th camera frame (1: all, for offline VO replay)")
     ap.add_argument("--vo-calibration", type=Path,
@@ -607,6 +610,11 @@ def main() -> None:
     args = ap.parse_args()
     if args.mode in ("test", "heading") and not args.calibration:
         ap.error("--mode test/heading needs --calibration")
+    if args.map_outage_legs:
+        first, last = args.map_outage_legs
+        if args.mode not in ("test", "heading") or not 1 <= first <= last <= len(TEST_ROUTES[args.test_route]):
+            ap.error(f"--map-outage-legs needs a test route and 1 <= FIRST <= LAST <= "
+                     f"{len(TEST_ROUTES[args.test_route])}")
     params = dict(PARAMS, EKF2_EV_CTRL="13") if args.ev_yaw else dict(PARAMS)
     if args.mode == "heading":
         # A 3D magnetometer with estimated earth field absorbs a declination
@@ -811,7 +819,11 @@ def main() -> None:
             errors, legs = [], []
             report["test_route"] = args.test_route
             report["route_start_us"] = int(link.boot_s * 1e6)
-            for fp, fr in TEST_ROUTES[args.test_route]:
+            outage = args.map_outage_legs
+            for leg_no, (fp, fr) in enumerate(TEST_ROUTES[args.test_route], 1):
+                if outage and leg_no == outage[0]:
+                    control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0], "outage": True}))
+                    report["map_outage_start_us"] = int(link.boot_s * 1e6)
                 pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
                 t_leg = link.boot_s
@@ -825,6 +837,9 @@ def main() -> None:
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
                 legs.append({"truth_ne_m": truth.round(2).tolist(), "estimate_ne_m": est.round(2).tolist()})
+                if outage and leg_no == outage[1]:
+                    control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
+                    report["map_outage_end_us"] = int(link.boot_s * 1e6)
             report["route_legs"] = legs
             report["route_end_us"] = int(link.boot_s * 1e6)
             # Limit fixed before the flight: 3 sigma of the calibrated map error, at least 0.5 m.
@@ -1036,6 +1051,22 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         c3["pass"] = bool(c3["pass"] and e_cont.max() < limit)
         report["analysis_ok"] = report.get("analysis_ok", True) and c3["pass"]
         print("PASS" if c3["pass"] else "FAIL", "3_route_absolute_error_on_map (continuous)", c3, flush=True)
+    # Map outage (diagnostic, no pass/fail): EKF2 error without map fixes
+    # and after they return.
+    t_o0, t_o1 = report.get("map_outage_start_us"), report.get("map_outage_end_us")
+    if t_o0 and t_o1 and t_r1:
+        tg = truth["timestamp"]
+        def err_between(a, b):
+            sel = (tg >= a) & (tg <= b)
+            return np.linalg.norm(interp(est, tg[sel]) - interp(truth, tg[sel]), axis=1) if sel.any() else np.array([np.nan])
+        during = err_between(t_o0, t_o1)
+        after = err_between(t_o1 + 10e6, t_r1)
+        report["map_outage"] = {"duration_s": round((t_o1 - t_o0) * 1e-6, 1),
+                                "error_at_start_m": round(float(err_between(t_o0, t_o0 + 0.5e6)[0]), 3),
+                                "max_error_during_m": round(float(np.nanmax(during)), 3),
+                                "error_at_end_m": round(float(during[-1]), 3),
+                                "max_error_10s_after_end_to_route_end_m": round(float(np.nanmax(after)), 3)}
+        print("MAP_OUTAGE", report["map_outage"], flush=True)
     # Test: VO-only track from GNSS loss to the end of the box, same flight.
     vo = np.genfromtxt(args.out / "companion_vo.csv", delimiter=",", names=True)
     t_off, t_end = report.get("gnss_off_us"), report.get("route_end_us")
