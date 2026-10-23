@@ -235,8 +235,13 @@ class MapAnchor:
             return
         self._p = self._p + d
         self._vo_since_fix += d
+        # Unbridged: gap_unc_m is a bound on motion. Bridged: a 1-sigma error
+        # with heavy tails (calibration flights, strong gusts: 1 of 52 gaps at
+        # 5.8 sigma), so 2 sigma: a 3-m shift after a 4-s gap stays above the
+        # step limit (1 m + 2 x 0.8 m), an error beyond it rejects true fixes
+        # until the lock is lost and taken again.
         self._step_budget_m += ((self._scale_sigma + sigma_psi) * float(np.linalg.norm(d))
-                               + (gap_unc_m if gap_s > 1e-3 else 0.0))
+                               + ((2.0 if bridged else 1.0) * gap_unc_m if gap_s > 1e-3 else 0.0))
         # Persistent scale/heading errors accumulate with total path, not
         # with sqrt(number of frames). Add only the increment of the squared
         # accumulated budgets; the same displacement split into more frames
