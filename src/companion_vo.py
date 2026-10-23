@@ -118,7 +118,8 @@ class BodyVelocityMeasurement:
 class CompanionVo:
     def __init__(self, odometry: ContinuousPlanarOdometry, *, height_sigma_m: float = 0.02,
                  max_tilt_rad: float = 0.45, min_range_rate_dt_s: float = 0.02,
-                 min_height_m: float = 0.5, window_pairs: int = 1) -> None:
+                 min_height_m: float = 0.5, window_pairs: int = 1,
+                 vertical_gate: "VerticalVelocityGate | None" = None) -> None:
         if window_pairs < 1:
             raise ValueError("window_pairs must be >= 1")
         self.vo = odometry
@@ -134,6 +135,7 @@ class CompanionVo:
         # takeoff/landing: no measurement rather than a poor one.
         self._min_height = min_height_m
         self._heights: dict[int, float] = {}
+        self._vertical_gate = vertical_gate
         self.counts: dict[str, int] = {}
 
     def count(self, key: str) -> None:
@@ -229,6 +231,12 @@ class CompanionVo:
         # the pair count (the errors of neighbouring pairs are correlated).
         cnn, cne, cee = (sum(wk * e[5][k] for wk, e in zip(weights, self._window)) for k in range(3))
         var_vd = 2.0 * self._sigma_h ** 2 / span ** 2
+        if self._vertical_gate is not None:
+            t_mid = (w0 + w1) // 2
+            if not self._vertical_gate.check(t_mid, vdw):
+                self.count("VO_VERTICAL_REJECTED")
+                vdw, var_vd = self._vertical_gate.held(t_mid)
+            var_vd = max(var_vd, self._vertical_gate.min_sigma ** 2)
         mid = self._state_at((w0 + w1) // 2 + self.clock.offset_us)
         if mid is None:
             self.count("NO_ATTITUDE_OR_RANGE")
@@ -297,3 +305,63 @@ class VelocityJumpGate:
         age = max(0.0, (t_us - self.last_t_us) * 1e-6)
         var = (self.max_accel * age) ** 2 + self.noise ** 2
         return (float(self.last_v[0]), float(self.last_v[1])), var
+
+
+class VerticalVelocityGate:
+    """Replaces implausible VO vertical velocities (range rate) by the last
+    plausible one.
+
+    The vertical velocity is the rangefinder height difference over a frame
+    pair (66 ms). Over the 3D scene the beam jumps between roofs, trees and
+    the ground, more so when tilted: a 2-m step is 30 m/s, sent with the
+    rangefinder model sigma ~0.4 m/s. Calibration flights (series V without
+    wind, gap-bridge flights with gusts): error median 0.09-0.15 m/s but q99
+    3-22 m/s and up to 89 m/s. EKF2 rejects most, but after 1 s of failing
+    EV velocity fusion it resets the whole velocity to the measurement: with
+    strong gusts (seed 31) it took -22 m/s vertical, the controller cut the
+    thrust and the vehicle fell from 50 m.
+
+    Limits fixed from physics and the calibration flights (not the tests):
+    a multirotor accelerates vertically by at most ~1 g (free fall down,
+    thrust-to-weight ~2 up): max_accel = g; noise = 2 x q95 of the core error
+    (robust sigma from the median, 0.18 m/s) = 0.7 m/s; |vd| <= 8 m/s, twice
+    the q99 of the true vertical speed (3.0-3.8 m/s). A rejected value is
+    replaced by the last accepted one, its variance grown by max_accel times
+    the hold; after max_hold_s the next plausible value is taken as is, an
+    implausible one is still replaced (by 0 if none was accepted).
+
+    What passes is still heavy-tailed (seven calibration flights: q95
+    0.9-2.8 m/s, q99 3.1-6.6 m/s), so the variance sent has a floor
+    min_sigma = max q99 / 2.58 = 2.5 m/s instead of the rangefinder model
+    (~0.4 m/s): EKF2's EV velocity test then does not fail on the vertical
+    and does not reset to it; the height stays on the barometer.
+    """
+
+    def __init__(self, max_accel_m_s2: float = 9.81, noise_m_s: float = 0.7, max_abs_m_s: float = 8.0,
+                 max_hold_s: float = 1.0, min_sigma_m_s: float = 2.5) -> None:
+        if not all(isfinite(x) and x > 0 for x in (max_accel_m_s2, noise_m_s, max_abs_m_s, max_hold_s,
+                                                   min_sigma_m_s)):
+            raise ValueError("vertical gate limits must be finite and positive")
+        self.max_accel, self.noise, self.max_abs, self.max_hold_s = max_accel_m_s2, noise_m_s, max_abs_m_s, max_hold_s
+        self.min_sigma = min_sigma_m_s
+        self.last_t_us: int | None = None
+        self.last_vd = 0.0
+
+    def check(self, t_us: int, vd: float) -> bool:
+        if not isfinite(vd) or abs(vd) > self.max_abs:
+            return False
+        if self.last_t_us is None or (t_us - self.last_t_us) * 1e-6 > self.max_hold_s:
+            ok = True
+        else:
+            dt = max(0.0, (t_us - self.last_t_us) * 1e-6)
+            ok = abs(vd - self.last_vd) <= self.max_accel * dt + self.noise
+        if ok:
+            self.last_t_us, self.last_vd = t_us, float(vd)
+        return ok
+
+    def held(self, t_us: int) -> tuple[float, float]:
+        """Last accepted vertical velocity and its variance at t_us."""
+        if self.last_t_us is None:
+            return 0.0, self.max_abs ** 2
+        age = max(0.0, (t_us - self.last_t_us) * 1e-6)
+        return self.last_vd, min((self.max_accel * age) ** 2 + self.noise ** 2, self.max_abs ** 2)

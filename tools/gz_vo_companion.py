@@ -44,7 +44,7 @@ from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
 from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
 from src.map_error_field import MapErrorField  # noqa: E402
-from src.companion_vo import BodyVelocityMeasurement, CompanionVo, VelocityJumpGate  # noqa: E402
+from src.companion_vo import BodyVelocityMeasurement, CompanionVo, VelocityJumpGate, VerticalVelocityGate  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
 from src.imu_preintegration import ImuReading  # noqa: E402
@@ -186,6 +186,8 @@ def main() -> None:
                     help="ncc: centre the map patch where the optical axis meets the ground (steady tilt, wind)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12,
                     help="ncc: largest roll/pitch for map matching (OrthoNccLocalizer max_tilt_rad, <= 0.2)")
+    ap.add_argument("--no-vo-vertical-gate", action="store_true",
+                    help="send the raw range-rate vertical velocity (src/companion_vo.py VerticalVelocityGate)")
     ap.add_argument("--vo-gap-bridge", type=Path,
                     help="JSON from tools/calibrate_vo_gap_bridge.py: carry the map anchor across VO gaps "
                          "with the autopilot velocity (src/companion_map.py VelocityBridge)")
@@ -388,7 +390,8 @@ def main() -> None:
                     fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
-            pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs)
+            pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs,
+                                   vertical_gate=None if args.no_vo_vertical_gate else VerticalVelocityGate())
             # The gate's acceleration bound (3.7 m/s^2) is derived from the 0.25 rad
             # VO tilt limit; it scales with tan(limit) when the limit is changed.
             jump_accel = 3.7 * math.tan(args.vo_max_tilt_rad) / math.tan(0.25)
