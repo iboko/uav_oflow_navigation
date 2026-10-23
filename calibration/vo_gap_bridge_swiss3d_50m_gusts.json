@@ -1,0 +1,103 @@
+{
+ "sigma0_m": 0.38689177974627165,
+ "sigma_per_s_m": 0.16714144204903592,
+ "sigma_per_s2_m": 0.0,
+ "flights": [
+  "swcalGB_box_s21",
+  "swcalGB_box_rf_s22",
+  "swcalGB_box_s23",
+  "swcalGB_box_rf_s24"
+ ],
+ "all": {
+  "gaps": 52,
+  "mean_nees_2d": 1.916,
+  "coverage_95": 0.942,
+  "max_gap_s": 4.62
+ },
+ "held_out": {
+  "swcalGB_box_s21": {
+   "gaps": 13,
+   "mean_nees_2d": 0.757,
+   "coverage_95": 1.0,
+   "max_gap_s": 4.16,
+   "fit_without": [
+    0.4281,
+    0.1765,
+    0.0
+   ]
+  },
+  "swcalGB_box_rf_s22": {
+   "gaps": 14,
+   "mean_nees_2d": 1.789,
+   "coverage_95": 0.857,
+   "max_gap_s": 4.29,
+   "fit_without": [
+    0.4136,
+    0.1545,
+    0.0
+   ]
+  },
+  "swcalGB_box_s23": {
+   "gaps": 11,
+   "mean_nees_2d": 0.34,
+   "coverage_95": 1.0,
+   "max_gap_s": 4.62,
+   "fit_without": [
+    0.4243,
+    0.1923,
+    0.0
+   ]
+  },
+  "swcalGB_box_rf_s24": {
+   "gaps": 14,
+   "mean_nees_2d": 7.232,
+   "coverage_95": 0.786,
+   "max_gap_s": 4.29,
+   "fit_without": [
+    0.2387,
+    0.1476,
+    0.0
+   ]
+  }
+ },
+ "bins": [
+  {
+   "gap_s": [
+    0.3,
+    1
+   ],
+   "gaps": 16,
+   "rms_axis_m": 0.142,
+   "model_sigma_m": 0.402
+  },
+  {
+   "gap_s": [
+    1,
+    2
+   ],
+   "gaps": 12,
+   "rms_axis_m": 0.477,
+   "model_sigma_m": 0.452
+  },
+  {
+   "gap_s": [
+    2,
+    4
+   ],
+   "gaps": 16,
+   "rms_axis_m": 0.747,
+   "model_sigma_m": 0.603
+  },
+  {
+   "gap_s": [
+    4,
+    8
+   ],
+   "gaps": 8,
+   "rms_axis_m": 0.798,
+   "model_sigma_m": 0.811
+  }
+ ],
+ "note": "VO-gap bridge with the autopilot velocity; simulated flights, not a sensor certification",
+ "conditions": "swiss 3D scene, 50 m, wind 5 m/s E, gusts sigma 1.5 m/s (seeds 21-24), routes box/box_rf, injected VO dropouts 0.5-4 s (--vo-outages-s 0.5 1 2 3 4)"
+}

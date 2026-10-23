@@ -536,6 +536,12 @@ def main() -> None:
     ap.add_argument("--map-patch-at-boresight", action="store_true",
                     help="companion: map patch centred on the optical axis (see gz_vo_companion.py)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12, help="companion: map matching tilt limit")
+    ap.add_argument("--vo-gap-bridge", type=Path,
+                    help="companion: carry the map anchor across VO gaps with the autopilot velocity (JSON)")
+    ap.add_argument("--vo-outages-s", type=float, nargs="+", metavar="LEN",
+                    help="calibration: injected VO dropouts on the test route, these lengths in turn "
+                         "(sim s), --vo-outage-off-s apart (gap bridge calibration flights, not tests)")
+    ap.add_argument("--vo-outage-off-s", type=float, default=6.0)
     ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25, help="companion: VO frame-pair tilt limit")
     ap.add_argument("--wind-ne-m-s", type=float, nargs=2, metavar=("NORTH", "EAST"),
                     help="steady wind from reaching altitude on (drag force on the model, tools/gz_wind.py)")
@@ -625,6 +631,9 @@ def main() -> None:
                      f"{len(TEST_ROUTES[args.test_route])}")
     if not 0.0 < args.vo_max_tilt_rad <= 0.4:
         ap.error("--vo-max-tilt-rad must be in (0, 0.4]")
+    if args.vo_outages_s and (args.mode not in ("test", "heading") or args.map_outage_legs
+                              or not all(0 < x <= 10 for x in args.vo_outages_s) or args.vo_outage_off_s <= 0):
+        ap.error("--vo-outages-s needs a test route without --map-outage-legs, lengths in (0, 10] s")
     params = dict(PARAMS, EKF2_EV_CTRL="13") if args.ev_yaw else dict(PARAMS)
     if args.mode == "heading":
         # A 3D magnetometer with estimated earth field absorbs a declination
@@ -700,6 +709,8 @@ def main() -> None:
         cmd += ["--attitude-stamp", args.attitude_stamp]
         if args.map_max_tilt_rad != 0.12:
             cmd += ["--map-max-tilt-rad", str(args.map_max_tilt_rad)]
+        if args.vo_gap_bridge:
+            cmd += ["--vo-gap-bridge", str(args.vo_gap_bridge.resolve())]
         if args.vo_max_tilt_rad != 0.25:
             cmd += ["--vo-max-tilt-rad", str(args.vo_max_tilt_rad)]
         if args.map_patch_at_boresight:
@@ -847,6 +858,31 @@ def main() -> None:
             report["test_route"] = args.test_route
             report["route_start_us"] = int(link.boot_s * 1e6)
             outage = args.map_outage_legs
+            vo_out = {"on": False, "next_s": link.boot_s + args.vo_outage_off_s, "k": 0}
+            report["vo_outages_us"] = []
+
+            def vo_outage_tick() -> None:
+                # Injected VO dropouts (calibration of the gap bridge).
+                if not args.vo_outages_s or link.boot_s < vo_out["next_s"]:
+                    return
+                if vo_out["on"]:
+                    vo_out.update(on=False, next_s=link.boot_s + args.vo_outage_off_s)
+                    report["vo_outages_us"][-1].append(int(link.boot_s * 1e6))
+                else:
+                    length = args.vo_outages_s[vo_out["k"] % len(args.vo_outages_s)]
+                    vo_out.update(on=True, next_s=link.boot_s + length, k=vo_out["k"] + 1)
+                    report["vo_outages_us"].append([int(link.boot_s * 1e6)])
+                control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0], "vo_outage": vo_out["on"]}))
+
+            def route_sleep(s: float) -> None:
+                # Fine steps while VO dropouts are injected (lengths below the 2-3 s samples).
+                if not args.vo_outages_s:
+                    gz.sim_sleep(s)
+                    return
+                t_end = link.boot_s + s
+                while link.boot_s < t_end - 1e-3:
+                    gz.sim_sleep(min(0.25, t_end - link.boot_s))
+                    vo_outage_tick()
             for leg_no, (fp, fr) in enumerate(TEST_ROUTES[args.test_route], 1):
                 if outage and leg_no == outage[0]:
                     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0], "outage": True}))
@@ -855,18 +891,21 @@ def main() -> None:
                 link.pitch, link.roll = pitch, roll
                 t_leg = link.boot_s
                 while link.boot_s - t_leg < leg_s:
-                    gz.sim_sleep(sample_s)
+                    route_sleep(sample_s)
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
                 link.pitch = link.roll = 0
                 for _ in range(4):
-                    gz.sim_sleep(2)
+                    route_sleep(2)
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
                 legs.append({"truth_ne_m": truth.round(2).tolist(), "estimate_ne_m": est.round(2).tolist()})
                 if outage and leg_no == outage[1]:
                     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
                     report["map_outage_end_us"] = int(link.boot_s * 1e6)
+            if vo_out["on"]:
+                control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
+                report["vo_outages_us"][-1].append(int(link.boot_s * 1e6))
             report["route_legs"] = legs
             report["route_end_us"] = int(link.boot_s * 1e6)
             # Limit fixed before the flight: 3 sigma of the calibrated map error, at least 0.5 m.

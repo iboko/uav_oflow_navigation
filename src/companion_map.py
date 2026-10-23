@@ -135,6 +135,7 @@ class MapAnchor:
         self._t_us = 0
         self._candidates: list[tuple[int, np.ndarray]] = []
         self._vo_since_candidate = np.zeros(2)
+        self._gap_since_candidate_m = 0.0   # bridged VO-gap uncertainty since the last candidate
         self.counts: dict[str, int] = {}
         self.last_nis = float("nan")
         self.last_step_error_m = float("nan")
@@ -145,17 +146,31 @@ class MapAnchor:
         self.counts[key] = self.counts.get(key, 0) + 1
 
     @property
+    def time_us(self) -> int:
+        """End of the last VO interval (0 before the first)."""
+        return self._t_us
+
+    @property
     def locked(self) -> bool:
         return self._p is not None
 
     def propagate(self, t0_us: int, t1_us: int, v_ne: tuple[float, float],
                   cov_ne: tuple[tuple[float, float], tuple[float, float]],
-                  reference_minus_autopilot_rad: float = 0.0) -> None:
+                  reference_minus_autopilot_rad: float = 0.0,
+                  gap_displacement_ne: tuple[float, float] | None = None,
+                  gap_sigma_m: float | None = None) -> None:
         """VO-перемещение за [t0, t1]; интервалы идут подряд по времени.
 
         reference_minus_autopilot_rad: курс, относительно которого измерена
         поправка (например, по гироскопу), минус курс автопилота, по
-        которому VO перевела скорость в N/E; 0 — поправка от автопилота."""
+        которому VO перевела скорость в N/E; 0 — поправка от автопилота.
+
+        gap_displacement_ne, gap_sigma_m: перемещение за разрыв VO перед t0
+        (от конца предыдущего интервала) по другому источнику, например по
+        скорости автопилота на IMU, в той же системе курса, что и VO, и его
+        СКО на ось. Без них перемещение за разрыв неизвестно: неопределенность
+        max_gap_speed_m_s * разрыв, и набранные кандидаты захвата сбрасываются.
+        """
         dt = (t1_us - t0_us) * 1e-6
         v = np.asarray(v_ne, dtype=float)
         c = np.asarray(cov_ne, dtype=float)
@@ -180,6 +195,15 @@ class MapAnchor:
         if gap_s < -1e-3:
             self._count("BAD_VO_INTERVAL")
             return
+        bridged = False
+        gap_unc_m = self._gap_speed * max(gap_s, 0.0)
+        if gap_s > 1e-3 and gap_displacement_ne is not None and gap_sigma_m is not None:
+            g = np.asarray(gap_displacement_ne, dtype=float)
+            if g.shape == (2,) and np.isfinite(g).all() and isfinite(gap_sigma_m) and gap_sigma_m >= 0:
+                bridged = True
+                gap_unc_m = float(gap_sigma_m)
+                d = d + rot @ g
+                self._count("VO_GAP_BRIDGED")
         if self._p is not None and gap_s <= 1e-3 and self._t_us:
             self._history.append((self._interval_start_us, self._t_us, self._p.copy(), self._cov.copy(),
                                   self._interval_velocity_ne.copy(), self._interval_velocity_cov.copy(),
@@ -199,19 +223,25 @@ class MapAnchor:
                 self._prior_p = self._prior_p + d
                 self._prior_cov = (self._prior_cov + c * dt * dt
                                    + np.eye(2) * ((self._scale_sigma + sigma_psi) * dist) ** 2
-                                   + np.eye(2) * (self._gap_speed * max(gap_s, 0.0)) ** 2)
-            if self._candidates and gap_s > 1e-3:
+                                   + np.eye(2) * gap_unc_m ** 2)
+            if self._candidates and gap_s > 1e-3 and not bridged:
                 # Перемещение за разрыв VO неизвестно: захват заново.
                 self._candidates.clear()
                 self._count("ACQUISITION_VO_GAP")
             if self._candidates:
                 self._vo_since_candidate += d
+                self._gap_since_candidate_m += gap_unc_m if gap_s > 1e-3 else 0.0
             self._t_us = t1_us
             return
         self._p = self._p + d
         self._vo_since_fix += d
+        # Unbridged: gap_unc_m is a bound on motion. Bridged: a 1-sigma error
+        # with heavy tails (calibration flights, strong gusts: 1 of 52 gaps at
+        # 5.8 sigma), so 2 sigma: a 3-m shift after a 4-s gap stays above the
+        # step limit (1 m + 2 x 0.8 m), an error beyond it rejects true fixes
+        # until the lock is lost and taken again.
         self._step_budget_m += ((self._scale_sigma + sigma_psi) * float(np.linalg.norm(d))
-                               + self._gap_speed * max(gap_s, 0.0))
+                               + ((2.0 if bridged else 1.0) * gap_unc_m if gap_s > 1e-3 else 0.0))
         # Persistent scale/heading errors accumulate with total path, not
         # with sqrt(number of frames). Add only the increment of the squared
         # accumulated budgets; the same displacement split into more frames
@@ -219,10 +249,10 @@ class MapAnchor:
         old_drift_var = float(self._drift_sigma_m @ self._drift_sigma_m)
         distance = float(np.linalg.norm(d))
         self._drift_sigma_m += np.array([self._scale_sigma * distance, sigma_psi * distance,
-                                        self._gap_speed * max(gap_s, 0.0)])
+                                        gap_unc_m if gap_s > 1e-3 else 0.0])
         drift_var = float(self._drift_sigma_m @ self._drift_sigma_m)
         self._cov = self._cov + c * dt * dt + np.eye(2) * (drift_var - old_drift_var)
-        if gap_s > 1e-3:
+        if gap_s > 1e-3 and not bridged:
             self._count("VO_GAP_INFLATED")
         self._t_us = t1_us
         if np.max(np.linalg.eigvalsh(self._cov)) > self._max_var:
@@ -346,15 +376,18 @@ class MapAnchor:
             t_prev, z_prev = self._candidates[-1]
             moved_vo = self._vo_since_candidate
             moved_map = z - z_prev
-            tol = self._acq_tol + (self._scale_sigma + self._sigma_psi_unknown) * float(np.linalg.norm(moved_vo))
+            tol = (self._acq_tol + (self._scale_sigma + self._sigma_psi_unknown) * float(np.linalg.norm(moved_vo))
+                   + 3.0 * self._gap_since_candidate_m)
             if hypot(*(moved_map - moved_vo)) > tol or t_us <= t_prev:
                 # Несогласованная пара: захват начинается заново с этой привязки.
                 self._candidates = [(t_us, z)]
                 self._vo_since_candidate = np.zeros(2)
+                self._gap_since_candidate_m = 0.0
                 self._count("ACQUISITION_INCONSISTENT")
                 return "ACQUISITION_INCONSISTENT"
         self._candidates.append((t_us, z))
         self._vo_since_candidate = np.zeros(2)
+        self._gap_since_candidate_m = 0.0
         if len(self._candidates) < self._n_acq:
             self._count("ACQUISITION_PENDING")
             return "ACQUISITION_PENDING"
@@ -472,3 +505,59 @@ class GyroHeading:
         if not self._t or t_us < self._t[0] or t_us > self._t[-1]:
             return float("nan")
         return float(np.interp(t_us, self._t, self._psi))
+
+
+class VelocityBridge:
+    """Displacement across a VO gap from the autopilot's own velocity.
+
+    Without VO the autopilot (EKF2) keeps integrating the IMU; over a gap of
+    a few seconds its horizontal velocity is far better than the anchor's
+    bound of max_gap_speed_m_s on unknown motion (strong gusts, series VT:
+    VO gaps of 4-5 s made the anchor drop the lock and lock again on a map
+    shifted by 3 m). The error of the integrated displacement is
+    sigma(L) = sqrt(s0^2 + (s1 L)^2 + (s2 L^2)^2) per axis for a gap of L s,
+    the parameters from calibration flights (tools/calibrate_vo_gap_bridge.py).
+    """
+
+    def __init__(self, sigma0_m: float, sigma_per_s_m: float, sigma_per_s2_m: float,
+                 max_sample_gap_us: int = 200_000, keep_us: int = 30_000_000) -> None:
+        if not all(isfinite(x) and x >= 0 for x in (sigma0_m, sigma_per_s_m, sigma_per_s2_m)):
+            raise ValueError("bridge sigmas must be finite and >= 0")
+        self.s = (float(sigma0_m), float(sigma_per_s_m), float(sigma_per_s2_m))
+        self._max_gap = max_sample_gap_us
+        self._keep = keep_us
+        self._t: deque = deque()
+        self._v: deque = deque()
+
+    @classmethod
+    def from_json(cls, d: dict) -> "VelocityBridge":
+        return cls(d["sigma0_m"], d["sigma_per_s_m"], d["sigma_per_s2_m"])
+
+    def add(self, t_us: int, vn: float, ve: float) -> None:
+        if not (isfinite(vn) and isfinite(ve)) or (self._t and t_us <= self._t[-1]):
+            return
+        self._t.append(int(t_us))
+        self._v.append((float(vn), float(ve)))
+        while self._t[0] < t_us - self._keep:
+            self._t.popleft()
+            self._v.popleft()
+
+    def sigma_m(self, gap_s: float) -> float:
+        s0, s1, s2 = self.s
+        return float(np.sqrt(s0 ** 2 + (s1 * gap_s) ** 2 + (s2 * gap_s ** 2) ** 2))
+
+    def displacement(self, t0_us: int, t1_us: int) -> tuple[np.ndarray, float] | None:
+        """(north, east) displacement over [t0, t1] and its sigma; None if
+        the velocity history does not cover the interval densely."""
+        if t1_us <= t0_us or not self._t or self._t[0] > t0_us or self._t[-1] < t1_us:
+            return None
+        t = np.asarray(self._t, dtype=np.int64)
+        v = np.asarray(self._v, dtype=float)
+        inside = (t > t0_us) & (t < t1_us)
+        knots = np.concatenate([[t0_us], t[inside], [t1_us]])
+        if np.max(np.diff(knots)) > self._max_gap:
+            return None
+        vk = np.column_stack([np.interp(knots, t, v[:, 0]), np.interp(knots, t, v[:, 1])])
+        dt = np.diff(knots) * 1e-6
+        d = np.sum(0.5 * (vk[1:] + vk[:-1]) * dt[:, None], axis=0)
+        return d, self.sigma_m((t1_us - t0_us) * 1e-6)

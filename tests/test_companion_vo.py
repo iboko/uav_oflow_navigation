@@ -7,7 +7,7 @@ import pytest
 cv2 = pytest.importorskip("cv2")
 
 from src.camera_rotation_compensation import CameraMountCalibration
-from src.companion_vo import CompanionVo, History, TimeOffset
+from src.companion_vo import CompanionVo, History, TimeOffset, VerticalVelocityGate
 from src.continuous_visual_odometry import ContinuousPlanarOdometry
 from src.ground_visual_motion import CameraCalibration
 from src.surface_depth import SurfaceDepth
@@ -29,14 +29,14 @@ def _texture():
     return (255 * img).astype(np.uint8)
 
 
-def _pipeline(window_pairs=1, surface=None):
+def _pipeline(window_pairs=1, surface=None, vertical_gate=None):
     cal = CameraCalibration(F_PX, F_PX, 160.0, 120.0, IMAGE_TO_BODY)
     vo = ContinuousPlanarOdometry(
         cal, camera_mount=CameraMountCalibration(BODY_FROM_CAMERA),
         velocity_error_assumptions=VelocityErrorAssumptions(0.5, 0.05, 0.002, 0.02, 0.01,
                                                             velocity_model_floor_m_s=0.05),
         max_tilt_rad=0.25, surface=surface)
-    pipe = CompanionVo(vo, window_pairs=window_pairs)
+    pipe = CompanionVo(vo, window_pairs=window_pairs, vertical_gate=vertical_gate)
     for k in range(5):  # обмен TIMESYNC, задержка круга 2-6 мс
         sent = 1_000_000 + k * 200_000
         rtt = 2000 + 1000 * k
@@ -207,3 +207,50 @@ def test_dsm_altitude_is_sampled_at_the_rangefinder_hit_point():
     pipe.vo.process = lambda frame: seen.append(frame) or pipe.vo.reject_frame(frame.timestamp_us, "TEST")
     pipe.process(t_cam, _texture()[:240, :320], position_ne_m=(0.0, 0.0))
     assert seen[0].altitude_m == pytest.approx(50.0, abs=0.05)
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_range_step_does_not_reach_the_vertical_velocity_when_gated(gated):
+    """A 0.3-m rangefinder step (roof edge) between two frames: 4.5 m/s."""
+    texture = _texture()
+    pipe = _pipeline(vertical_gate=VerticalVelocityGate() if gated else None)
+    q = (1.0, 0.0, 0.0, 0.0)
+    dt_us = 66_667
+    outs = []
+    for k in range(8):
+        t_cam = 2_000_000 + k * dt_us
+        for j in range(-8, 9):
+            t_ap = t_cam + OFFSET_US + j * 10_000
+            pipe.attitude.add(t_ap, q)
+            pipe.distance.add(t_ap, 3.0 + (0.3 if t_ap - OFFSET_US >= 2_000_000 + 5 * dt_us - 5_000 else 0.0))
+        crop = cv2.getRectSubPix(texture, (320, 240), (450.0, 520.0 - 0.5 * k * dt_us * 1e-6 * F_PX / 3.0))
+        out = pipe.process(t_cam, crop)
+        if out is not None:
+            outs.append(out)
+    vz = [o.velocity_frd[2] for o in outs]
+    assert len(vz) >= 5, pipe.counts
+    # The step is smeared over the 10-ms range samples: -3 m/s, then -1.5.
+    if gated:
+        # What passes is bounded by the vertical acceleration over the hold
+        # plus the noise (9.81 x 0.133 s + 0.7 m/s), not tens of m/s.
+        assert max(abs(v) for v in vz) <= 9.81 * 2 * dt_us * 1e-6 + 0.7
+        assert pipe.counts["VO_VERTICAL_REJECTED"] >= 1
+        assert min(vz) > -2.9
+        assert min(o.variance_frd[2] for o in outs) == pytest.approx(2.5 ** 2)
+    else:
+        assert min(vz) < -2.9
+
+
+def test_vertical_gate_limits_and_hold():
+    g = VerticalVelocityGate()
+    assert g.held(0) == (0.0, 64.0)                 # nothing accepted yet
+    assert g.check(1_000_000, 0.5)
+    assert not g.check(1_066_000, 30.0)             # range step
+    assert not g.check(1_132_000, 9.0)              # beyond the absolute bound
+    vd, var = g.held(1_500_000)
+    assert vd == 0.5 and var == pytest.approx((9.81 * 0.5) ** 2 + 0.7 ** 2)
+    assert g.check(1_200_000, 1.5)                  # 0.5 + 9.81 x 0.2 + 0.7 allows it
+    assert not g.check(3_000_000, 8.5)              # after the hold: still bounded
+    assert g.check(3_000_000, 6.0)                  # after the hold: taken as is
+    with pytest.raises(ValueError):
+        VerticalVelocityGate(max_accel_m_s2=0.0)

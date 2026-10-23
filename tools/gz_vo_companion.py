@@ -39,12 +39,12 @@ from pymavlink import mavutil
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E402
 from src.attitude_time_alignment import quaternion_to_rpy  # noqa: E402
-from src.companion_map import GyroHeading, MapAnchor  # noqa: E402
+from src.companion_map import GyroHeading, MapAnchor, VelocityBridge  # noqa: E402
 from src.camera_rotation_compensation import body_to_ned  # noqa: E402
 from src.companion_msckf import CompanionMsckf  # noqa: E402
 from src.map_error_calibration import covariance_at_height, quality_covariance  # noqa: E402
 from src.map_error_field import MapErrorField  # noqa: E402
-from src.companion_vo import BodyVelocityMeasurement, CompanionVo, VelocityJumpGate  # noqa: E402
+from src.companion_vo import BodyVelocityMeasurement, CompanionVo, VelocityJumpGate, VerticalVelocityGate  # noqa: E402
 from src.error_state_inertial_filter import ImuNoiseDensity  # noqa: E402
 from src.feature_tracker import KltTracker  # noqa: E402
 from src.imu_preintegration import ImuReading  # noqa: E402
@@ -186,6 +186,11 @@ def main() -> None:
                     help="ncc: centre the map patch where the optical axis meets the ground (steady tilt, wind)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12,
                     help="ncc: largest roll/pitch for map matching (OrthoNccLocalizer max_tilt_rad, <= 0.2)")
+    ap.add_argument("--no-vo-vertical-gate", action="store_true",
+                    help="send the raw range-rate vertical velocity (src/companion_vo.py VerticalVelocityGate)")
+    ap.add_argument("--vo-gap-bridge", type=Path,
+                    help="JSON from tools/calibrate_vo_gap_bridge.py: carry the map anchor across VO gaps "
+                         "with the autopilot velocity (src/companion_map.py VelocityBridge)")
     ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25,
                     help="largest roll/pitch of a VO frame pair (planar model, ContinuousPlanarOdometry, <= 0.4)")
     ap.add_argument("--map-yaw", action="store_true",
@@ -233,6 +238,8 @@ def main() -> None:
         ap.error("--vo-max-tilt-rad must be in (0, 0.4]")
     if args.map_mode != "off" and not (args.orthophoto and args.map_georef):
         ap.error("--map-mode needs --orthophoto and --map-georef")
+    if args.vo_gap_bridge and args.map_mode != "fuse":
+        ap.error("--vo-gap-bridge needs --map-mode fuse")
     if args.map_mode == "fuse" and not args.map_calibration:
         ap.error("--map-mode fuse needs --map-calibration (no uncalibrated map covariance)")
     if not all(math.isfinite(x) and x > 0 for x in (args.max_fix_age_s, args.max_map_step_error_m)):
@@ -280,6 +287,8 @@ def main() -> None:
     source = "primary"
     map_shift = np.zeros(2)
     map_outage = False
+    vo_outage = False   # injected VO dropout (map control "vo_outage"; calibration flights)
+    bridge = VelocityBridge.from_json(json.loads(args.vo_gap_bridge.read_text())) if args.vo_gap_bridge else None
     msckf: CompanionMsckf | None = None
     tracker: KltTracker | None = None
     last_msckf_t = 0
@@ -351,6 +360,8 @@ def main() -> None:
                                              "a": list(reading.specific_force_body_m_s2)}) + "\n")
             elif t == "LOCAL_POSITION_NED":
                 local_ne = np.array([msg.x, msg.y])
+                if bridge is not None and pipeline.clock.valid:
+                    bridge.add(msg.time_boot_ms * 1000 - pipeline.clock.offset_us, msg.vx, msg.vy)
                 # Before the first lock nothing of ours is fused yet: the
                 # autopilot position is GNSS-aided and independent of the map.
                 if anchor is not None and not anchor.counts.get("LOCK_ACQUIRED"):
@@ -379,7 +390,8 @@ def main() -> None:
                     fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
-            pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs)
+            pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs,
+                                   vertical_gate=None if args.no_vo_vertical_gate else VerticalVelocityGate())
             # The gate's acceleration bound (3.7 m/s^2) is derived from the 0.25 rad
             # VO tilt limit; it scales with tan(limit) when the limit is changed.
             jump_accel = 3.7 * math.tan(args.vo_max_tilt_rad) / math.tan(0.25)
@@ -438,6 +450,8 @@ def main() -> None:
         if wall - last_rates > 5.0:
             streams = [(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE_QUATERNION, 100),
                        (mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR, 50)]
+            if bridge is not None:
+                streams.append((mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 50))
             if args.attitude_stamp == "sample":
                 streams.append((mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY, 100))
             if msckf is not None:
@@ -455,6 +469,7 @@ def main() -> None:
                 ctl = json.loads(args.map_control.read_text())
                 map_shift = np.asarray(ctl.get("shift_ne_m", (0, 0)), float)
                 map_outage = bool(ctl.get("outage", False))
+                vo_outage = bool(ctl.get("vo_outage", False))
             except (OSError, ValueError):
                 pass
         # Process frames in order once autopilot samples exist after them.
@@ -465,7 +480,10 @@ def main() -> None:
                 import cv2
                 args.save_frames.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(args.save_frames / f"{t_frame}.png"), gray)
-            if msckf is not None:
+            if vo_outage:
+                out = None
+                pipeline.count("VO_OUTAGE")
+            elif msckf is not None:
                 out = msckf_measurement(pipeline, msckf, tracker, t_frame, gray, last_msckf_t, record, msckf_scale)
                 if out is not None:
                     last_msckf_t = t_frame
@@ -495,8 +513,16 @@ def main() -> None:
                 if gyro is not None:
                     d = gyro.at(out.time_us + pipeline.clock.offset_us) - out.rpy_mid[2]
                     ref = math.atan2(math.sin(d), math.cos(d)) if math.isfinite(d) else float("nan")
+                gap_d = gap_sigma = None
+                if bridge is not None and anchor.time_us and r.interval_start_us - anchor.time_us > 1000:
+                    b = bridge.displacement(anchor.time_us, r.interval_start_us)
+                    if b is not None:
+                        gap_d, gap_sigma = (float(b[0][0]), float(b[0][1])), b[1]
+                    else:
+                        pipeline.count("VO_GAP_NOT_BRIDGED")
                 anchor.propagate(r.interval_start_us, r.timestamp_us, v_prop, c_prop,
-                                 reference_minus_autopilot_rad=ref)
+                                 reference_minus_autopilot_rad=ref, gap_displacement_ne=gap_d,
+                                 gap_sigma_m=gap_sigma)
             if localizer is not None and map_outage and t_frame - last_map_t >= 1e6 / args.map_rate_hz:
                 # Injected outage (map control): no map matching at all.
                 last_map_t = t_frame
