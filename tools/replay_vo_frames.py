@@ -146,7 +146,8 @@ def load_inputs(flight: Path, surface: SurfaceDepth | None, attitude_shift_us: f
 
 
 def replay(inp: dict, *, attitude="ekf", height="range", depth="none", position="ekf", altitude="range",
-           pair_step=1, surface: SurfaceDepth | None = None, hfov=1.2, gyro_blend=0.05) -> dict:
+           pair_step=1, surface: SurfaceDepth | None = None, hfov=1.2, gyro_blend=0.05,
+           max_tilt_rad=0.25) -> dict:
     first = cv2.imread(str(inp["frames"][0]), cv2.IMREAD_GRAYSCALE)
     h, w = first.shape
     cal = calibration(w, h, hfov)
@@ -155,7 +156,7 @@ def replay(inp: dict, *, attitude="ekf", height="range", depth="none", position=
         velocity_error_assumptions=VelocityErrorAssumptions(
             fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
             yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
-        max_tilt_rad=0.25, max_pair_dt_s=min(1.0, 0.25 * pair_step), surface=surface if depth == "dsm" else None)
+        max_tilt_rad=max_tilt_rad, max_pair_dt_s=min(1.0, 0.25 * pair_step), surface=surface if depth == "dsm" else None)
     if attitude == "gyro":
         rpy = np.column_stack(quat_rpy(gyro_attitude(inp["t"], inp["q_ekf"], inp["rate"], gyro_blend)))
     elif attitude in ("tilt_truth", "yaw_truth"):
@@ -217,6 +218,7 @@ def main(argv=None) -> int:
     ap.add_argument("--position", choices=("ekf", "truth"), default="ekf")
     ap.add_argument("--altitude", choices=("range", "ekf", "truth"), default="range")
     ap.add_argument("--pair-step", type=int, default=1)
+    ap.add_argument("--max-tilt-rad", type=float, default=0.25, help="VO planar-model tilt limit (companion: 0.25)")
     ap.add_argument("--surface", type=Path, help="DSM .npy on the orthophoto grid (needed for --depth dsm)")
     ap.add_argument("--georef", type=Path, help="orthophoto georef JSON of the surface grid")
     ap.add_argument("--out", type=Path, help="write per-pair errors (CSV)")
@@ -229,7 +231,7 @@ def main(argv=None) -> int:
     inp = load_inputs(args.flight, surface, args.attitude_shift_ms * 1e3, args.attitude_stamp)
     res = replay(inp, attitude=args.attitude, height=args.height, depth=args.depth, position=args.position,
                  altitude=args.altitude, pair_step=args.pair_step, surface=surface,
-                 gyro_blend=args.gyro_blend)
+                 gyro_blend=args.gyro_blend, max_tilt_rad=args.max_tilt_rad)
     if args.out:
         np.savetxt(args.out, res["errors"], delimiter=",", header="t_us,err_n,err_e,ref_vn,ref_ve", comments="")
     res.pop("errors")

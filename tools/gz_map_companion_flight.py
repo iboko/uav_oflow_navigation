@@ -536,6 +536,7 @@ def main() -> None:
     ap.add_argument("--map-patch-at-boresight", action="store_true",
                     help="companion: map patch centred on the optical axis (see gz_vo_companion.py)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12, help="companion: map matching tilt limit")
+    ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25, help="companion: VO frame-pair tilt limit")
     ap.add_argument("--wind-ne-m-s", type=float, nargs=2, metavar=("NORTH", "EAST"),
                     help="steady wind from reaching altitude on (drag force on the model, tools/gz_wind.py)")
     ap.add_argument("--wind-gust-sigma", type=float, default=0.0, help="gust speed sigma per axis, m/s")
@@ -622,6 +623,8 @@ def main() -> None:
         if args.mode not in ("test", "heading") or not 1 <= first <= last <= len(TEST_ROUTES[args.test_route]):
             ap.error(f"--map-outage-legs needs a test route and 1 <= FIRST <= LAST <= "
                      f"{len(TEST_ROUTES[args.test_route])}")
+    if not 0.0 < args.vo_max_tilt_rad <= 0.4:
+        ap.error("--vo-max-tilt-rad must be in (0, 0.4]")
     params = dict(PARAMS, EKF2_EV_CTRL="13") if args.ev_yaw else dict(PARAMS)
     if args.mode == "heading":
         # A 3D magnetometer with estimated earth field absorbs a declination
@@ -697,6 +700,8 @@ def main() -> None:
         cmd += ["--attitude-stamp", args.attitude_stamp]
         if args.map_max_tilt_rad != 0.12:
             cmd += ["--map-max-tilt-rad", str(args.map_max_tilt_rad)]
+        if args.vo_max_tilt_rad != 0.25:
+            cmd += ["--vo-max-tilt-rad", str(args.vo_max_tilt_rad)]
         if args.map_patch_at_boresight:
             cmd += ["--map-patch-at-boresight"]
         if args.vo_window_pairs != 1:

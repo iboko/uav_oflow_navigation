@@ -186,6 +186,8 @@ def main() -> None:
                     help="ncc: centre the map patch where the optical axis meets the ground (steady tilt, wind)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12,
                     help="ncc: largest roll/pitch for map matching (OrthoNccLocalizer max_tilt_rad, <= 0.2)")
+    ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25,
+                    help="largest roll/pitch of a VO frame pair (planar model, ContinuousPlanarOdometry, <= 0.4)")
     ap.add_argument("--map-yaw", action="store_true",
                     help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
@@ -227,6 +229,8 @@ def main() -> None:
         # The map anchor keeps 16 intervals: a longer window's midpoint
         # would lose the map position.
         ap.error("--vo-window-pairs must be 1..16")
+    if not 0.0 < args.vo_max_tilt_rad <= 0.4:
+        ap.error("--vo-max-tilt-rad must be in (0, 0.4]")
     if args.map_mode != "off" and not (args.orthophoto and args.map_georef):
         ap.error("--map-mode needs --orthophoto and --map-georef")
     if args.map_mode == "fuse" and not args.map_calibration:
@@ -374,9 +378,13 @@ def main() -> None:
                 velocity_error_assumptions=VelocityErrorAssumptions(
                     fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
-                max_tilt_rad=0.25, max_pair_dt_s=0.25, surface=vo_surface)
+                max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
             pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs)
-            jump_gate = None if args.no_vo_jump_gate or args.estimator == "msckf" else VelocityJumpGate()
+            # The gate's acceleration bound (3.7 m/s^2) is derived from the 0.25 rad
+            # VO tilt limit; it scales with tan(limit) when the limit is changed.
+            jump_accel = 3.7 * math.tan(args.vo_max_tilt_rad) / math.tan(0.25)
+            jump_gate = (None if args.no_vo_jump_gate or args.estimator == "msckf"
+                         else VelocityJumpGate(max_accel_m_s2=jump_accel))
             if args.estimator == "msckf":
                 msckf = CompanionMsckf(
                     PinholeCamera(cal.focal_x_px, cal.focal_y_px, cal.center_x_px, cal.center_y_px,
