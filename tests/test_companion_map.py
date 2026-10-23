@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from src.companion_map import AnchorMeasurement, GyroHeading, MapAnchor
+from src.companion_map import AnchorMeasurement, GyroHeading, MapAnchor, VelocityBridge
 
 R = ((0.05 ** 2, 0.0), (0.0, 0.05 ** 2))
 VO_COV = ((0.05 ** 2, 0.0), (0.0, 0.05 ** 2))
@@ -366,3 +366,60 @@ def test_window_midpoint_position_from_an_earlier_interval():
     # A VO gap clears the history: no position across it.
     anchor.propagate(t + 50_000, t + 150_000, (2.0, 0.0), VO_COV)
     assert anchor.measurement_at(start + 150_000, max_fix_age_s=10.0) is None
+
+
+def test_bridged_vo_gap_keeps_the_lock_and_rejects_a_shift_behind_it():
+    # Strong gusts (series VT, seed 8): a 4.7-s VO gap inside the map fault.
+    # Bound on unknown motion: 2 m/s x 4.7 s -> lock lost, then locked again
+    # on the shifted map. Bridged by the autopilot velocity it holds.
+    for bridged in (False, True):
+        anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+        _, pos, t = _fly(anchor, 5)
+        gap = 4_700_000
+        kw = {"gap_displacement_ne": (4.7, 0.0), "gap_sigma_m": 0.3} if bridged else {}
+        anchor.propagate(t + gap, t + gap + DT, (1.0, 0.0), VO_COV, **kw)
+        t += gap + DT
+        pos = pos + np.array([4.7 + DT * 1e-6, 0.0])
+        if not bridged:
+            assert not anchor.locked and anchor.counts["LOCK_LOST_UNCERTAINTY"] == 1
+            continue
+        assert anchor.locked and anchor.counts["VO_GAP_BRIDGED"] == 1
+        assert np.allclose(anchor.status().position_ne_m, pos)
+        assert anchor.fix(t, True, pos[0], pos[1] + 3.0) in ("FIX_REJECTED_STEP", "FIX_REJECTED_NIS")
+        anchor.propagate(t, t + DT, (1.0, 0.0), VO_COV)
+        t += DT
+        assert anchor.fix(t, True, pos[0] + DT * 1e-6, pos[1]) == "FIX_FUSED"
+
+
+def test_bridged_vo_gap_keeps_acquisition_candidates():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, pos, t = _fly(anchor, 2)                     # two candidates
+    anchor.propagate(t + 2_000_000, t + 2_000_000 + DT, (1.0, 0.0), VO_COV,
+                     gap_displacement_ne=(2.0, 0.0), gap_sigma_m=0.2)
+    t += 2_000_000 + DT
+    assert anchor.fix(t, True, pos[0] + 2.0 + DT * 1e-6, pos[1]) == "LOCK_ACQUIRED"
+
+
+def test_unbridged_vo_gap_restarts_acquisition():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, pos, t = _fly(anchor, 2)
+    anchor.propagate(t + 2_000_000, t + 2_000_000 + DT, (1.0, 0.0), VO_COV)
+    assert anchor.counts["ACQUISITION_VO_GAP"] == 1
+
+
+def test_velocity_bridge_integrates_and_needs_dense_coverage():
+    b = VelocityBridge(0.1, 0.05, 0.01)
+    for k in range(0, 101):
+        b.add(k * 20_000, 1.0 + 0.01 * k, -0.5)     # 50 Hz, 2 s
+    d, sigma = b.displacement(100_000, 1_900_000)
+    # v(t) = 1 + 0.5 t: integral over [0.1, 1.9] s.
+    assert d[0] == pytest.approx(1.8 + 0.25 * (1.9 ** 2 - 0.1 ** 2), rel=1e-6)
+    assert d[1] == pytest.approx(-0.9)
+    assert sigma == pytest.approx(np.sqrt(0.1 ** 2 + (0.05 * 1.8) ** 2 + (0.01 * 1.8 ** 2) ** 2))
+    assert b.displacement(1_900_000, 2_100_000) is None   # beyond the history
+    sparse = VelocityBridge(0.1, 0.05, 0.01)
+    sparse.add(0, 1.0, 0.0)
+    sparse.add(1_000_000, 1.0, 0.0)
+    assert sparse.displacement(0, 1_000_000) is None
+    with pytest.raises(ValueError):
+        VelocityBridge(-0.1, 0.0, 0.0)
