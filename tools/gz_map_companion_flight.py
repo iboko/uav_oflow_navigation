@@ -537,7 +537,8 @@ def main() -> None:
                     help="companion: map patch centred on the optical axis (see gz_vo_companion.py)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12, help="companion: map matching tilt limit")
     ap.add_argument("--vo-gap-bridge", type=Path,
-                    help="companion: carry the map anchor across VO gaps with the autopilot velocity (JSON)")
+                    help="companion: VO-gap bridge calibration (JSON; default: the companion's)")
+    ap.add_argument("--no-vo-gap-bridge", action="store_true", help="companion: no VO-gap bridge")
     ap.add_argument("--vo-outages-s", type=float, nargs="+", metavar="LEN",
                     help="calibration: injected VO dropouts on the test route, these lengths in turn "
                          "(sim s), --vo-outage-off-s apart (gap bridge calibration flights, not tests)")
@@ -711,6 +712,8 @@ def main() -> None:
             cmd += ["--map-max-tilt-rad", str(args.map_max_tilt_rad)]
         if args.vo_gap_bridge:
             cmd += ["--vo-gap-bridge", str(args.vo_gap_bridge.resolve())]
+        if args.no_vo_gap_bridge:
+            cmd += ["--no-vo-gap-bridge"]
         if args.vo_max_tilt_rad != 0.25:
             cmd += ["--vo-max-tilt-rad", str(args.vo_max_tilt_rad)]
         if args.map_patch_at_boresight:

@@ -37,6 +37,9 @@ from gz.transport13 import Node
 from pymavlink import mavutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Strong gusts, diag, seeds 33-36 and 41-44: all checks 7 of 8 flights with the
+# bridge, 3 of 8 without (one relocked on the shifted map: 32 fixes fused).
+DEFAULT_GAP_BRIDGE = Path(__file__).resolve().parents[1] / "calibration" / "vo_gap_bridge_swiss3d_50m_gusts.json"
 from src.camera_rotation_compensation import CameraMountCalibration  # noqa: E402
 from src.attitude_time_alignment import quaternion_to_rpy  # noqa: E402
 from src.companion_map import GyroHeading, MapAnchor, VelocityBridge  # noqa: E402
@@ -188,9 +191,12 @@ def main() -> None:
                     help="ncc: largest roll/pitch for map matching (OrthoNccLocalizer max_tilt_rad, <= 0.2)")
     ap.add_argument("--no-vo-vertical-gate", action="store_true",
                     help="send the raw range-rate vertical velocity (src/companion_vo.py VerticalVelocityGate)")
-    ap.add_argument("--vo-gap-bridge", type=Path,
+    ap.add_argument("--vo-gap-bridge", type=Path, default=DEFAULT_GAP_BRIDGE,
                     help="JSON from tools/calibrate_vo_gap_bridge.py: carry the map anchor across VO gaps "
-                         "with the autopilot velocity (src/companion_map.py VelocityBridge)")
+                         "with the autopilot velocity (src/companion_map.py VelocityBridge); fuse mode, "
+                         "default: the strong-gust calibration (series GB)")
+    ap.add_argument("--no-vo-gap-bridge", action="store_true",
+                    help="VO gaps as unknown motion (max_gap_speed_m_s), the anchor may drop its lock")
     ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25,
                     help="largest roll/pitch of a VO frame pair (planar model, ContinuousPlanarOdometry, <= 0.4)")
     ap.add_argument("--map-yaw", action="store_true",
@@ -238,8 +244,8 @@ def main() -> None:
         ap.error("--vo-max-tilt-rad must be in (0, 0.4]")
     if args.map_mode != "off" and not (args.orthophoto and args.map_georef):
         ap.error("--map-mode needs --orthophoto and --map-georef")
-    if args.vo_gap_bridge and args.map_mode != "fuse":
-        ap.error("--vo-gap-bridge needs --map-mode fuse")
+    if args.no_vo_gap_bridge or args.map_mode != "fuse":
+        args.vo_gap_bridge = None
     if args.map_mode == "fuse" and not args.map_calibration:
         ap.error("--map-mode fuse needs --map-calibration (no uncalibrated map covariance)")
     if not all(math.isfinite(x) and x > 0 for x in (args.max_fix_age_s, args.max_map_step_error_m)):
