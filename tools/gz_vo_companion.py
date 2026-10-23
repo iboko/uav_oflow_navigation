@@ -380,7 +380,11 @@ def main() -> None:
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
             pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs)
-            jump_gate = None if args.no_vo_jump_gate or args.estimator == "msckf" else VelocityJumpGate()
+            # The gate's acceleration bound (3.7 m/s^2) is derived from the 0.25 rad
+            # VO tilt limit; it scales with tan(limit) when the limit is changed.
+            jump_accel = 3.7 * math.tan(args.vo_max_tilt_rad) / math.tan(0.25)
+            jump_gate = (None if args.no_vo_jump_gate or args.estimator == "msckf"
+                         else VelocityJumpGate(max_accel_m_s2=jump_accel))
             if args.estimator == "msckf":
                 msckf = CompanionMsckf(
                     PinholeCamera(cal.focal_x_px, cal.focal_y_px, cal.center_x_px, cal.center_y_px,
