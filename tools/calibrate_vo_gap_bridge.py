@@ -60,7 +60,10 @@ def flight_gaps(d: Path, min_gap_s: float = 0.3) -> np.ndarray:
         knots = np.concatenate([[t0], lp["timestamp"][m], [t1]])
         if np.max(np.diff(knots)) > 200_000:
             continue
-        d_est = [np.trapezoid(np.interp(knots, lp["timestamp"], lp[c]), knots * 1e-6) for c in ("vx", "vy")]
+        dt = np.diff(knots) * 1e-6
+        # Trapezoid sum by hand: np.trapezoid needs NumPy 2, np.trapz is deprecated there.
+        d_est = [float(np.sum(0.5 * (v[1:] + v[:-1]) * dt))
+                 for v in (np.interp(knots, lp["timestamp"], lp[c]) for c in ("vx", "vy"))]
         d_true = [np.interp(t1, gt["timestamp"], gt[c]) - np.interp(t0, gt["timestamp"], gt[c]) for c in "xy"]
         out.append(((t1 - t0) * 1e-6, d_est[0] - d_true[0], d_est[1] - d_true[1]))
     return np.array(out).reshape(-1, 3)
