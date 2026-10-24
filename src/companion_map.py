@@ -111,9 +111,6 @@ class MapAnchor:
         self._last_map_z: np.ndarray | None = None
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
-        # Last step-rejected fix and VO since: the series of a jumped map.
-        self._rejected_z: np.ndarray | None = None
-        self._vo_since_rejected = np.zeros(2)
         self._drift_sigma_m = np.zeros(3)  # scale, heading, unobserved VO gaps
         self._prior_p: np.ndarray | None = None
         self._prior_cov: np.ndarray | None = None
@@ -238,7 +235,6 @@ class MapAnchor:
             return
         self._p = self._p + d
         self._vo_since_fix += d
-        self._vo_since_rejected += d
         # Unbridged: gap_unc_m is a bound on motion. Bridged: a 1-sigma error
         # with heavy tails (calibration flights, strong gusts: 1 of 52 gaps at
         # 5.8 sigma), so 2 sigma: a 3-m shift after a 4-s gap stays above the
@@ -268,7 +264,6 @@ class MapAnchor:
             self._p = None
             self._cov = None
             self._last_map_z = None
-            self._rejected_z = None
             self._candidates.clear()
             self._count("LOCK_LOST_UNCERTAINTY")
             # Повторный захват — только по кинематически согласованным
@@ -337,9 +332,6 @@ class MapAnchor:
         nis = float(y @ np.linalg.solve(s, y))
         self.last_nis = nis
         if not isfinite(nis) or nis > self._gate:
-            if isfinite(nis):
-                self._rejected_z = z.copy()
-                self._vo_since_rejected = np.zeros(2)
             self._count("FIX_REJECTED_NIS")
             return "FIX_REJECTED_NIS"
         # A wide marginal covariance must not hide a sudden georeference
@@ -347,19 +339,7 @@ class MapAnchor:
         # retaining the same reference after every rejection. This is a
         # configurable engineering bound, not a statistical integrity proof.
         self.last_step_error_m = float(np.linalg.norm(z - self._last_map_z - self._vo_since_fix))
-        # The budget grows with every VO gap while the fixes of a jumped map
-        # are rejected (strong gusts, seed 53: five bridged gaps in 15 s let
-        # a 3-m shift through, true drift 0.6 m). A fix that continues the
-        # rejected series (much closer to it than to the accepted reference)
-        # stays rejected however large the budget has grown.
-        continues_rejected = (
-            self._rejected_z is not None and self.last_step_error_m > self._step_limit
-            and float(np.linalg.norm(z - self._rejected_z - self._vo_since_rejected)) < 0.5 * self.last_step_error_m)
-        if continues_rejected or self.last_step_error_m > self._step_limit + self._step_budget_m:
-            if continues_rejected:
-                self._count("STEP_REJECTED_SERIES")
-            self._rejected_z = z.copy()
-            self._vo_since_rejected = np.zeros(2)
+        if self.last_step_error_m > self._step_limit + self._step_budget_m:
             self._count("FIX_REJECTED_STEP")
             return "FIX_REJECTED_STEP"
         self._p, self._cov, self.last_ci_weight_prior = covariance_intersection_2d(
@@ -367,7 +347,6 @@ class MapAnchor:
         self._last_map_z = z.copy()
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
-        self._rejected_z = None
         self._drift_sigma_m[:] = 0.0
         self._heading(heading_offset_rad)
         self.last_fix_us = t_us
@@ -417,7 +396,6 @@ class MapAnchor:
         self._last_map_z = z.copy()
         self._vo_since_fix = np.zeros(2)
         self._step_budget_m = 0.0
-        self._rejected_z = None
         self._drift_sigma_m[:] = 0.0
         self._candidates.clear()
         self._prior_p = self._prior_cov = None
