@@ -423,3 +423,38 @@ def test_velocity_bridge_integrates_and_needs_dense_coverage():
     assert sparse.displacement(0, 1_000_000) is None
     with pytest.raises(ValueError):
         VelocityBridge(-0.1, 0.0, 0.0)
+
+
+def test_shift_stays_rejected_after_the_budget_grew_over_bridged_gaps():
+    # Seed 53: the map shifted by 3 m, step rejections, then several bridged
+    # VO gaps grew the step budget beyond the shift.
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, pos, t = _fly(anchor, 5, v=(0.0, 0.0))
+    shift = np.array([0.0, 3.0])
+    anchor.propagate(t, t + DT, (0.0, 0.0), VO_COV)
+    t += DT
+    assert anchor.fix(t, True, *(pos + shift)) in ("FIX_REJECTED_STEP", "FIX_REJECTED_NIS")
+    results = []
+    for _ in range(4):           # budget 1 m + 2 x 0.6 m per gap passes 3 m after two
+        gap = 3_000_000
+        anchor.propagate(t + gap, t + gap + DT, (0.0, 0.0), VO_COV, gap_displacement_ne=(0.0, 0.0), gap_sigma_m=0.6)
+        t += gap + DT
+        results.append(anchor.fix(t, True, *(pos + shift)))
+    assert anchor.locked
+    assert "FIX_FUSED" not in results, results
+    assert anchor.counts.get("STEP_REJECTED_SERIES", 0) >= 1
+    # The map is right again: fused, the rejected series forgotten.
+    anchor.propagate(t, t + DT, (0.0, 0.0), VO_COV)
+    t += DT
+    assert anchor.fix(t, True, *pos) == "FIX_FUSED"
+
+
+def test_single_outlier_does_not_block_the_next_good_fix():
+    anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+    _, pos, t = _fly(anchor, 5, v=(0.0, 0.0))
+    anchor.propagate(t, t + DT, (0.0, 0.0), VO_COV)
+    t += DT
+    assert anchor.fix(t, True, pos[0] + 2.0, pos[1]) in ("FIX_REJECTED_STEP", "FIX_REJECTED_NIS")
+    anchor.propagate(t, t + DT, (0.0, 0.0), VO_COV)
+    t += DT
+    assert anchor.fix(t, True, *pos) == "FIX_FUSED"

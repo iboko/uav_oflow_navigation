@@ -198,3 +198,20 @@ def test_patch_at_boresight_keeps_a_tilted_frame_usable():
     fix = bore.localize(frame, **kw)
     assert fix.accepted, (fix, bore.last_peak, bore.last_margin)
     assert math.hypot(fix.north_m - n, fix.east_m - e) < 0.3
+
+
+def test_weak_match_needs_both_low_margin_and_low_peak():
+    world = _texture()
+    n, e, h, y = 12.0, -8.0, 40.0, math.radians(80)
+    frame = _render(world, n, e, h, 0.0, 0.0, y)
+    kw = dict(prior_ne_m=(n, e), radius_m=10.0, height_agl_m=h, roll_rad=0.0, pitch_rad=0.0, yaw_rad=y)
+    probe = OrthoNccLocalizer(world, GEO, CAL, MOUNT)
+    assert probe.localize(frame, **kw).accepted
+    peak, margin = probe.last_peak, probe.last_margin
+    both = OrthoNccLocalizer(world, GEO, CAL, MOUNT, weak_match=(margin + 0.01, peak + 0.01)).localize(frame, **kw)
+    assert not both.accepted and both.status == "WEAK_AMBIGUOUS_MATCH"
+    # Only one of the two below its limit: kept.
+    assert OrthoNccLocalizer(world, GEO, CAL, MOUNT, weak_match=(margin + 0.01, peak - 0.01)).localize(frame, **kw).accepted
+    assert OrthoNccLocalizer(world, GEO, CAL, MOUNT, weak_match=(margin - 0.01, peak + 0.01)).localize(frame, **kw).accepted
+    with pytest.raises(ValueError):
+        OrthoNccLocalizer(world, GEO, CAL, MOUNT, weak_match=(0.1, -0.5))
