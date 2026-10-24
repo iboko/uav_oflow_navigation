@@ -44,7 +44,8 @@ class OrthoNccLocalizer:
                  subpatch_search_m: float = 3.0, surface_m: np.ndarray | None = None,
                  occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1,
                  refine_radius_m: float = 0.0, refine_min_shift_m: float = 1.0,
-                 yaw_extension_deg: float = 12.0, patch_at_boresight: bool = False) -> None:
+                 yaw_extension_deg: float = 12.0, patch_at_boresight: bool = False,
+                 weak_match: tuple[float, float] | None = None) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -73,6 +74,16 @@ class OrthoNccLocalizer:
         if self.npx < 3:
             raise ValueError("Патч NCC должен содержать не менее трех пикселей на сторону")
         self.min_peak, self.min_margin = min_peak, min_margin
+        # (margin, peak): a match below both is rejected. Strong gusts
+        # (calibration flights GB, seeds 21-24): fixes with margin < 0.10
+        # were > 2 m off in 52 % of cases (3.6-4.8 m rms), but in the same
+        # zone without wind such margins are exact; the bad ones also have
+        # a lower peak (median 0.49 against 0.55). margin < 0.10 and peak <
+        # 0.52 rejects 69 % of the bad fixes and 4 % of the good ones there,
+        # 52 % / 11 % on the no-wind calibration flights P and V.
+        if weak_match is not None and not (len(weak_match) == 2 and all(isfinite(x) and x > 0 for x in weak_match)):
+            raise ValueError("weak_match must be (margin, peak), both positive")
+        self.weak_match = None if weak_match is None else (float(weak_match[0]), float(weak_match[1]))
         self.shape_radius_px = max(1, int(round(shape_radius_m / self.gsd)))
         self.subpatch_search_px = max(1, int(round(subpatch_search_m / self.gsd)))
         # Surface model (DSM) on the map grid [m, up, any common datum]: the
@@ -279,6 +290,8 @@ class OrthoNccLocalizer:
             return MapLocalizationFix(False, "WEAK_CORRELATION")
         if peak - second < self.min_margin:
             return MapLocalizationFix(False, "AMBIGUOUS_MAP_MATCH")
+        if self.weak_match is not None and peak - second < self.weak_match[0] and peak < self.weak_match[1]:
+            return MapLocalizationFix(False, "WEAK_AMBIGUOUS_MATCH")
         x, y = float(loc[0]), float(loc[1])
         # Sub-pixel peak: parabola through the neighbours.
         if 0 < loc[0] < res.shape[1] - 1:
