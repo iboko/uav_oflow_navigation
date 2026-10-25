@@ -324,6 +324,11 @@ TEST_ROUTES = {
 }
 
 
+# Area over the test routes (their fixes span N -57..0 m, E 0..60 m) for
+# --calib-walk-in-test-zone: (north range, east range), m.
+CALIB_ZONE_BOX = ((-75.0, 10.0), (-10.0, 75.0))
+
+
 def in_test_zone(north_m, east_m):
     return (np.asarray(north_m) < 10.0) & (np.asarray(east_m) > -10.0)
 
@@ -616,6 +621,10 @@ def main() -> None:
                          "180 270 (west to north) keeps every leg out of TEST_ZONE. 180 360 does not: "
                          "legs near 360 head east, into the zone (series P flights 5-6); 90 360: "
                          "series M/N, legs near 90 deg ran along the zone's south strip")
+    ap.add_argument("--calib-walk-in-test-zone", action="store_true",
+                    help="calibrate walk: over the test routes instead of away from them (map calibration "
+                         "of the test zone itself; a leg ends on leaving CALIB_ZONE_BOX). Its result "
+                         "is a zone-calibrated setup, reported apart from the zone-independent one")
     ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
                     help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
@@ -634,6 +643,8 @@ def main() -> None:
                      f"{len(TEST_ROUTES[args.test_route])}")
     if not 0.0 < args.vo_max_tilt_rad <= 0.4:
         ap.error("--vo-max-tilt-rad must be in (0, 0.4]")
+    if args.calib_walk_in_test_zone and (args.mode != "calibrate" or args.calib_walk_seed is None):
+        ap.error("--calib-walk-in-test-zone needs --mode calibrate and --calib-walk-seed")
     if args.vo_outages_s and (args.mode not in ("test", "heading") or args.map_outage_legs
                               or not all(0 < x <= 10 for x in args.vo_outages_s) or args.vo_outage_off_s <= 0):
         ap.error("--vo-outages-s needs a test route without --map-outage-legs, lengths in (0, 10] s")
@@ -812,6 +823,15 @@ def main() -> None:
                         # Stay over the scene: a leg ends early beyond
                         # calib_walk_bound_m from the centre (GNSS-aided
                         # position; series M flight 5 left the 400 m scene).
+                        target = None
+                        if args.calib_walk_in_test_zone:
+                            # Towards a random point of the box (forward = east, right = south).
+                            (n_lo, n_hi), (e_lo, e_hi) = CALIB_ZONE_BOX
+                            target = (rng.uniform(n_lo + 5, n_hi - 5), rng.uniform(e_lo + 5, e_hi - 5))
+                            a = math.atan2(-(target[0] - link.state["x"]), target[1] - link.state["y"])
+                            pitch, roll = round(stick * math.cos(a)), round(stick * math.sin(a))
+                            report.setdefault("calib_walk_zone_targets", []).append([round(target[0], 1),
+                                                                                     round(target[1], 1)])
                         link.pitch, link.roll = pitch, roll
                         t_leg = link.boot_s
                         while link.boot_s - t_leg < leg_s:
@@ -820,6 +840,12 @@ def main() -> None:
                                 report.setdefault("calib_walk_bounded_legs", 0)
                                 report["calib_walk_bounded_legs"] += 1
                                 break
+                            if target is not None:
+                                n_, e_ = link.state["x"], link.state["y"]
+                                if (math.hypot(n_ - target[0], e_ - target[1]) < 4.0
+                                        or not (n_lo <= n_ <= n_hi and e_lo <= e_ <= e_hi)):
+                                    break
+                                continue
                             # Nor over the test routes (their fixes are not
                             # used in combine anyway): beyond the start area.
                             if (in_test_zone(link.state["x"], link.state["y"])
