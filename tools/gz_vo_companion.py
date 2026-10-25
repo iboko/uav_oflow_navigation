@@ -175,6 +175,10 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
+    ap.add_argument("--ev-pos-repeat-scale", action="store_true",
+                    help="scale the horizontal position variance sent to EKF2 by (map fix interval / "
+                         "message interval): the anchor position goes with every VO message (~15 Hz) "
+                         "but carries one fix per map interval (2 Hz); EKF2 fuses each as independent")
     ap.add_argument("--acquisition-prior-sigma-m", type=float, default=3.0,
                     help="first map lock: autopilot (GNSS) position as prior with this sigma per axis")
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
@@ -289,6 +293,9 @@ def main() -> None:
     if log:
         log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers,jump_rejected\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
+    # Smoothed interval between sent messages (sim s), for --ev-pos-repeat-scale.
+    msg_dt_s: float | None = None
+    last_sent_us: int | None = None
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
     map_cal: dict | None = None
@@ -629,6 +636,10 @@ def main() -> None:
                 pos = [*measurement.position_ne_m,
                        -out.height_mid_m]  # map datum = ground plane; EV height is not fused
                 pose_cov = list(measurement.mavlink_pose_covariance(0.05 ** 2))
+                if args.ev_pos_repeat_scale and msg_dt_s is not None:
+                    k = min(30.0, max(1.0, (1.0 / args.map_rate_hz) / msg_dt_s))
+                    for i in (0, 1, 6):           # N-N, N-E, E-E of the pose covariance
+                        pose_cov[i] *= k
                 r, p_, y = out.rpy_mid
                 if gyro is not None:
                     # Not the autopilot heading: EKF2 turns it towards what
@@ -650,6 +661,10 @@ def main() -> None:
                 *pos, quat, *velocity, nan, nan, nan,
                 pose_cov, cov, 0, mavutil.mavlink.MAV_ESTIMATOR_TYPE_VIO, 100)
             sent += 1
+            if last_sent_us is not None and 0 < out.time_us - last_sent_us < 1_000_000:
+                dt = (out.time_us - last_sent_us) * 1e-6
+                msg_dt_s = dt if msg_dt_s is None else 0.9 * msg_dt_s + 0.1 * dt
+            last_sent_us = out.time_us
             if log:
                 r = out.vo
                 # Variances with 6 significant digits: calibrated MSCKF
