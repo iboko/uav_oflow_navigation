@@ -538,6 +538,8 @@ def main() -> None:
                     help="companion: VO feature depths on the DSM (with --dsm-surface)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="companion: mean VO velocity over this many frame pairs")
+    ap.add_argument("--no-ev-pos-repeat-scale", action="store_true",
+                    help="companion: position variance not scaled for its repetition (see gz_vo_companion.py)")
     ap.add_argument("--map-weak-match", type=float, nargs=2, metavar=("MARGIN", "PEAK"),
                     help="companion: reject NCC matches below both (see gz_vo_companion.py)")
     ap.add_argument("--map-patch-at-boresight", action="store_true",
@@ -731,6 +733,8 @@ def main() -> None:
             cmd += ["--vo-max-tilt-rad", str(args.vo_max_tilt_rad)]
         if args.map_patch_at_boresight:
             cmd += ["--map-patch-at-boresight"]
+        if args.no_ev_pos_repeat_scale:
+            cmd += ["--no-ev-pos-repeat-scale"]
         if args.map_weak_match:
             cmd += ["--map-weak-match", *map(str, args.map_weak_match)]
         if args.vo_window_pairs != 1:

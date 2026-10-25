@@ -175,6 +175,12 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
+    ap.add_argument("--no-ev-pos-repeat-scale", dest="ev_pos_repeat_scale", action="store_false",
+                    help="send the anchor position variance as is with every VO message (~15 Hz). By "
+                         "default it is scaled by (map fix interval / message interval): one fix per "
+                         "map interval (2 Hz), which EKF2 would otherwise fuse 7-8 times as independent. "
+                         "No wind: EKF2 velocity error 0.35 -> 0.09 m/s, route max 1.6-1.7 -> 0.5-0.6 m "
+                         "(zone-calibrated field), 1.2 -> 1.0 m (field A)")
     ap.add_argument("--acquisition-prior-sigma-m", type=float, default=3.0,
                     help="first map lock: autopilot (GNSS) position as prior with this sigma per axis")
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
@@ -289,6 +295,9 @@ def main() -> None:
     if log:
         log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers,jump_rejected\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
+    # Smoothed interval between sent messages (sim s), for --ev-pos-repeat-scale.
+    msg_dt_s: float | None = None
+    last_sent_us: int | None = None
     localizer: OrthophotoLocalizer | None = None
     anchor: MapAnchor | None = None
     map_cal: dict | None = None
@@ -629,6 +638,10 @@ def main() -> None:
                 pos = [*measurement.position_ne_m,
                        -out.height_mid_m]  # map datum = ground plane; EV height is not fused
                 pose_cov = list(measurement.mavlink_pose_covariance(0.05 ** 2))
+                if args.ev_pos_repeat_scale and msg_dt_s is not None:
+                    k = min(30.0, max(1.0, (1.0 / args.map_rate_hz) / msg_dt_s))
+                    for i in (0, 1, 6):           # N-N, N-E, E-E of the pose covariance
+                        pose_cov[i] *= k
                 r, p_, y = out.rpy_mid
                 if gyro is not None:
                     # Not the autopilot heading: EKF2 turns it towards what
@@ -650,6 +663,10 @@ def main() -> None:
                 *pos, quat, *velocity, nan, nan, nan,
                 pose_cov, cov, 0, mavutil.mavlink.MAV_ESTIMATOR_TYPE_VIO, 100)
             sent += 1
+            if last_sent_us is not None and 0 < out.time_us - last_sent_us < 1_000_000:
+                dt = (out.time_us - last_sent_us) * 1e-6
+                msg_dt_s = dt if msg_dt_s is None else 0.9 * msg_dt_s + 0.1 * dt
+            last_sent_us = out.time_us
             if log:
                 r = out.vo
                 # Variances with 6 significant digits: calibrated MSCKF
