@@ -175,10 +175,12 @@ def main() -> None:
     ap.add_argument("--map-calibration", type=Path,
                     help="JSON from calibrate_map_error: bias_ne_m, covariance_ne_m2 (fuse mode)")
     ap.add_argument("--map-rate-hz", type=float, default=2.0)
-    ap.add_argument("--ev-pos-repeat-scale", action="store_true",
-                    help="scale the horizontal position variance sent to EKF2 by (map fix interval / "
-                         "message interval): the anchor position goes with every VO message (~15 Hz) "
-                         "but carries one fix per map interval (2 Hz); EKF2 fuses each as independent")
+    ap.add_argument("--no-ev-pos-repeat-scale", dest="ev_pos_repeat_scale", action="store_false",
+                    help="send the anchor position variance as is with every VO message (~15 Hz). By "
+                         "default it is scaled by (map fix interval / message interval): one fix per "
+                         "map interval (2 Hz), which EKF2 would otherwise fuse 7-8 times as independent. "
+                         "No wind: EKF2 velocity error 0.35 -> 0.09 m/s, route max 1.6-1.7 -> 0.5-0.6 m "
+                         "(zone-calibrated field), 1.2 -> 1.0 m (field A)")
     ap.add_argument("--acquisition-prior-sigma-m", type=float, default=3.0,
                     help="first map lock: autopilot (GNSS) position as prior with this sigma per axis")
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
