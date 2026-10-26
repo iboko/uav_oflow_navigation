@@ -963,8 +963,18 @@ def main() -> None:
             # 4: map fault.
             def truth_ne():
                 return truth_est()[0]
+            def means(seconds=DRIFT_MEAN_S, step_s=0.5):
+                # Mean true position and mean estimate error over the same samples.
+                pts = []
+                for i in range(int(round(seconds / step_s)) + 1):
+                    if i:
+                        gz.sim_sleep(step_s)
+                    truth, est = truth_est()
+                    pts.append(np.concatenate([truth, est - truth]))
+                m = np.mean(pts, axis=0)
+                return m[:2], m[2:]
             settle_s = wait_settled(truth_ne, gz.sim_sleep)
-            truth0 = mean_position(truth_ne, gz.sim_sleep)
+            truth0, err0 = means()
             before = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
             control.write_text(json.dumps({"shift_ne_m": [0.0, 3.0]}))
             report["fault_start_us"] = int(link.boot_s * 1e6)
@@ -973,8 +983,8 @@ def main() -> None:
                 gz.sim_sleep(2)
                 truth, est = truth_est()
                 worst = max(worst, float(np.linalg.norm(est - truth)))
-            # Last 2 s of the 20-s fault: mean true position.
-            truth = mean_position(truth_ne, gz.sim_sleep)
+            # Last 2 s of the 20-s fault: mean true position and estimate error.
+            truth, err1 = means()
             t_est, est = truth_est()
             worst = max(worst, float(np.linalg.norm(est - t_est)))
             during = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
@@ -984,6 +994,10 @@ def main() -> None:
             rejected = sum(during.get(key, 0) - before.get(key, 0)
                            for key in ("FIX_REJECTED_NIS", "FIX_REJECTED_STEP"))
             drift = float(np.linalg.norm(truth - truth0))
+            # Integrity measure: how far the estimate moved away from the truth.
+            # The true drift also holds the vehicle's own wander in gusts
+            # (strong gusts: up to 1.3 m with the estimate moving 0.2 m).
+            pull = float(np.linalg.norm(err1 - err0))
             gz.sim_sleep(10)
             after = latest_status(clog_path).get("map_anchor", {}).get("counts", {})
             refused = after.get("FIX_FUSED", 0) - during.get("FIX_FUSED", 0)
@@ -991,6 +1005,7 @@ def main() -> None:
             # the flight (status lines are 5 s apart); vehicle behaviour here.
             report["fault_live"] = {"max_abs_error_during_fault_m": round(worst, 3),
                                     "true_drift_during_fault_m": round(drift, 3),
+                                    "estimate_pull_during_fault_m": round(pull, 3),
                                     "settle_s": settle_s,
                                     "status_counts_delta": {"fused": fused_during, "rejected": rejected,
                                                             "fused_after": refused}}
@@ -1133,14 +1148,15 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
         rejected = sum(r["anchor_result"] in ("FIX_REJECTED_NIS", "FIX_REJECTED_STEP") for r in shifted)
         fused_after = sum(r["anchor_result"] == "FIX_FUSED" for r in after)
         live = report.get("fault_live", {})
-        # Integrity: the vehicle is not pulled by the shifted map (true
-        # drift < 0.5 m). The absolute error during the fault includes the
+        # Integrity: the estimate is not pulled by the shifted map (change of
+        # estimate - truth over the fault < 0.5 m; the true drift is reported,
+        # in strong gusts it is mostly the vehicle's wander). The absolute error during the fault includes the
         # error the estimate already had: same limit as check 3 (it was a
         # fixed 0.5 m, set for the 20-m scene with sigma 0.16 m).
         abs_limit = report.get("route_error_limit_m", 0.5)
         ok = (fused_shifted == 0 and rejected >= 5 and fused_after > 0
               and live.get("max_abs_error_during_fault_m", 9) < abs_limit
-              and live.get("true_drift_during_fault_m", 9) < 0.5)
+              and live.get("estimate_pull_during_fault_m", 9) < 0.5)
         report["checks"]["4_shifted_map_rejected"] = {
             "pass": ok, "shifted_fixes": len(shifted), "fused_shifted": fused_shifted,
             "rejected_total": rejected,
