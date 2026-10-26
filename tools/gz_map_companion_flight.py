@@ -928,26 +928,47 @@ def main() -> None:
                 while link.boot_s < t_end - 1e-3:
                     gz.sim_sleep(min(0.25, t_end - link.boot_s))
                     vo_outage_tick()
+            def position_control_lost() -> bool:
+                # PX4 leaves POSCTL (to ALTCTL) when EKF2 loses the horizontal
+                # position. The route sticks would then command tilt, not
+                # velocity, and fly the vehicle away (strong gusts, seed 113:
+                # 22 m/s, 1.3 km). An operator stops; the route is abandoned.
+                if link.mode() == "POSCTL":
+                    return False
+                link.pitch = link.roll = 0
+                report["position_control_lost"] = {"t_us": int(link.boot_s * 1e6), "mode": link.mode(),
+                                                   "leg": len(legs) + 1}
+                print(f"POSITION_CONTROL_LOST {report['position_control_lost']}", flush=True)
+                return True
+            lost = False
             for leg_no, (fp, fr) in enumerate(TEST_ROUTES[args.test_route], 1):
+                if lost:
+                    break
                 if outage and leg_no == outage[0]:
                     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0], "outage": True}))
                     report["map_outage_start_us"] = int(link.boot_s * 1e6)
                 pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
                 t_leg = link.boot_s
-                while link.boot_s - t_leg < leg_s:
+                while link.boot_s - t_leg < leg_s and not lost:
                     route_sleep(sample_s)
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
+                    lost = position_control_lost()
                 link.pitch = link.roll = 0
-                for _ in range(4):
+                for _ in range(0 if lost else 4):
                     route_sleep(2)
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
+                    lost = lost or position_control_lost()
                 legs.append({"truth_ne_m": truth.round(2).tolist(), "estimate_ne_m": est.round(2).tolist()})
                 if outage and leg_no == outage[1]:
                     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
                     report["map_outage_end_us"] = int(link.boot_s * 1e6)
+            if lost and "map_outage_start_us" in report and "map_outage_end_us" not in report:
+                # Abandoned inside an injected map outage: map matching back for the landing.
+                control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
+                report["map_outage_end_us"] = int(link.boot_s * 1e6)
             if vo_out["on"]:
                 control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
                 report["vo_outages_us"][-1].append(int(link.boot_s * 1e6))
@@ -957,9 +978,11 @@ def main() -> None:
             cal = json.loads(args.calibration.read_text())
             limit = max(0.5, 3.0 * math.sqrt(max(cal["covariance_ne_m2"][0][0], cal["covariance_ne_m2"][1][1])))
             report["route_error_limit_m"] = round(limit, 3)
-            check("3_route_absolute_error_on_map", max(errors) < limit, max_abs_error_m=round(max(errors), 3),
-                  mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors))
-        if args.mode == "test":
+            check("3_route_absolute_error_on_map", max(errors) < limit and "position_control_lost" not in report,
+                  max_abs_error_m=round(max(errors), 3),
+                  mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors),
+                  route_completed="position_control_lost" not in report)
+        if args.mode == "test" and "position_control_lost" not in report:
             # 4: map fault.
             def truth_ne():
                 return truth_est()[0]
@@ -1166,6 +1189,11 @@ def analyse(args, px4_dir: Path, started_wall: float, report: dict) -> None:
             "fused_after_fault": fused_after, **{k: v for k, v in live.items() if k != "status_counts_delta"}}
         report["analysis_ok"] = ok
         print("PASS" if ok else "FAIL", "4_shifted_map_rejected", report["checks"]["4_shifted_map_rejected"], flush=True)
+    if "position_control_lost" in report and not (t_f0 and t_f1):
+        report["checks"]["4_shifted_map_rejected"] = {"pass": False, "skipped": "position control lost",
+                                                     **report["position_control_lost"]}
+        report["analysis_ok"] = False
+        print("FAIL 4_shifted_map_rejected", report["checks"]["4_shifted_map_rejected"], flush=True)
     # Check 3 also over the whole route from the ULog: the live samples are
     # 3 s apart and missed a 5.7 m excursion of 2 s (series P repeat, box_rf).
     c3 = report.get("checks", {}).get("3_route_absolute_error_on_map")
