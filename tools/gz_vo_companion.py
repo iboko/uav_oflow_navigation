@@ -194,6 +194,9 @@ def main() -> None:
     ap.add_argument("--map-weak-match", type=float, nargs=2, metavar=("MARGIN", "PEAK"),
                     help="ncc: reject matches below both (OrthoNccLocalizer weak_match; strong-gust "
                          "calibration flights: 0.10 0.52)")
+    ap.add_argument("--map-competitor-prominence", type=float, metavar="DELTA",
+                    help="ncc: a competing match must be a local maximum standing DELTA above the saddle "
+                         "to the main peak (default: highest value outside the exclusion circle)")
     ap.add_argument("--map-patch-at-boresight", action="store_true",
                     help="ncc: centre the map patch where the optical axis meets the ground (steady tilt, wind)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12,
@@ -436,7 +439,8 @@ def main() -> None:
                                                   camera_offset_body_m=tuple(args.camera_offset_frd),
                                                   surface_m=surface, patch_at_boresight=args.map_patch_at_boresight,
                                                   max_tilt_rad=args.map_max_tilt_rad,
-                                                  weak_match=tuple(args.map_weak_match) if args.map_weak_match else None)
+                                                  weak_match=tuple(args.map_weak_match) if args.map_weak_match else None,
+                                                  competitor_prominence=args.map_competitor_prominence)
                     if args.orthophoto_fallback:
                         fallback = OrthoNccLocalizer(cv2.imread(str(args.orthophoto_fallback), cv2.IMREAD_GRAYSCALE),
                                                      geo, cal, CameraMountCalibration(BODY_FROM_CAMERA),
@@ -444,7 +448,8 @@ def main() -> None:
                                                      surface_m=surface,
                                                      patch_at_boresight=args.map_patch_at_boresight,
                                                      max_tilt_rad=args.map_max_tilt_rad,
-                                                  weak_match=tuple(args.map_weak_match) if args.map_weak_match else None)
+                                                  weak_match=tuple(args.map_weak_match) if args.map_weak_match else None,
+                                                  competitor_prominence=args.map_competitor_prominence)
                 else:
                     tile = OrthophotoTile("orthophoto", clahe.apply(map_gray), geo)
                     localizer = OrthophotoLocalizer([tile], cal, CameraMountCalibration(BODY_FROM_CAMERA),

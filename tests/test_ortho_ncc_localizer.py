@@ -215,3 +215,55 @@ def test_weak_match_needs_both_low_margin_and_low_peak():
     assert OrthoNccLocalizer(world, GEO, CAL, MOUNT, weak_match=(margin - 0.01, peak + 0.01)).localize(frame, **kw).accepted
     with pytest.raises(ValueError):
         OrthoNccLocalizer(world, GEO, CAL, MOUNT, weak_match=(0.1, -0.5))
+
+
+def _envelope(peaks, plateau=0.5, n=81):
+    """Synthetic correlation envelope: a plateau with Gaussian peaks (row, col, height, width px)."""
+    ys, xs = np.mgrid[0:n, 0:n].astype(np.float32)
+    env = np.full((n, n), plateau, np.float32)
+    rng = np.random.default_rng(3)
+    env += rng.normal(0, 0.002, env.shape).astype(np.float32)        # small bumps on the plateau
+    for r, c, h, w in peaks:
+        env = np.maximum(env, plateau + h * np.exp(-((ys - r) ** 2 + (xs - c) ** 2) / (2 * w * w)))
+    return env
+
+
+def _competitor(loc, env, main):
+    masked = env.copy()
+    cv2.circle(masked, main, loc.exclusion_px, -1.0, -1)
+    return loc._prominent_competitor(env, masked, main)
+
+
+def test_plateau_around_a_narrow_peak_is_no_competitor():
+    loc = OrthoNccLocalizer(_texture(), GEO, CAL, MOUNT, competitor_prominence=0.02)
+    env = _envelope([(40, 40, 0.05, 1.5)])
+    masked = env.copy()
+    cv2.circle(masked, (40, 40), loc.exclusion_px, -1.0, -1)
+    assert float(env.max() - masked.max()) < 0.05          # old rule: ambiguous
+    second, _ = _competitor(loc, env, (40, 40))
+    assert second == -1.0
+
+
+def test_distinct_peak_beyond_a_valley_is_a_competitor():
+    loc = OrthoNccLocalizer(_texture(), GEO, CAL, MOUNT, competitor_prominence=0.02)
+    env = _envelope([(40, 40, 0.05, 1.5), (40, 65, 0.04, 1.5)])
+    second, at = _competitor(loc, env, (40, 40))
+    assert abs(second - 0.54) < 0.01 and abs(at[0] - 65) <= 1 and abs(at[1] - 40) <= 1
+    # Joined to the main peak by a ridge higher than the competitor's top minus delta: not distinct.
+    ys, xs = np.mgrid[0:81, 0:81]
+    ridge = env.copy()
+    ridge[(abs(ys - 40) <= 1) & (xs >= 40) & (xs <= 65)] = 0.535
+    second, _ = _competitor(loc, np.maximum(env, ridge), (40, 40))
+    assert second == -1.0
+
+
+def test_prominence_rule_still_refuses_repetitive_texture():
+    tile = _texture(n=80)
+    world = np.tile(tile, (10, 10))
+    loc = OrthoNccLocalizer(world, GEO, CAL, MOUNT, competitor_prominence=0.02)
+    frame = _render(world, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0)
+    fix = loc.localize(frame, prior_ne_m=(0.0, 0.0), radius_m=25.0, height_agl_m=40.0,
+                       roll_rad=0.0, pitch_rad=0.0, yaw_rad=0.0)
+    assert not fix.accepted and fix.status == "AMBIGUOUS_MAP_MATCH"
+    with pytest.raises(ValueError):
+        OrthoNccLocalizer(world, GEO, CAL, MOUNT, competitor_prominence=0.0)

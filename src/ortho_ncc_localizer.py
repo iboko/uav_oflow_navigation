@@ -45,7 +45,8 @@ class OrthoNccLocalizer:
                  occlusion_tolerance_m: float = 0.5, max_outside_fraction: float = 0.1,
                  refine_radius_m: float = 0.0, refine_min_shift_m: float = 1.0,
                  yaw_extension_deg: float = 12.0, patch_at_boresight: bool = False,
-                 weak_match: tuple[float, float] | None = None) -> None:
+                 weak_match: tuple[float, float] | None = None,
+                 competitor_prominence: float | None = None) -> None:
         jac = georef.jacobian()
         if not (abs(jac[0, 0]) < 1e-9 and abs(jac[1, 1]) < 1e-9 and jac[0, 1] < 0 and jac[1, 0] > 0
                 and abs(-jac[0, 1] - jac[1, 0]) < 1e-9):
@@ -84,6 +85,15 @@ class OrthoNccLocalizer:
         if weak_match is not None and not (len(weak_match) == 2 and all(isfinite(x) and x > 0 for x in weak_match)):
             raise ValueError("weak_match must be (margin, peak), both positive")
         self.weak_match = None if weak_match is None else (float(weak_match[0]), float(weak_match[1]))
+        # Competing match = a local maximum outside the exclusion circle that
+        # stands at least this much above the highest saddle joining it to the
+        # main peak. None: the highest value outside the circle (also a point
+        # on the flank or on a plateau around the peak). Over the start of the
+        # swiss scene the envelope is a ~0.50 plateau with a narrow ~0.55 peak:
+        # plateau points 3-4.5 m away gave margins 0.03-0.06 (threshold 0.05).
+        if competitor_prominence is not None and not (isfinite(competitor_prominence) and competitor_prominence > 0):
+            raise ValueError("competitor_prominence must be positive")
+        self.competitor_prominence = competitor_prominence
         self.shape_radius_px = max(1, int(round(shape_radius_m / self.gsd)))
         self.subpatch_search_px = max(1, int(round(subpatch_search_m / self.gsd)))
         # Surface model (DSM) on the map grid [m, up, any common datum]: the
@@ -284,8 +294,14 @@ class OrthoNccLocalizer:
         # misses such ambiguity.
         masked = envelope.copy()
         cv2.circle(masked, loc, self.exclusion_px, -1.0, -1)
-        second = float(masked.max())
+        if self.competitor_prominence is None:
+            _, second, _, second_loc = cv2.minMaxLoc(masked)
+            second = float(second)
+        else:
+            second, second_loc = self._prominent_competitor(envelope, masked, loc)
         self.last_peak, self.last_margin = float(peak), float(peak - second)
+        self.last_second_offset_m = (float(loc[1] - second_loc[1]) * self.gsd,     # north: rows grow south
+                                     float(second_loc[0] - loc[0]) * self.gsd)
         if peak < self.min_peak:
             return MapLocalizationFix(False, "WEAK_CORRELATION")
         if peak - second < self.min_margin:
@@ -313,6 +329,30 @@ class OrthoNccLocalizer:
                                   float("nan"), False, yaw, float(cam_n), float(cam_e),
                                   self._peak_shape(res, loc, float(peak)),
                                   self._subpatch_cov(window, best_patch, loc))
+
+    def _prominent_competitor(self, envelope: np.ndarray, masked: np.ndarray, loc, max_candidates: int = 64):
+        """Highest local maximum outside the exclusion circle with a prominence
+        (value minus the highest saddle to the main peak) >= competitor_prominence.
+        None found: -1 (no competing match in the window)."""
+        env = envelope.astype(np.float32)
+        is_max = (env >= cv2.dilate(env, np.ones((3, 3), np.uint8))) & (masked > -1.0)
+        ys, xs = np.nonzero(is_max)
+        order = np.argsort(-env[ys, xs])[:max_candidates]
+        for i in order:
+            y, x = int(ys[i]), int(xs[i])
+            v = float(env[y, x])
+            # Highest level at which (y, x) is still joined to the main peak.
+            lo, hi = float(env.min()), v
+            for _ in range(14):
+                mid = 0.5 * (lo + hi)
+                _, lab = cv2.connectedComponents((env >= mid).astype(np.uint8), connectivity=8)
+                if lab[y, x] == lab[loc[1], loc[0]]:
+                    lo = mid
+                else:
+                    hi = mid
+            if v - lo >= self.competitor_prominence:
+                return v, (x, y)
+        return -1.0, loc
 
     def _subpatch_cov(self, window, patch, loc):
         sub = self.subpatch_offsets(window, patch, loc, self.subpatch_search_px)
