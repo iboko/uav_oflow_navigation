@@ -234,6 +234,26 @@ def test_map_position_export_refuses_stale_and_extrapolated_timestamps():
     assert anchor.measurement_at(t + 200_000, max_fix_age_s=1.0) is None
 
 
+def test_hold_keeps_the_map_position_without_fixes_only_while_nearly_still():
+    def after(v, seconds):
+        anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
+        _, _, t = _fly(anchor, 3, v=(0.0, 0.0))
+        for _ in range(int(seconds * 10)):
+            anchor.propagate(t, t + 100_000, v, VO_COV)
+            t += 100_000
+        return anchor, t
+    hold = dict(hold_age_s=30.0, hold_moved_m=3.0)
+    anchor, t = after((0.05, 0.0), 15.0)              # 0.75 m in 15 s
+    assert anchor.measurement_at(t, max_fix_age_s=10.0) is None
+    assert anchor.measurement_at(t, max_fix_age_s=10.0, **hold) is not None
+    anchor, t = after((0.4, 0.0), 15.0)               # 6 m: the old anchor is no longer trusted
+    assert anchor.measurement_at(t, max_fix_age_s=10.0, **hold) is None
+    anchor, t = after((0.0, 0.0), 31.0)               # still, but past the hold limit
+    assert anchor.measurement_at(t, max_fix_age_s=10.0, **hold) is None
+    with pytest.raises(ValueError):
+        anchor.measurement_at(t, max_fix_age_s=10.0, hold_age_s=30.0)
+
+
 @pytest.mark.parametrize("age", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_map_freshness_limit_is_refused(age):
     anchor = MapAnchor(bias_ne_m=(0.0, 0.0), covariance_ne_m2=R)
