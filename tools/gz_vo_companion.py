@@ -185,9 +185,12 @@ def main() -> None:
                     help="first map lock: autopilot (GNSS) position as prior with this sigma per axis")
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
                     help="send the anchor position only this long after the last fused map fix")
-    ap.add_argument("--map-hold", type=float, nargs=2, metavar=("AGE_S", "MOVED_M"),
+    ap.add_argument("--map-hold", type=float, nargs=2, metavar=("AGE_S", "MOVED_M"), default=[30.0, 3.0],
                     help="past --max-fix-age-s keep sending it up to AGE_S while the VO displacement "
-                         "since the fix is <= MOVED_M (hover over a place without map fixes)")
+                         "since the fix is <= MOVED_M (hover over a place without map fixes; swiss "
+                         "start: 21.6 s without a fix, EKF2 lost the position 5 s after GNSS loss)")
+    ap.add_argument("--no-map-hold", dest="map_hold", action="store_const", const=None,
+                    help="no hold: the position stops --max-fix-age-s after the last fix")
     ap.add_argument("--max-map-step-error-m", type=float, default=1.0,
                     help="map displacement minus VO displacement: base engineering bound, "
                          "plus accumulated scale/heading/gap allowance (not flight validated)")

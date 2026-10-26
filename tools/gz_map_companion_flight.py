@@ -543,7 +543,9 @@ def main() -> None:
     ap.add_argument("--map-weak-match", type=float, nargs=2, metavar=("MARGIN", "PEAK"),
                     help="companion: reject NCC matches below both (see gz_vo_companion.py)")
     ap.add_argument("--map-hold", type=float, nargs=2, metavar=("AGE_S", "MOVED_M"),
-                    help="companion: keep the map position without fixes while nearly still (see gz_vo_companion.py)")
+                    help="companion: hold parameters (default in gz_vo_companion.py: 30 s, 3 m)")
+    ap.add_argument("--no-map-hold", action="store_true",
+                    help="companion: no map position hold without fixes (see gz_vo_companion.py)")
     ap.add_argument("--map-patch-at-boresight", action="store_true",
                     help="companion: map patch centred on the optical axis (see gz_vo_companion.py)")
     ap.add_argument("--map-max-tilt-rad", type=float, default=0.12, help="companion: map matching tilt limit")
@@ -741,6 +743,8 @@ def main() -> None:
             cmd += ["--map-weak-match", *map(str, args.map_weak_match)]
         if args.map_hold:
             cmd += ["--map-hold", *map(str, args.map_hold)]
+        if args.no_map_hold:
+            cmd += ["--no-map-hold"]
         if args.vo_window_pairs != 1:
             cmd += ["--vo-window-pairs", str(args.vo_window_pairs)]
         if args.vo_surface_depth:
