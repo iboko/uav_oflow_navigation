@@ -185,6 +185,12 @@ def main() -> None:
                     help="first map lock: autopilot (GNSS) position as prior with this sigma per axis")
     ap.add_argument("--max-fix-age-s", type=float, default=10.0,
                     help="send the anchor position only this long after the last fused map fix")
+    ap.add_argument("--map-hold", type=float, nargs=2, metavar=("AGE_S", "MOVED_M"), default=[30.0, 3.0],
+                    help="past --max-fix-age-s keep sending it up to AGE_S while the VO displacement "
+                         "since the fix is <= MOVED_M (hover over a place without map fixes; swiss "
+                         "start: 21.6 s without a fix, EKF2 lost the position 5 s after GNSS loss)")
+    ap.add_argument("--no-map-hold", dest="map_hold", action="store_const", const=None,
+                    help="no hold: the position stops --max-fix-age-s after the last fix")
     ap.add_argument("--max-map-step-error-m", type=float, default=1.0,
                     help="map displacement minus VO displacement: base engineering bound, "
                          "plus accumulated scale/heading/gap allowance (not flight validated)")
@@ -259,6 +265,9 @@ def main() -> None:
         ap.error("--map-mode fuse needs --map-calibration (no uncalibrated map covariance)")
     if not all(math.isfinite(x) and x > 0 for x in (args.max_fix_age_s, args.max_map_step_error_m)):
         ap.error("--max-fix-age-s and --max-map-step-error-m must be finite and positive")
+    if args.map_hold and not (math.isfinite(args.map_hold[0]) and args.map_hold[0] > 0
+                              and math.isfinite(args.map_hold[1]) and args.map_hold[1] >= 0):
+        ap.error("--map-hold: AGE_S > 0 and MOVED_M >= 0, both finite")
 
     clock_us = [0]          # companion clock = simulation time
     frames: queue.Queue = queue.Queue(maxsize=8)
@@ -632,7 +641,8 @@ def main() -> None:
             # the anchor is VO integrated with the autopilot heading, and EKF2
             # fusing it next to the VO velocity rotated the heading by 17 deg
             # after GNSS loss (swiss scene). Velocity only then.
-            measurement = anchor.measurement_at(out.time_us, max_fix_age_s=args.max_fix_age_s) \
+            hold = dict(hold_age_s=args.map_hold[0], hold_moved_m=args.map_hold[1]) if args.map_hold else {}
+            measurement = anchor.measurement_at(out.time_us, max_fix_age_s=args.max_fix_age_s, **hold) \
                 if anchor is not None else None
             if measurement is not None and math.isfinite(out.height_mid_m):
                 pos = [*measurement.position_ne_m,

@@ -207,7 +207,8 @@ class MapAnchor:
         if self._p is not None and gap_s <= 1e-3 and self._t_us:
             self._history.append((self._interval_start_us, self._t_us, self._p.copy(), self._cov.copy(),
                                   self._interval_velocity_ne.copy(), self._interval_velocity_cov.copy(),
-                                  self._interval_heading_sigma, self.last_fix_us))
+                                  self._interval_heading_sigma, self.last_fix_us,
+                                  float(np.linalg.norm(self._vo_since_fix))))
         else:
             self._history.clear()
         self._interval_start_us = t0_us
@@ -410,7 +411,9 @@ class MapAnchor:
                             tuple(tuple(float(v) for v in row) for row in self._cov), dict(self.counts),
                             self.heading_offset_rad)
 
-    def measurement_at(self, timestamp_us: int, *, max_fix_age_s: float) -> AnchorMeasurement | None:
+    def measurement_at(self, timestamp_us: int, *, max_fix_age_s: float,
+                       hold_age_s: float | None = None, hold_moved_m: float | None = None
+                       ) -> AnchorMeasurement | None:
         """Map-backed position within the most recent VO intervals only.
 
         A midpoint VO message must use the same heading-corrected velocity
@@ -421,19 +424,30 @@ class MapAnchor:
         """
         if not isfinite(max_fix_age_s) or max_fix_age_s <= 0:
             raise ValueError("Возраст привязки должен быть конечным и положительным")
+        if (hold_age_s is None) != (hold_moved_m is None) or (
+                hold_age_s is not None and not (isfinite(hold_age_s) and hold_age_s > 0
+                                                and isfinite(hold_moved_m) and hold_moved_m >= 0)):
+            raise ValueError("hold_age_s and hold_moved_m go together, finite, age > 0, distance >= 0")
         if self._p is None or not isfinite(timestamp_us):
             return None
         if self._interval_start_us <= timestamp_us <= self._t_us:
             state = (self._interval_start_us, self._t_us, self._p, self._cov, self._interval_velocity_ne,
-                     self._interval_velocity_cov, self._interval_heading_sigma, self.last_fix_us)
+                     self._interval_velocity_cov, self._interval_heading_sigma, self.last_fix_us,
+                     float(np.linalg.norm(self._vo_since_fix)))
         else:
             # An earlier interval: its end state as it was then (later fixes
             # are not applied backwards).
             state = next((h for h in reversed(self._history) if h[0] <= timestamp_us <= h[1]), None)
             if state is None:
                 return None
-        t0, t1, p, cov0, v_ne, v_cov, heading_sigma, last_fix = state
-        if not 0 <= t1 - last_fix <= max_fix_age_s * 1e6:
+        t0, t1, p, cov0, v_ne, v_cov, heading_sigma, last_fix, moved = state
+        age_us = t1 - last_fix
+        # Past max_fix_age_s only while the VO displacement since the fix is
+        # small (hold over a place without fixes): the heading and scale
+        # errors that made the old anchor unusable act on displacement, and
+        # the time-driven VO noise is in the covariance.
+        held = hold_age_s is not None and age_us <= hold_age_s * 1e6 and moved <= hold_moved_m
+        if not (0 <= age_us and (age_us <= max_fix_age_s * 1e6 or held)):
             return None
         back_s = (t1 - timestamp_us) * 1e-6
         back = v_ne * back_s
