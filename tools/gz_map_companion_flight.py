@@ -965,6 +965,10 @@ def main() -> None:
                 if outage and leg_no == outage[1]:
                     control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
                     report["map_outage_end_us"] = int(link.boot_s * 1e6)
+            if lost and "map_outage_start_us" in report and "map_outage_end_us" not in report:
+                # Abandoned inside an injected map outage: map matching back for the landing.
+                control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
+                report["map_outage_end_us"] = int(link.boot_s * 1e6)
             if vo_out["on"]:
                 control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
                 report["vo_outages_us"][-1].append(int(link.boot_s * 1e6))
