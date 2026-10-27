@@ -556,7 +556,7 @@ def main() -> None:
                     help="calibration: injected VO dropouts on the test route, these lengths in turn "
                          "(sim s), --vo-outage-off-s apart (gap bridge calibration flights, not tests)")
     ap.add_argument("--vo-outage-off-s", type=float, default=6.0)
-    ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25, help="companion: VO frame-pair tilt limit")
+    ap.add_argument("--vo-max-tilt-rad", type=float, default=0.35, help="companion: VO frame-pair tilt limit")
     ap.add_argument("--wind-ne-m-s", type=float, nargs=2, metavar=("NORTH", "EAST"),
                     help="steady wind from reaching altitude on (drag force on the model, tools/gz_wind.py)")
     ap.add_argument("--wind-gust-sigma", type=float, default=0.0, help="gust speed sigma per axis, m/s")
@@ -733,7 +733,7 @@ def main() -> None:
             cmd += ["--vo-gap-bridge", str(args.vo_gap_bridge.resolve())]
         if args.no_vo_gap_bridge:
             cmd += ["--no-vo-gap-bridge"]
-        if args.vo_max_tilt_rad != 0.25:
+        if args.vo_max_tilt_rad != 0.35:
             cmd += ["--vo-max-tilt-rad", str(args.vo_max_tilt_rad)]
         if args.map_patch_at_boresight:
             cmd += ["--map-patch-at-boresight"]
