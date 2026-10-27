@@ -634,6 +634,10 @@ def main() -> None:
     ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
                     help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
+    ap.add_argument("--route-stick", type=int, default=400,
+                    help="test route stick (of 1000; swiss default 400): larger = faster legs and harder "
+                         "accelerations (large tilts for VO calibration); the leg time is scaled to keep "
+                         "the route length")
     ap.add_argument("--calib-direction-deg", type=float, default=0.0,
                     help="calibrate: direction of the two legs (0: forward then right). Each calibration "
                          "flight of a series uses its own (e.g. 72 deg apart) so the map error is "
@@ -673,6 +677,10 @@ def main() -> None:
     world = ("ofnav_swiss3d" if args.world_3d else "ofnav_swiss") if args.scene == "swiss" else gz.TEXTURED_WORLD
     # Route scale: legs long enough to cross several camera footprints.
     stick, leg_s, sample_s = (400, 15, 3) if args.scene == "swiss" else (300, 4, 2)
+    if args.scene == "swiss" and args.route_stick != 400:
+        if not 100 <= args.route_stick <= 1000:
+            raise SystemExit("--route-stick must be in [100, 1000]")
+        stick, leg_s = args.route_stick, leg_s * 400 / args.route_stick
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     args.out.mkdir(parents=True, exist_ok=True)
     px4_dir = args.px4_dir.resolve()
