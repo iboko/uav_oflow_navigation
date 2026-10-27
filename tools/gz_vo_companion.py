@@ -304,7 +304,7 @@ def main() -> None:
     if args.vo_calibration:
         vo_scale = float(json.loads(args.vo_calibration.read_text())["horizontal"]["scale"])
     if log:
-        log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers,jump_rejected\n")
+        log.write("t_us,vx,vy,vz,var_x,var_y,var_z,vn,ve,vd,inliers,jump_rejected,vd_raw,vertical_rejected\n")
     sent, last_ts, last_status, last_rates = 0, 0.0, 0.0, 0.0
     # Smoothed interval between sent messages (sim s), for --ev-pos-repeat-scale.
     msg_dt_s: float | None = None
@@ -318,6 +318,7 @@ def main() -> None:
     map_outage = False
     vo_outage = False   # injected VO dropout (map control "vo_outage"; calibration flights)
     bridge = VelocityBridge.from_json(json.loads(args.vo_gap_bridge.read_text())) if args.vo_gap_bridge else None
+    vertical_gate = None   # created with the VO pipeline
     msckf: CompanionMsckf | None = None
     tracker: KltTracker | None = None
     last_msckf_t = 0
@@ -391,6 +392,10 @@ def main() -> None:
                 local_ne = np.array([msg.x, msg.y])
                 if bridge is not None and pipeline.clock.valid:
                     bridge.add(msg.time_boot_ms * 1000 - pipeline.clock.offset_us, msg.vx, msg.vy)
+                if vertical_gate is not None and pipeline.clock.valid:
+                    # Reference after a VO gap: EKF2's reset to the first EV velocity then
+                    # leaves its vertical velocity as it was.
+                    vertical_gate.set_reference(msg.time_boot_ms * 1000 - pipeline.clock.offset_us, msg.vz)
                 # Before the first lock nothing of ours is fused yet: the
                 # autopilot position is GNSS-aided and independent of the map.
                 if anchor is not None and not anchor.counts.get("LOCK_ACQUIRED"):
@@ -419,8 +424,9 @@ def main() -> None:
                     fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
+            vertical_gate = None if args.no_vo_vertical_gate else VerticalVelocityGate()
             pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs,
-                                   vertical_gate=None if args.no_vo_vertical_gate else VerticalVelocityGate())
+                                   vertical_gate=vertical_gate)
             # The gate's acceleration bound (3.7 m/s^2) is derived from the 0.25 rad
             # VO tilt limit; it scales with tan(limit) when the limit is changed.
             jump_accel = 3.7 * math.tan(args.vo_max_tilt_rad) / math.tan(0.25)
@@ -481,7 +487,7 @@ def main() -> None:
         if wall - last_rates > 5.0:
             streams = [(mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE_QUATERNION, 100),
                        (mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR, 50)]
-            if bridge is not None:
+            if bridge is not None or vertical_gate is not None:
                 streams.append((mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 50))
             if args.attitude_stamp == "sample":
                 streams.append((mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY, 100))
@@ -687,7 +693,8 @@ def main() -> None:
                                    + [str(round(v, 5)) for v in out.velocity_frd]
                                    + [f"{v:.6g}" for v in out.variance_frd]
                                    + [str(round(v, 5)) for v in (r.vn_m_s, r.ve_m_s, out.vd_m_s)])
-                          + f",{r.inlier_count},{int(vo_rejected)}\n")
+                          + f",{r.inlier_count},{int(vo_rejected)},{round(pipeline.last_vd_raw, 5)},"
+                          + f"{int(pipeline.last_vertical_rejected)}\n")
         # A frame waiting far too long has no autopilot data around it.
         while pending and now - pending[0][0] > 1_000_000:
             pending.pop(0)
