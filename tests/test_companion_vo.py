@@ -254,3 +254,23 @@ def test_vertical_gate_limits_and_hold():
     assert g.check(3_000_000, 6.0)                  # after the hold: taken as is
     with pytest.raises(ValueError):
         VerticalVelocityGate(max_accel_m_s2=0.0)
+
+
+def test_vertical_gate_checks_against_the_autopilot_after_a_gap():
+    g = VerticalVelocityGate()
+    assert g.check(1_000_000, 0.2)
+    g.set_reference(3_000_000, -0.8)                # autopilot vertical velocity
+    # After the hold the first VO value is checked against the reference
+    # (C35: EKF2 reset to +7.0 m/s while the truth was -0.8 m/s).
+    assert not g.check(3_050_000, 7.0)
+    vd, var = g.held(3_050_000)
+    assert vd == -0.8 and var == pytest.approx((9.81 * 0.05) ** 2 + 0.7 ** 2)
+    assert not g.check(3_116_000, 7.5)              # still against the reference
+    assert g.held(3_116_000)[0] == -0.8
+    assert g.check(3_182_000, -0.4)                 # agrees: accepted, normal gating again
+    assert not g.check(3_248_000, 7.0)
+    assert g.held(3_248_000)[0] == -0.4             # last accepted, not the reference
+    # A stale reference (> 0.5 s) is not used: old behaviour.
+    g2 = VerticalVelocityGate()
+    g2.set_reference(0, -0.8)
+    assert g2.check(2_000_000, 6.0)

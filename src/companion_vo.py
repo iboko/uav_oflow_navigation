@@ -136,6 +136,7 @@ class CompanionVo:
         self._min_height = min_height_m
         self._heights: dict[int, float] = {}
         self._vertical_gate = vertical_gate
+        self.last_vd_raw, self.last_vertical_rejected = float("nan"), False   # for the log
         self.counts: dict[str, int] = {}
 
     def count(self, key: str) -> None:
@@ -231,9 +232,11 @@ class CompanionVo:
         # the pair count (the errors of neighbouring pairs are correlated).
         cnn, cne, cee = (sum(wk * e[5][k] for wk, e in zip(weights, self._window)) for k in range(3))
         var_vd = 2.0 * self._sigma_h ** 2 / span ** 2
+        self.last_vd_raw, self.last_vertical_rejected = float(vdw), False
         if self._vertical_gate is not None:
             t_mid = (w0 + w1) // 2
             if not self._vertical_gate.check(t_mid, vdw):
+                self.last_vertical_rejected = True
                 self.count("VO_VERTICAL_REJECTED")
                 vdw, var_vd = self._vertical_gate.held(t_mid)
             var_vd = max(var_vd, self._vertical_gate.min_sigma ** 2)
@@ -330,6 +333,16 @@ class VerticalVelocityGate:
     the hold; after max_hold_s the next plausible value is taken as is, an
     implausible one is still replaced (by 0 if none was accepted).
 
+    After a VO gap (nothing accepted for max_hold_s) the first value used
+    to pass unchecked. EKF2 resets its velocity to the first EV velocity
+    when the fusion restarts, and that value (a range difference over the
+    first frame pair) was 4-8 m/s off: calibration flights C35 with
+    injected dropouts, 7-16 vertical resets per flight, EKF2 off by up to
+    7.9 m/s. With a reference (the autopilot's own vertical velocity, which
+    the reset then leaves unchanged) the gate checks the value against it
+    instead, and a value outside noise + max_accel * reference age is
+    replaced by the reference until one agrees.
+
     What passes is still heavy-tailed (seven calibration flights: q95
     0.9-2.8 m/s, q99 3.1-6.6 m/s), so the variance sent has a floor
     min_sigma = max q99 / 2.58 = 2.5 m/s instead of the rangefinder model
@@ -346,11 +359,32 @@ class VerticalVelocityGate:
         self.min_sigma = min_sigma_m_s
         self.last_t_us: int | None = None
         self.last_vd = 0.0
+        self.max_reference_age_s = 0.5
+        self._ref: tuple[int, float] | None = None
+        self._use_ref = False
+
+    def set_reference(self, t_us: int, vd: float) -> None:
+        """Autopilot vertical velocity at t_us (same clock as check())."""
+        if isfinite(vd):
+            self._ref = (int(t_us), float(vd))
+
+    def _reference_at(self, t_us: int) -> tuple[float, float] | None:
+        if self._ref is None:
+            return None
+        age = abs(t_us - self._ref[0]) * 1e-6
+        return (self._ref[1], age) if age <= self.max_reference_age_s else None
 
     def check(self, t_us: int, vd: float) -> bool:
+        self._use_ref = False
+        expired = self.last_t_us is None or (t_us - self.last_t_us) * 1e-6 > self.max_hold_s
+        ref = self._reference_at(t_us) if expired else None
         if not isfinite(vd) or abs(vd) > self.max_abs:
+            self._use_ref = ref is not None
             return False
-        if self.last_t_us is None or (t_us - self.last_t_us) * 1e-6 > self.max_hold_s:
+        if expired and ref is not None:
+            ok = abs(vd - ref[0]) <= self.noise + self.max_accel * ref[1]
+            self._use_ref = not ok
+        elif expired:
             ok = True
         else:
             dt = max(0.0, (t_us - self.last_t_us) * 1e-6)
@@ -360,7 +394,11 @@ class VerticalVelocityGate:
         return ok
 
     def held(self, t_us: int) -> tuple[float, float]:
-        """Last accepted vertical velocity and its variance at t_us."""
+        """Replacement for a rejected value at t_us and its variance: the
+        reference after a gap, else the last accepted value."""
+        ref = self._reference_at(t_us) if self._use_ref else None
+        if ref is not None:
+            return ref[0], min((self.max_accel * ref[1]) ** 2 + self.noise ** 2, self.max_abs ** 2)
         if self.last_t_us is None:
             return 0.0, self.max_abs ** 2
         age = max(0.0, (t_us - self.last_t_us) * 1e-6)
