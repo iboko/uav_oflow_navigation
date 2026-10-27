@@ -959,7 +959,8 @@ def main() -> None:
                 link.pitch, link.roll = pitch, roll
                 t_leg = link.boot_s
                 while link.boot_s - t_leg < leg_s and not lost:
-                    route_sleep(sample_s)
+                    # Not past the leg: with --route-stick the leg is not a multiple of sample_s.
+                    route_sleep(min(sample_s, max(0.05, leg_s - (link.boot_s - t_leg))))
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
                     lost = position_control_lost()
