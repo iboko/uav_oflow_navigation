@@ -212,8 +212,10 @@ def main() -> None:
                          "default: the strong-gust calibration (series GB)")
     ap.add_argument("--no-vo-gap-bridge", action="store_true",
                     help="VO gaps as unknown motion (max_gap_speed_m_s), the anchor may drop its lock")
-    ap.add_argument("--vo-max-tilt-rad", type=float, default=0.25,
-                    help="largest roll/pitch of a VO frame pair (planar model, ContinuousPlanarOdometry, <= 0.4)")
+    ap.add_argument("--vo-max-tilt-rad", type=float, default=0.35,
+                    help="largest roll/pitch of a VO frame pair (planar model, ContinuousPlanarOdometry, <= 0.4). "
+                         "0.35 since series N1 (strong gusts: 10/10 flights pass all checks against 8/10 at "
+                         "0.25, which lost VO above 14 deg tilt and once EKF2 position)")
     ap.add_argument("--map-yaw", action="store_true",
                     help="fuse mode: also send the map-referenced heading (EKF2_EV_CTRL bit 3)")
     ap.add_argument("--map-control", type=Path,
