@@ -242,6 +242,10 @@ def main() -> None:
     ap.add_argument("--frame-time-shift-ms", type=float, default=0.0,
                     help="added to every camera frame stamp before use; keep 0: the apparent 105 ms VO lead "
                          "(tools/measure_frame_time_shift.py) applied here made the test flights diverge")
+    ap.add_argument("--vo-speed-sigma-frac", type=float, default=0.0, metavar="C",
+                    help="add (C * horizontal VO speed)^2 to the horizontal VO variance sent to EKF2: the VO "
+                         "error grows with speed and is correlated in time (calibration flights T1, 4-s window "
+                         "NEES: C = 0.37); 0 = off")
     ap.add_argument("--vo-calibration", type=Path,
                     help="JSON from tools/calibrate_vo_covariance.py: horizontal variance scale of the camera VO "
                          "(separate calibration flights); applied to what EKF2 and the map anchor get, the log "
@@ -265,6 +269,8 @@ def main() -> None:
         args.vo_gap_bridge = None
     if args.map_mode == "fuse" and not args.map_calibration:
         ap.error("--map-mode fuse needs --map-calibration (no uncalibrated map covariance)")
+    if not (math.isfinite(args.vo_speed_sigma_frac) and 0 <= args.vo_speed_sigma_frac <= 2):
+        ap.error("--vo-speed-sigma-frac must be in [0, 2]")
     if not all(math.isfinite(x) and x > 0 for x in (args.max_fix_age_s, args.max_map_step_error_m)):
         ap.error("--max-fix-age-s and --max-map-step-error-m must be finite and positive")
     if args.map_hold and not (math.isfinite(args.map_hold[0]) and args.map_hold[0] > 0
@@ -636,6 +642,11 @@ def main() -> None:
             if msckf is None:
                 cov[0] *= vo_scale
                 cov[6] *= vo_scale
+                if args.vo_speed_sigma_frac:
+                    # Speed-proportional (scale) error, correlated in time: series T1.
+                    extra = (args.vo_speed_sigma_frac * math.hypot(out.velocity_frd[0], out.velocity_frd[1])) ** 2
+                    cov[0] += extra
+                    cov[6] += extra
             cov[15] = cov[18] = cov[20] = nan
             velocity = list(out.velocity_frd)
             if vo_rejected:
