@@ -305,3 +305,13 @@ def test_robust_vertical_gate_accepts_values_that_agree_with_the_autopilot():
     assert not g2.check(1_066_000, 0.3)                 # default: anchor only
     with pytest.raises(ValueError):
         VerticalVelocityGate(anchor_n=0)
+
+
+def test_robust_vertical_gate_restarts_its_anchor_after_a_gap():
+    g = VerticalVelocityGate(robust=True)
+    for i in range(5):
+        assert g.check(1_000_000 + i * 66_000, 0.0)
+    g.set_reference(3_000_000, 4.0)                     # climbing after a 1.7 s VO gap
+    assert g.check(3_010_000, 4.1)                      # agrees with the reference
+    assert not g.check(3_076_000, 0.0)                  # the pre-gap median must not come back
+    assert g.held(3_076_000)[0] == pytest.approx(4.1)

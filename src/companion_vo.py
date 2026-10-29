@@ -415,8 +415,8 @@ class VerticalVelocityGate:
                 ok = ref is not None and abs(vd - ref[0]) <= self.noise + self.max_accel * ref[1]
         if ok:
             self.last_t_us, self.last_vd = t_us, float(vd)
-            if self.robust:
-                self._accepted = (self._accepted + [float(vd)])[-self.anchor_n:]
+            if self.robust:   # after a gap the pre-gap values no longer describe the velocity
+                self._accepted = [float(vd)] if expired else (self._accepted + [float(vd)])[-self.anchor_n:]
         return ok
 
     def held(self, t_us: int) -> tuple[float, float]:
