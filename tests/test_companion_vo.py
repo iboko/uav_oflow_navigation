@@ -274,3 +274,44 @@ def test_vertical_gate_checks_against_the_autopilot_after_a_gap():
     g2 = VerticalVelocityGate()
     g2.set_reference(0, -0.8)
     assert g2.check(2_000_000, 6.0)
+
+
+def test_robust_vertical_gate_is_not_held_by_an_accepted_outlier():
+    # Series VG: an outlier that passes the default gate becomes the anchor
+    # and the correct values after it are replaced by it.
+    values = [0.0, 0.1, 0.0, 0.1, 1.3, 2.6, 0.1, 0.0]   # 1.3 and 2.6 creep in steps under 0.7 + g * 66 ms
+    plain, robust = VerticalVelocityGate(), VerticalVelocityGate(robust=True)
+    sent = {}
+    for name, g in (("plain", plain), ("robust", robust)):
+        out = []
+        for i, v in enumerate(values):
+            t = 1_000_000 + i * 66_000
+            out.append(v if g.check(t, v) else g.held(t)[0])
+        sent[name] = out
+    assert sent["plain"][-2:] == [2.6, 2.6]             # anchored on the outlier
+    assert sent["robust"][-3:] == [0.1, 0.1, 0.0]       # 2.6 rejected against the median; true values kept
+
+
+def test_robust_vertical_gate_accepts_values_that_agree_with_the_autopilot():
+    g = VerticalVelocityGate(robust=True)
+    assert g.check(1_000_000, 3.0)                      # first value, an outlier
+    g.set_reference(1_050_000, 0.2)
+    assert g.check(1_066_000, 0.3)                      # rejected by the anchor, agrees with the reference
+    assert g.last_vd == 0.3
+    assert not g.check(1_132_000, 6.0)                  # disagrees with both
+    g2 = VerticalVelocityGate()
+    g2.check(1_000_000, 3.0)
+    g2.set_reference(1_050_000, 0.2)
+    assert not g2.check(1_066_000, 0.3)                 # default: anchor only
+    with pytest.raises(ValueError):
+        VerticalVelocityGate(anchor_n=0)
+
+
+def test_robust_vertical_gate_restarts_its_anchor_after_a_gap():
+    g = VerticalVelocityGate(robust=True)
+    for i in range(5):
+        assert g.check(1_000_000 + i * 66_000, 0.0)
+    g.set_reference(3_000_000, 4.0)                     # climbing after a 1.7 s VO gap
+    assert g.check(3_010_000, 4.1)                      # agrees with the reference
+    assert not g.check(3_076_000, 0.0)                  # the pre-gap median must not come back
+    assert g.held(3_076_000)[0] == pytest.approx(4.1)

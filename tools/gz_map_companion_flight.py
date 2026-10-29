@@ -568,6 +568,8 @@ def main() -> None:
                     help="companion: save every N-th camera frame (1: all, for offline VO replay)")
     ap.add_argument("--vo-speed-sigma-frac", type=float, default=0.0,
                     help="companion: speed term of the VO variance (see gz_vo_companion.py)")
+    ap.add_argument("--vo-vertical-last-anchor", action="store_true",
+                    help="companion: vertical VO gate anchored on the last accepted value (see gz_vo_companion.py)")
     ap.add_argument("--vo-calibration", type=Path,
                     help="companion: camera-VO variance scale (tools/calibrate_vo_covariance.py)")
     ap.add_argument("--ev-yaw", action="store_true",
@@ -738,6 +740,8 @@ def main() -> None:
             cmd += ["--vo-calibration", str(args.vo_calibration.resolve())]
         if args.vo_speed_sigma_frac:
             cmd += ["--vo-speed-sigma-frac", str(args.vo_speed_sigma_frac)]
+        if args.vo_vertical_last_anchor:
+            cmd += ["--vo-vertical-last-anchor"]
         cmd += ["--attitude-stamp", args.attitude_stamp]
         if args.map_max_tilt_rad != 0.12:
             cmd += ["--map-max-tilt-rad", str(args.map_max_tilt_rad)]
