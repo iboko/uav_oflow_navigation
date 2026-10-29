@@ -348,13 +348,29 @@ class VerticalVelocityGate:
     min_sigma = max q99 / 2.58 = 2.5 m/s instead of the rangefinder model
     (~0.4 m/s): EKF2's EV velocity test then does not fail on the vertical
     and does not reset to it; the height stays on the barometer.
+
+    The single last accepted value is a poor anchor: an outlier that passes
+    (1-2 % of the accepted values are > 3 m/s off) makes the gate reject the
+    correct values that follow and send the outlier instead. Series VG
+    (6 strong-gust flights): 15 % of the replaced values were correct, 2.4 %
+    of all sent values were correct values replaced by a worse one (added
+    error q95 7.4 m/s), all in the check against the last accepted value.
+    Option (robust=True, offline replay on the V1 calibration flights): the
+    anchor is the median of the last anchor_n accepted values, and a value
+    the anchor rejects is still accepted when it agrees with the autopilot
+    reference within noise + max_accel * reference age.
     """
 
     def __init__(self, max_accel_m_s2: float = 9.81, noise_m_s: float = 0.7, max_abs_m_s: float = 8.0,
-                 max_hold_s: float = 1.0, min_sigma_m_s: float = 2.5) -> None:
+                 max_hold_s: float = 1.0, min_sigma_m_s: float = 2.5, robust: bool = False,
+                 anchor_n: int = 5) -> None:
         if not all(isfinite(x) and x > 0 for x in (max_accel_m_s2, noise_m_s, max_abs_m_s, max_hold_s,
                                                    min_sigma_m_s)):
             raise ValueError("vertical gate limits must be finite and positive")
+        if anchor_n < 1:
+            raise ValueError("anchor_n must be >= 1")
+        self.robust, self.anchor_n = bool(robust), int(anchor_n)
+        self._accepted: list[float] = []
         self.max_accel, self.noise, self.max_abs, self.max_hold_s = max_accel_m_s2, noise_m_s, max_abs_m_s, max_hold_s
         self.min_sigma = min_sigma_m_s
         self.last_t_us: int | None = None
@@ -376,6 +392,8 @@ class VerticalVelocityGate:
 
     def check(self, t_us: int, vd: float) -> bool:
         self._use_ref = False
+        if self.robust and self._accepted:
+            self.last_vd = float(np.median(self._accepted))   # anchor, and what held() sends
         expired = self.last_t_us is None or (t_us - self.last_t_us) * 1e-6 > self.max_hold_s
         ref = self._reference_at(t_us) if expired else None
         if not isfinite(vd) or abs(vd) > self.max_abs:
@@ -389,13 +407,19 @@ class VerticalVelocityGate:
         else:
             dt = max(0.0, (t_us - self.last_t_us) * 1e-6)
             ok = abs(vd - self.last_vd) <= self.max_accel * dt + self.noise
+            if not ok and self.robust:
+                ref = self._reference_at(t_us)
+                ok = ref is not None and abs(vd - ref[0]) <= self.noise + self.max_accel * ref[1]
         if ok:
             self.last_t_us, self.last_vd = t_us, float(vd)
+            if self.robust:
+                self._accepted = (self._accepted + [float(vd)])[-self.anchor_n:]
         return ok
 
     def held(self, t_us: int) -> tuple[float, float]:
         """Replacement for a rejected value at t_us and its variance: the
-        reference after a gap, else the last accepted value."""
+        reference after a gap, else the last accepted value (the anchor
+        median with robust=True)."""
         ref = self._reference_at(t_us) if self._use_ref else None
         if ref is not None:
             return ref[0], min((self.max_accel * ref[1]) ** 2 + self.noise ** 2, self.max_abs ** 2)
