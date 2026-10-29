@@ -355,10 +355,13 @@ class VerticalVelocityGate:
     (6 strong-gust flights): 15 % of the replaced values were correct, 2.4 %
     of all sent values were correct values replaced by a worse one (added
     error q95 7.4 m/s), all in the check against the last accepted value.
-    Option (robust=True, offline replay on the V1 calibration flights): the
-    anchor is the median of the last anchor_n accepted values, and a value
-    the anchor rejects is still accepted when it agrees with the autopilot
-    reference within noise + max_accel * reference age.
+    robust=True (the companion default since series VR): the anchor is the
+    median of the last anchor_n accepted values, and a value the anchor
+    rejects is still accepted when it agrees with the autopilot reference
+    within noise + max_accel * reference age. Designed by offline replay on
+    the V1 calibration flights; flight A/B on new seeds (6 pairs): harmful
+    replacements 2.7 % -> 0.06 %, sent values > 3 m/s off 6.6 % -> 0.4 %,
+    EKF2 vz error q99 1.8 -> 0.7 m/s, route error unchanged.
     """
 
     def __init__(self, max_accel_m_s2: float = 9.81, noise_m_s: float = 0.7, max_abs_m_s: float = 8.0,

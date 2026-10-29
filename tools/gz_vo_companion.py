@@ -206,9 +206,10 @@ def main() -> None:
                     help="ncc: largest roll/pitch for map matching (OrthoNccLocalizer max_tilt_rad, <= 0.2)")
     ap.add_argument("--no-vo-vertical-gate", action="store_true",
                     help="send the raw range-rate vertical velocity (src/companion_vo.py VerticalVelocityGate)")
-    ap.add_argument("--vo-vertical-robust", action="store_true",
-                    help="vertical gate anchored on the median of the last 5 accepted values, also accepting "
-                         "values that agree with the autopilot vz (VerticalVelocityGate robust, series VG)")
+    ap.add_argument("--vo-vertical-last-anchor", action="store_true",
+                    help="vertical gate anchored on the last accepted value only (before series VR); default: "
+                         "median of the last 5 accepted values, also accepting values that agree with the "
+                         "autopilot vz (VerticalVelocityGate robust)")
     ap.add_argument("--vo-gap-bridge", type=Path, default=DEFAULT_GAP_BRIDGE,
                     help="JSON from tools/calibrate_vo_gap_bridge.py: carry the map anchor across VO gaps "
                          "with the autopilot velocity (src/companion_map.py VelocityBridge); fuse mode, "
@@ -434,7 +435,7 @@ def main() -> None:
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
                 max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
             vertical_gate = (None if args.no_vo_vertical_gate
-                             else VerticalVelocityGate(robust=args.vo_vertical_robust))
+                             else VerticalVelocityGate(robust=not args.vo_vertical_last_anchor))
             pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs,
                                    vertical_gate=vertical_gate)
             # The gate's acceleration bound (3.7 m/s^2) is derived from the 0.25 rad
