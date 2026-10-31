@@ -316,6 +316,9 @@ TEST_ZONE = "north < 10 m and east > -10 m"
 # N and E ranges (m) covering all test routes: where the field variance is
 # taken for the route limit.
 TEST_ROUTE_AREA = ((-60.0, 15.0), (-10.0, 65.0))
+# Wait for PX4 to restore POSCTL on its own before abandoning the route (bench
+# choice, about 3 times the 1.09 s PX4 took in every case of series NG).
+POSCTL_GRACE_S = 3.0
 TEST_ROUTES = {
     # Legs of the test box as (pitch, roll) stick fractions; all stay in TEST_ZONE.
     "box": ((1, 0), (0, 1), (1, 0), (0, 1)),
@@ -944,14 +947,31 @@ def main() -> None:
                 while link.boot_s < t_end - 1e-3:
                     gz.sim_sleep(min(0.25, t_end - link.boot_s))
                     vo_outage_tick()
+            leg_pause = {"s": 0.0}   # sticks released while PX4 restores POSCTL, this leg
+
             def position_control_lost() -> bool:
                 # PX4 leaves POSCTL (to ALTCTL) when EKF2 loses the horizontal
                 # position. The route sticks would then command tilt, not
                 # velocity, and fly the vehicle away (strong gusts, seed 113:
-                # 22 m/s, 1.3 km). An operator stops; the route is abandoned.
+                # 22 m/s, 1.3 km). An operator releases the sticks. PX4 goes
+                # back to POSCTL by itself once the position is valid again
+                # (injected 4-s VO dropouts at the EKF2_NOAID_TOUT limit:
+                # 1.09 s in ALTCTL, series NG); the route then goes on.
+                # Otherwise the route is abandoned.
                 if link.mode() == "POSCTL":
                     return False
+                sticks = (link.pitch, link.roll)
                 link.pitch = link.roll = 0
+                t0, mode = link.boot_s, link.mode()
+                while link.boot_s - t0 < POSCTL_GRACE_S and link.mode() != "POSCTL":
+                    route_sleep(0.1)
+                if link.mode() == "POSCTL":
+                    leg_pause["s"] += link.boot_s - t0   # the leg's motion is not cut short
+                    report.setdefault("position_control_transient", []).append(
+                        {"t_us": int(t0 * 1e6), "mode": mode, "seen_s": round(link.boot_s - t0, 2)})
+                    print(f"POSITION_CONTROL_TRANSIENT {report['position_control_transient'][-1]}", flush=True)
+                    link.pitch, link.roll = sticks
+                    return False
                 report["position_control_lost"] = {"t_us": int(link.boot_s * 1e6), "mode": link.mode(),
                                                    "leg": len(legs) + 1}
                 print(f"POSITION_CONTROL_LOST {report['position_control_lost']}", flush=True)
@@ -965,10 +985,10 @@ def main() -> None:
                     report["map_outage_start_us"] = int(link.boot_s * 1e6)
                 pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
-                t_leg = link.boot_s
-                while link.boot_s - t_leg < leg_s and not lost:
+                t_leg, leg_pause["s"] = link.boot_s, 0.0
+                while link.boot_s - t_leg - leg_pause["s"] < leg_s and not lost:
                     # Not past the leg: with --route-stick the leg is not a multiple of sample_s.
-                    route_sleep(min(sample_s, max(0.05, leg_s - (link.boot_s - t_leg))))
+                    route_sleep(min(sample_s, max(0.05, leg_s - (link.boot_s - t_leg - leg_pause["s"]))))
                     truth, est = truth_est()
                     errors.append(float(np.linalg.norm(est - truth)))
                     lost = position_control_lost()
