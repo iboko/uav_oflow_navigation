@@ -1005,10 +1005,11 @@ def main() -> None:
                         route_sleep(0.2)
                         truth, est = truth_est()
                         moved = float(np.linalg.norm(truth - start))
-                        if link.boot_s >= next_sample:
+                        lost = position_control_lost()
+                        if link.boot_s >= next_sample or lost:
+                            # Also on abandoning: check 3 needs a sample (time legs always take one).
                             errors.append(float(np.linalg.norm(est - truth)))
                             next_sample += sample_s
-                        lost = position_control_lost()
                     legs_flown_m.append(round(moved, 2))
                     if moved < args.route_leg_m and not lost:
                         # Time cap before the distance: a shortened route, not a completed one.
