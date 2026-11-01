@@ -984,6 +984,7 @@ def main() -> None:
                 return True
             lost = False
             legs_flown_m: list[float] = []
+            legs_short: list[int] = []
             for leg_no, (fp, fr) in enumerate(TEST_ROUTES[args.test_route], 1):
                 if lost:
                     break
@@ -1009,6 +1010,9 @@ def main() -> None:
                             next_sample += sample_s
                         lost = position_control_lost()
                     legs_flown_m.append(round(moved, 2))
+                    if moved < args.route_leg_m and not lost:
+                        # Time cap before the distance: a shortened route, not a completed one.
+                        legs_short.append(leg_no)
                 while not args.route_leg_m and link.boot_s - t_leg - leg_pause["s"] < leg_s and not lost:
                     # Not past the leg: with --route-stick the leg is not a multiple of sample_s.
                     route_sleep(min(sample_s, max(0.05, leg_s - (link.boot_s - t_leg - leg_pause["s"]))))
@@ -1035,15 +1039,17 @@ def main() -> None:
             report["route_legs"] = legs
             if args.route_leg_m:
                 report["route_legs_flown_m"] = legs_flown_m
+                report["route_legs_short"] = legs_short
             report["route_end_us"] = int(link.boot_s * 1e6)
             # Limit fixed before the flight: 3 sigma of the calibrated map error, at least 0.5 m.
             cal = json.loads(args.calibration.read_text())
             limit = max(0.5, 3.0 * math.sqrt(max(cal["covariance_ne_m2"][0][0], cal["covariance_ne_m2"][1][1])))
             report["route_error_limit_m"] = round(limit, 3)
-            check("3_route_absolute_error_on_map", max(errors) < limit and "position_control_lost" not in report,
+            completed = "position_control_lost" not in report and not legs_short
+            check("3_route_absolute_error_on_map", max(errors) < limit and completed,
                   max_abs_error_m=round(max(errors), 3),
                   mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors),
-                  route_completed="position_control_lost" not in report)
+                  route_completed=completed, **({"legs_short": legs_short} if legs_short else {}))
         if args.mode == "test" and "position_control_lost" not in report:
             # 4: map fault.
             def truth_ne():
