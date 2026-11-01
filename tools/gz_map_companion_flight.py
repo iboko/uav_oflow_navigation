@@ -641,6 +641,9 @@ def main() -> None:
     ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
                     help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
+    ap.add_argument("--mpc-acc-hor-max", type=float,
+                    help="PX4 MPC_ACC_HOR_MAX (m/s^2, PX4 default 5): limits braking, hence the tilt, in "
+                         "position mode (a fast-route braking at ~3 m/s^2 tilts past the VO limit, series BR)")
     ap.add_argument("--route-leg-m", type=float,
                     help="test: end each route leg after this distance (true position) instead of a "
                          "fixed time (cap 3 x the leg time); the normal route legs are ~20 m")
@@ -685,6 +688,8 @@ def main() -> None:
     if args.focal_error is None:
         args.focal_error = 0.0 if args.scene == "swiss" else 0.05
     params["MIS_TAKEOFF_ALT"] = f"{altitude:.1f}"
+    if args.mpc_acc_hor_max is not None:
+        params["MPC_ACC_HOR_MAX"] = f"{args.mpc_acc_hor_max:.2f}"
     world = ("ofnav_swiss3d" if args.world_3d else "ofnav_swiss") if args.scene == "swiss" else gz.TEXTURED_WORLD
     # Route scale: legs long enough to cross several camera footprints.
     stick, leg_s, sample_s = (400, 15, 3) if args.scene == "swiss" else (300, 4, 2)
@@ -692,6 +697,8 @@ def main() -> None:
         if not 100 <= args.route_stick <= 1000:
             raise SystemExit("--route-stick must be in [100, 1000]")
         stick, leg_s = args.route_stick, leg_s * 400 / args.route_stick
+    if args.mpc_acc_hor_max is not None and not (math.isfinite(args.mpc_acc_hor_max) and 1 <= args.mpc_acc_hor_max <= 15):
+        raise SystemExit("--mpc-acc-hor-max must be in [1, 15]")
     if args.route_leg_m is not None and not (math.isfinite(args.route_leg_m) and 1 <= args.route_leg_m <= 200):
         raise SystemExit("--route-leg-m must be in [1, 200]")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
