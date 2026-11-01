@@ -641,10 +641,14 @@ def main() -> None:
     ap.add_argument("--calib-walk-bound-m", type=float, default=170.0,
                     help="calibrate walk: a leg ends early beyond this distance from the scene centre")
     ap.add_argument("--calib-walk-leg-s", type=float, default=12.0)
+    ap.add_argument("--route-leg-m", type=float,
+                    help="test: end each route leg after this distance (true position) instead of a "
+                         "fixed time (cap 3 x the leg time); the normal route legs are ~20 m")
     ap.add_argument("--route-stick", type=int, default=400,
                     help="test route stick (of 1000; swiss default 400): larger = faster legs and harder "
-                         "accelerations (large tilts for VO calibration); the leg time is scaled to keep "
-                         "the route length")
+                         "accelerations (large tilts for VO calibration); the leg time is scaled by 400/N, "
+                         "which does not keep the route length (PX4 stick-to-speed is not linear: 800 "
+                         "doubles it, series FR); use --route-leg-m for a fixed length")
     ap.add_argument("--calib-direction-deg", type=float, default=0.0,
                     help="calibrate: direction of the two legs (0: forward then right). Each calibration "
                          "flight of a series uses its own (e.g. 72 deg apart) so the map error is "
@@ -688,6 +692,8 @@ def main() -> None:
         if not 100 <= args.route_stick <= 1000:
             raise SystemExit("--route-stick must be in [100, 1000]")
         stick, leg_s = args.route_stick, leg_s * 400 / args.route_stick
+    if args.route_leg_m is not None and not (math.isfinite(args.route_leg_m) and 1 <= args.route_leg_m <= 200):
+        raise SystemExit("--route-leg-m must be in [1, 200]")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     args.out.mkdir(parents=True, exist_ok=True)
     px4_dir = args.px4_dir.resolve()
@@ -977,6 +983,8 @@ def main() -> None:
                 print(f"POSITION_CONTROL_LOST {report['position_control_lost']}", flush=True)
                 return True
             lost = False
+            legs_flown_m: list[float] = []
+            legs_short: list[int] = []
             for leg_no, (fp, fr) in enumerate(TEST_ROUTES[args.test_route], 1):
                 if lost:
                     break
@@ -986,7 +994,27 @@ def main() -> None:
                 pitch, roll = round(fp * stick), round(fr * stick)
                 link.pitch, link.roll = pitch, roll
                 t_leg, leg_pause["s"] = link.boot_s, 0.0
-                while link.boot_s - t_leg - leg_pause["s"] < leg_s and not lost:
+                if args.route_leg_m:
+                    # Leg ended by distance flown (true position, bench only): with
+                    # --route-stick the PX4 stick-to-speed curve is not linear (400: ~2 m/s,
+                    # 800: ~6.6 m/s), so time-scaled legs doubled the route and left
+                    # the zone of the normal route (series FR). Time cap 3 x leg_s.
+                    start, next_sample, moved = truth_est()[0], link.boot_s + sample_s, 0.0
+                    while (moved < args.route_leg_m and link.boot_s - t_leg - leg_pause["s"] < 3 * leg_s
+                           and not lost):
+                        route_sleep(0.2)
+                        truth, est = truth_est()
+                        moved = float(np.linalg.norm(truth - start))
+                        lost = position_control_lost()
+                        if link.boot_s >= next_sample or lost:
+                            # Also on abandoning: check 3 needs a sample (time legs always take one).
+                            errors.append(float(np.linalg.norm(est - truth)))
+                            next_sample += sample_s
+                    legs_flown_m.append(round(moved, 2))
+                    if moved < args.route_leg_m and not lost:
+                        # Time cap before the distance: a shortened route, not a completed one.
+                        legs_short.append(leg_no)
+                while not args.route_leg_m and link.boot_s - t_leg - leg_pause["s"] < leg_s and not lost:
                     # Not past the leg: with --route-stick the leg is not a multiple of sample_s.
                     route_sleep(min(sample_s, max(0.05, leg_s - (link.boot_s - t_leg - leg_pause["s"]))))
                     truth, est = truth_est()
@@ -1010,15 +1038,19 @@ def main() -> None:
                 control.write_text(json.dumps({"shift_ne_m": [0.0, 0.0]}))
                 report["vo_outages_us"][-1].append(int(link.boot_s * 1e6))
             report["route_legs"] = legs
+            if args.route_leg_m:
+                report["route_legs_flown_m"] = legs_flown_m
+                report["route_legs_short"] = legs_short
             report["route_end_us"] = int(link.boot_s * 1e6)
             # Limit fixed before the flight: 3 sigma of the calibrated map error, at least 0.5 m.
             cal = json.loads(args.calibration.read_text())
             limit = max(0.5, 3.0 * math.sqrt(max(cal["covariance_ne_m2"][0][0], cal["covariance_ne_m2"][1][1])))
             report["route_error_limit_m"] = round(limit, 3)
-            check("3_route_absolute_error_on_map", max(errors) < limit and "position_control_lost" not in report,
+            completed = "position_control_lost" not in report and not legs_short
+            check("3_route_absolute_error_on_map", max(errors) < limit and completed,
                   max_abs_error_m=round(max(errors), 3),
                   mean_abs_error_m=round(float(np.mean(errors)), 3), samples=len(errors),
-                  route_completed="position_control_lost" not in report)
+                  route_completed=completed, **({"legs_short": legs_short} if legs_short else {}))
         if args.mode == "test" and "position_control_lost" not in report:
             # 4: map fault.
             def truth_ne():
