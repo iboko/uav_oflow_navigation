@@ -539,6 +539,8 @@ def main() -> None:
                     help="companion: VO attitude from ATTITUDE_QUATERNION (publish) or ODOMETRY (sample)")
     ap.add_argument("--vo-surface-depth", action="store_true",
                     help="companion: VO feature depths on the DSM (with --dsm-surface)")
+    ap.add_argument("--vo-tilt-geometry", action="store_true",
+                    help="companion: VO tilt geometry (see gz_vo_companion.py)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="companion: mean VO velocity over this many frame pairs")
     ap.add_argument("--no-ev-pos-repeat-scale", action="store_true",
@@ -790,6 +792,8 @@ def main() -> None:
             if not args.dsm_surface:
                 raise SystemExit("--vo-surface-depth needs --dsm-surface")
             cmd += ["--vo-surface-depth"]
+        if args.vo_tilt_geometry:
+            cmd += ["--vo-tilt-geometry"]
         if args.frame_time_shift_ms:
             cmd += ["--frame-time-shift-ms", str(args.frame_time_shift_ms)]
         cmd += ["--map-mode", "observe"] if args.mode == "calibrate" else \

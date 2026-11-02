@@ -240,6 +240,9 @@ def main() -> None:
     ap.add_argument("--vo-surface-depth", action="store_true",
                     help="VO: each feature's depth on the --surface DSM (needs --surface, --map-georef) "
                          "instead of one rangefinder height for the frame (swiss tests: safe, no route gain)")
+    ap.add_argument("--vo-tilt-geometry", action="store_true",
+                    help="VO: optical-axis depth h/cos(tilt) and level-motion conversion to NED instead of "
+                         "vertical height and zero body-z motion (removes the ~cos^3(tilt) speed underestimate)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
                     help="send the mean VO velocity over this many contiguous frame pairs (window midpoint "
                          "stamp); keep 1: 4 pairs made the swiss test flights swing at the route corners")
@@ -433,7 +436,8 @@ def main() -> None:
                 velocity_error_assumptions=VelocityErrorAssumptions(
                     fitted_displacement_sigma_px=0.5, height_sigma_m=0.05, interval_sigma_s=0.002,
                     yaw_sigma_rad=0.02, focal_relative_sigma=0.01, velocity_model_floor_m_s=0.05),
-                max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface)
+                max_tilt_rad=args.vo_max_tilt_rad, max_pair_dt_s=0.25, surface=vo_surface,
+                tilt_geometry=args.vo_tilt_geometry)
             vertical_gate = (None if args.no_vo_vertical_gate
                              else VerticalVelocityGate(robust=not args.vo_vertical_last_anchor))
             pipeline = CompanionVo(vo, window_pairs=args.vo_window_pairs,

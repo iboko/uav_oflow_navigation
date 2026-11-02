@@ -131,6 +131,9 @@ def camera_delta_to_center_ned(
     previous_rpy: tuple[float, float, float],
     current_rpy: tuple[float, float, float],
     camera_offset_body_m: tuple[float, float, float],
+    *,
+    level_motion: bool = False,
+    vertical_delta_m: float = 0.0,
 ) -> np.ndarray:
     """Горизонтальное перемещение центра масс с поправкой на плечо камеры.
 
@@ -139,6 +142,13 @@ def camera_delta_to_center_ned(
                        - (R_nb_curr - R_nb_prev) r_camera^B.
     Исходный визуальный перенос выражен в СК корпуса ПРЕДЫДУЩЕГО кадра.
     Вертикальное движение камеры и неплоская местность не моделируются.
+
+    По умолчанию неизмеренное смещение вдоль оси Z корпуса принимается
+    нулевым, что при наклоне theta занижает горизонтальное перемещение в
+    cos^2(theta) раз. При ``level_motion=True`` вместо этого задано
+    вертикальное смещение центра в NED (``vertical_delta_m``, вниз +), и
+    горизонтальная часть находится из двух измеренных компонент:
+    (R_nb_prev^T)[:2,:2] [dn, de] = xy - R_nb_prev^T[:2,:] (dLever + [0,0,dd]).
     """
     xy = np.asarray(camera_delta_body_prev_m, dtype=np.float64)
     lever = np.asarray(camera_offset_body_m, dtype=np.float64)
@@ -150,6 +160,15 @@ def camera_delta_to_center_ned(
         raise ValueError("Плечо камеры превышает допустимый диапазон")
     r_prev = body_to_ned(*previous_rpy)
     r_curr = body_to_ned(*current_rpy)
-    delta_cam_nav = r_prev @ np.array([xy[0], xy[1], 0.0])
     delta_lever_nav = (r_curr - r_prev) @ lever
+    if level_motion:
+        if not isfinite(vertical_delta_m):
+            raise ValueError("Нечисловое вертикальное перемещение")
+        nav_to_body = r_prev.T
+        horizontal = nav_to_body[:2, :2]
+        if abs(float(np.linalg.det(horizontal))) < 0.5:
+            raise ValueError("Слишком большой наклон для горизонтального решения")
+        known = delta_lever_nav + np.array([0.0, 0.0, float(vertical_delta_m)])
+        return np.linalg.solve(horizontal, xy - nav_to_body[:2, :] @ known)
+    delta_cam_nav = r_prev @ np.array([xy[0], xy[1], 0.0])
     return (delta_cam_nav - delta_lever_nav)[:2]
