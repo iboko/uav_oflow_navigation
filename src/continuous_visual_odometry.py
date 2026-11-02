@@ -87,6 +87,7 @@ class ContinuousPlanarOdometry:
         min_inlier_ratio: float = 0.60,
         pixel_resolution_floor: float = 0.5,
         surface: "SurfaceDepth | None" = None,
+        tilt_geometry: bool = False,
     ) -> None:
         if not calibration.valid():
             raise ValueError("Неверные параметры камеры или ориентации ее осей")
@@ -114,6 +115,13 @@ class ContinuousPlanarOdometry:
             raise ValueError("Недопустимые предположения о погрешностях")
         if surface is not None and camera_mount is None:
             raise ValueError("Feature depths from a surface model need the 3D camera mount")
+        if tilt_geometry and camera_mount is None:
+            raise ValueError("Tilt geometry needs the 3D camera mount")
+        # tilt_geometry: optical-axis depth h/cos(theta) instead of the
+        # vertical height, and level (not zero body-z) motion when the
+        # derotated displacement is taken to NED.  Without it, horizontal
+        # speed is underestimated by about cos^3(theta) on flat ground.
+        self._tilt_geometry = bool(tilt_geometry)
         self._surface = surface
         self._velocity_errors = velocity_error_assumptions
         self._offset = tuple(float(v) for v in offset)
@@ -282,12 +290,20 @@ class ContinuousPlanarOdometry:
                 return self._out(current.timestamp_us, "ROTATION_COMPENSATION_FAILED")
 
         height = 0.5 * (previous.height_agl_m + current.height_agl_m)
+        principal_depth = None
+        if self._tilt_geometry:
+            # Flat-ground depth along the optical axis of the previous frame;
+            # the AGL height stays the validated input.
+            axis_nav = (body_to_ned(previous.roll_rad, previous.pitch_rad, previous.yaw_rad)
+                        @ np.asarray(self._mount.body_from_camera, dtype=np.float64)[:, 2])
+            principal_depth = height / float(axis_nav[2])
         motion = estimate_ground_motion(
             previous.gray, corrected_current, dt_s, height,
             self._calib, roll_rad=previous.roll_rad, pitch_rad=previous.pitch_rad,
             max_tilt_rad=self._max_tilt, min_inliers=self._min_inliers,
             min_inlier_ratio=self._min_ratio,
             feature_depth_m=self._depth_function(previous),
+            principal_depth_m=principal_depth,
         )
         if not motion.valid:
             # The new frame can seed a new segment but cannot bridge missing
@@ -306,8 +322,9 @@ class ContinuousPlanarOdometry:
                     (previous.roll_rad, previous.pitch_rad, previous.yaw_rad),
                     (current.roll_rad, current.pitch_rad, current.yaw_rad),
                     self._offset,
+                    level_motion=self._tilt_geometry,
                 )
-            except ValueError:
+            except (ValueError, np.linalg.LinAlgError):
                 self._restart(current)
                 return self._out(current.timestamp_us, "LEVER_ARM_CORRECTION_FAILED")
             vn, ve = float(dn_de[0] / dt_s), float(dn_de[1] / dt_s)
