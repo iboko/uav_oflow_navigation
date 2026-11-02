@@ -644,6 +644,9 @@ def main() -> None:
     ap.add_argument("--mpc-acc-hor-max", type=float,
                     help="PX4 MPC_ACC_HOR_MAX (m/s^2, PX4 default 5): limits braking, hence the tilt, in "
                          "position mode (a fast-route braking at ~3 m/s^2 tilts past the VO limit, series BR)")
+    ap.add_argument("--mpc-tiltmax-air", type=float,
+                    help="PX4 MPC_TILTMAX_AIR (deg, PX4 default 45): the tilt limit that bounds braking in "
+                         "position mode, kept under the VO tilt limit (series TM)")
     ap.add_argument("--route-leg-m", type=float,
                     help="test: end each route leg after this distance (true position) instead of a "
                          "fixed time (cap 3 x the leg time); the normal route legs are ~20 m")
@@ -690,6 +693,8 @@ def main() -> None:
     params["MIS_TAKEOFF_ALT"] = f"{altitude:.1f}"
     if args.mpc_acc_hor_max is not None:
         params["MPC_ACC_HOR_MAX"] = f"{args.mpc_acc_hor_max:.2f}"
+    if args.mpc_tiltmax_air is not None:
+        params["MPC_TILTMAX_AIR"] = f"{args.mpc_tiltmax_air:.1f}"
     world = ("ofnav_swiss3d" if args.world_3d else "ofnav_swiss") if args.scene == "swiss" else gz.TEXTURED_WORLD
     # Route scale: legs long enough to cross several camera footprints.
     stick, leg_s, sample_s = (400, 15, 3) if args.scene == "swiss" else (300, 4, 2)
@@ -699,6 +704,8 @@ def main() -> None:
         stick, leg_s = args.route_stick, leg_s * 400 / args.route_stick
     if args.mpc_acc_hor_max is not None and not (math.isfinite(args.mpc_acc_hor_max) and 1 <= args.mpc_acc_hor_max <= 15):
         raise SystemExit("--mpc-acc-hor-max must be in [1, 15]")
+    if args.mpc_tiltmax_air is not None and not (math.isfinite(args.mpc_tiltmax_air) and 10 <= args.mpc_tiltmax_air <= 89):
+        raise SystemExit("--mpc-tiltmax-air must be in [10, 89] deg")
     if args.route_leg_m is not None and not (math.isfinite(args.route_leg_m) and 1 <= args.route_leg_m <= 200):
         raise SystemExit("--route-leg-m must be in [1, 200]")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
