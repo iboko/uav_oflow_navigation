@@ -290,18 +290,20 @@ class ContinuousPlanarOdometry:
                 return self._out(current.timestamp_us, "ROTATION_COMPENSATION_FAILED")
 
         height = 0.5 * (previous.height_agl_m + current.height_agl_m)
-        depth = height
+        principal_depth = None
         if self._tilt_geometry:
-            # Flat-ground depth along the optical axis of the previous frame.
+            # Flat-ground depth along the optical axis of the previous frame;
+            # the AGL height stays the validated input.
             axis_nav = (body_to_ned(previous.roll_rad, previous.pitch_rad, previous.yaw_rad)
                         @ np.asarray(self._mount.body_from_camera, dtype=np.float64)[:, 2])
-            depth = height / float(axis_nav[2])
+            principal_depth = height / float(axis_nav[2])
         motion = estimate_ground_motion(
-            previous.gray, corrected_current, dt_s, depth,
+            previous.gray, corrected_current, dt_s, height,
             self._calib, roll_rad=previous.roll_rad, pitch_rad=previous.pitch_rad,
             max_tilt_rad=self._max_tilt, min_inliers=self._min_inliers,
             min_inlier_ratio=self._min_ratio,
             feature_depth_m=self._depth_function(previous),
+            principal_depth_m=principal_depth,
         )
         if not motion.valid:
             # The new frame can seed a new segment but cannot bridge missing

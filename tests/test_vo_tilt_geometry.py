@@ -31,7 +31,7 @@ def _texture(seed=3, n=1600):
     return (255 * (img - img.min()) / (img.max() - img.min())).astype(np.uint8)
 
 
-def _render(world, n, e, h, roll, pitch, yaw):
+def _render(world, n, e, h, roll, pitch, yaw, gsd=GSD):
     """320x240 pinhole frame of flat ground ``h`` m below the camera; world centred at 0."""
     r_nc = body_to_ned(roll, pitch, yaw) @ np.asarray(MOUNT.body_from_camera)
     k_inv = np.linalg.inv(np.array([[CAL.focal_x_px, 0, CAL.center_x_px],
@@ -41,8 +41,8 @@ def _render(world, n, e, h, roll, pitch, yaw):
     s = h / rays[..., 2]
     gn, ge = n + s * rays[..., 0], e + s * rays[..., 1]
     half = world.shape[0] / 2
-    return cv2.remap(world, (half + ge / GSD).astype(np.float32),
-                     (half - gn / GSD).astype(np.float32), cv2.INTER_LINEAR)
+    return cv2.remap(world, (half + ge / gsd).astype(np.float32),
+                     (half - gn / gsd).astype(np.float32), cv2.INTER_LINEAR)
 
 
 @pytest.mark.parametrize("level", [False, True])
@@ -75,16 +75,16 @@ def test_tilt_geometry_needs_mount():
         ContinuousPlanarOdometry(CAL, tilt_geometry=True)
 
 
-def _speed_error(tilt_geometry, roll, pitch):
+def _speed_error(tilt_geometry, roll, pitch, h_cam=50.0, gsd=GSD):
     world = _texture()
     vo = ContinuousPlanarOdometry(CAL, camera_mount=MOUNT, max_tilt_rad=0.4,
                                   tilt_geometry=tilt_geometry)
-    h_cam, yaw, dt = 50.0, 0.4, 0.1
+    yaw, dt = 0.4, 0.1
     v = np.array([6.0, 2.0])  # NED m/s, level flight
     out = []
     for k in range(4):
         n, e = v * dt * k
-        frame = VisualFrame(int((1 + k * dt) * 1e6), _render(world, n, e, h_cam, roll, pitch, yaw),
+        frame = VisualFrame(int((1 + k * dt) * 1e6), _render(world, n, e, h_cam, roll, pitch, yaw, gsd),
                             height_agl_m=h_cam, yaw_rad=yaw, roll_rad=roll, pitch_rad=pitch)
         res = vo.process(frame)
         if k:
@@ -101,3 +101,9 @@ def test_tilt_geometry_removes_along_track_underestimate_at_large_tilt():
     c = math.cos(roll) * math.cos(pitch)
     assert old < -0.08  # about 1 - cos^3(tilt) = -13 %
     assert abs(new) < 0.02, (old, new, 1 - c ** 3)
+
+
+def test_tilt_geometry_keeps_the_agl_ceiling():
+    # 149 m AGL at 0.2 rad: optical-axis depth ~152 m is above the 150 m
+    # height limit, which must still apply to the height, not the depth.
+    assert abs(_speed_error(True, 0.0, 0.2, h_cam=149.0, gsd=0.4)) < 0.03

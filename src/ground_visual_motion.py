@@ -65,6 +65,7 @@ def estimate_ground_motion(
     min_inlier_ratio: float = 0.60,
     max_horizontal_speed_m_s: float = 15.0,
     feature_depth_m=None,
+    principal_depth_m: float | None = None,
 ) -> GroundMotionEstimate:
     """LK tracking + forward/backward test + RANSAC partial-affine plane motion.
 
@@ -79,6 +80,11 @@ def estimate_ground_motion(
     squares with each point's own depth, instead of one height for the
     whole frame: d_u = (-f t_x + x t_z) / Z - w y, d_v = (-f t_y + y t_z) / Z
     + w x (x, y from the principal point; w: residual roll about the axis).
+
+    ``principal_depth_m``: optional depth along the optical axis at the
+    principal point, used instead of ``height_agl_m`` to scale the image
+    shift (e.g. h/cos(tilt) over flat ground). ``height_agl_m`` stays the
+    validated height above ground; ignored with ``feature_depth_m``.
     """
     def reject(reason: str, tracked: int = 0, inliers: int = 0) -> GroundMotionEstimate:
         return GroundMotionEstimate(
@@ -90,6 +96,8 @@ def estimate_ground_motion(
         return reject("INVALID_CALIBRATION")
     if not all(map(isfinite, (dt_s, height_agl_m, roll_rad, pitch_rad))):
         return reject("NON_FINITE_INPUT")
+    if principal_depth_m is not None and (not isfinite(principal_depth_m) or principal_depth_m <= 0.0):
+        return reject("INVALID_TIME_OR_HEIGHT")
     if dt_s <= 0.0 or dt_s > 0.5 or height_agl_m <= 0.0 or height_agl_m > 150.0:
         return reject("INVALID_TIME_OR_HEIGHT")
     if abs(roll_rad) > max_tilt_rad or abs(pitch_rad) > max_tilt_rad:
@@ -165,9 +173,10 @@ def estimate_ground_motion(
 
     principal = np.array([calibration.center_x_px, calibration.center_y_px])
     pixel_shift = transform[:, :2] @ principal + transform[:, 2] - principal
+    scale_depth = height_agl_m if principal_depth_m is None else principal_depth_m
     image_plane_speed = np.array([
-        -pixel_shift[0] * height_agl_m / (calibration.focal_x_px * dt_s),
-        -pixel_shift[1] * height_agl_m / (calibration.focal_y_px * dt_s),
+        -pixel_shift[0] * scale_depth / (calibration.focal_x_px * dt_s),
+        -pixel_shift[1] * scale_depth / (calibration.focal_y_px * dt_s),
     ])
     if feature_depth_m is not None:
         try:
