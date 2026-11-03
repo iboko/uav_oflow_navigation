@@ -538,7 +538,9 @@ def main() -> None:
     ap.add_argument("--attitude-stamp", choices=("publish", "sample"), default="sample",
                     help="companion: VO attitude from ATTITUDE_QUATERNION (publish) or ODOMETRY (sample)")
     ap.add_argument("--vo-surface-depth", action="store_true",
-                    help="companion: VO feature depths on the DSM (with --dsm-surface)")
+                    help="companion: require VO feature depths on the DSM (needs --dsm-surface; default with it)")
+    ap.add_argument("--no-vo-surface-depth", action="store_true",
+                    help="companion: VO with one rangefinder height even with --dsm-surface (before series SD)")
     ap.add_argument("--no-vo-tilt-geometry", action="store_true",
                     help="companion: VO without the tilt geometry (before series VT; see gz_vo_companion.py)")
     ap.add_argument("--vo-window-pairs", type=int, default=1,
@@ -792,6 +794,8 @@ def main() -> None:
             if not args.dsm_surface:
                 raise SystemExit("--vo-surface-depth needs --dsm-surface")
             cmd += ["--vo-surface-depth"]
+        if args.no_vo_surface_depth:
+            cmd += ["--no-vo-surface-depth"]
         if args.no_vo_tilt_geometry:
             cmd += ["--no-vo-tilt-geometry"]
         if args.frame_time_shift_ms:
