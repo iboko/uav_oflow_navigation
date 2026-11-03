@@ -238,8 +238,10 @@ def main() -> None:
                          "publication, 0-12 ms after the IMU sample) or the autopilot ODOMETRY (stamped at "
                          "the IMU sample)")
     ap.add_argument("--vo-surface-depth", action="store_true",
-                    help="VO: each feature's depth on the --surface DSM (needs --surface, --map-georef) "
-                         "instead of one rangefinder height for the frame (swiss tests: safe, no route gain)")
+                    help="VO: require each feature's depth on the --surface DSM (error without --surface and "
+                         "--map-georef); with both given this is the default since series SD")
+    ap.add_argument("--no-vo-surface-depth", action="store_true",
+                    help="VO: one rangefinder height for the frame even when a DSM is given (before series SD)")
     ap.add_argument("--no-vo-tilt-geometry", action="store_true",
                     help="VO: vertical height as depth and zero body-z motion when converting to NED (before "
                          "series VT; underestimates speed by ~cos^3(tilt)); default: optical-axis depth "
@@ -265,6 +267,10 @@ def main() -> None:
     args = ap.parse_args()
     if args.vo_surface_depth and not (args.surface and args.map_georef):
         ap.error("--vo-surface-depth needs --surface and --map-georef")
+    if args.vo_surface_depth and args.no_vo_surface_depth:
+        ap.error("--vo-surface-depth and --no-vo-surface-depth exclude each other")
+    # Series SD: feature depths on the DSM whenever one is available.
+    args.vo_surface_depth = bool(args.surface and args.map_georef) and not args.no_vo_surface_depth
     if not 1 <= args.vo_window_pairs <= 16:
         # The map anchor keeps 16 intervals: a longer window's midpoint
         # would lose the map position.
